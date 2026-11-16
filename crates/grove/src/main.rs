@@ -64,7 +64,8 @@ enum Cmd {
         #[arg(long)]
         backup_dir: Option<PathBuf>,
     },
-    /// Run one full sync pass on the repo at PATH
+    /// Run one full sync pass on the repo at PATH (pushes WIP snapshots whatever the
+    /// `snapshots` policy says; only the daemon enforces it)
     Sync {
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -327,7 +328,12 @@ fn main() -> Result<()> {
                     stamp: stamp(),
                     remote: "origin".into(),
                     offline: *offline,
-                    materialize: true,
+                    materialize: path
+                        .canonicalize()
+                        .ok()
+                        .and_then(|p| grove_daemon::discover::group_of(&p))
+                        .and_then(|g| cfg.groups.iter().find(|x| x.name == g))
+                        .is_none_or(|g| g.auto_materialize),
                     push_snapshots: true,
                 },
             )?;
