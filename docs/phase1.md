@@ -82,3 +82,9 @@ exclusion of `refs/sync/*` on this Gitea (needs a mirror target and credentials)
 
 Observed UX noise: a stale snapshot from another machine is reported as "not applied" on every
 pass until that machine syncs again.
+
+## Bug found later (Phase 5 tests)
+
+`clone_bare_layout` created worktrees without upstream tracking, so `Diverged` and `Behind` were
+reported as `Synced` on repos cloned by grove itself. Fixed: every local branch with an `origin/<br>`
+counterpart gets `--set-upstream-to` before worktrees are materialized (asserted in `tests/registry.rs`).
