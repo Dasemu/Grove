@@ -3,14 +3,14 @@
 //! so passes never overlap.
 
 use crate::activity::{Activity, now_secs};
-use crate::discover::{discover, group_of, is_bare_layout, subdirs};
+use crate::discover::{discover, group_of, is_ready, subdirs};
 use crate::ipc;
 use crate::visibility::{RealForge, Visibility, snapshot_gate};
 use grove_core::config::Config;
 use grove_core::receive::Received;
 use grove_core::sync::{Options, sync_repo};
 use notify::{EventKind, RecursiveMode, Watcher};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -176,6 +176,7 @@ pub fn ignored(rel: &Path, extra: &[String]) -> bool {
         let n = c.as_os_str().to_string_lossy();
         n == ".git"
             || n == ".bare"
+            || n == ".grove-busy"
             || n == ".grove-stage"
             || extra.iter().any(|p| pattern_matches(p, &n))
     })
@@ -200,7 +201,13 @@ pub fn triggers_rediscovery(path: &Path, root: &Path, groups: &[String]) -> bool
     match parts.as_slice() {
         [g] => in_group(g),
         [g, _] => in_group(g),
-        [g, _, f] => in_group(g) && (f == ".bare" || f == ".git"),
+        [g, _, f] => {
+            in_group(g)
+                && matches!(
+                    f.as_str(),
+                    ".bare" | ".git" | ".grove-busy" | ".grove-stage"
+                )
+        }
         _ => false,
     }
 }
@@ -208,8 +215,18 @@ pub fn triggers_rediscovery(path: &Path, root: &Path, groups: &[String]) -> bool
 struct Watch {
     watcher: Option<notify::RecommendedWatcher>,
     repos: Arc<Mutex<Vec<PathBuf>>>,
-    /// Watched paths and whether the watch is recursive.
-    watched: HashMap<PathBuf, bool>,
+    /// Watched paths: whether the watch is recursive, and the (device, inode) of the directory it
+    /// was set on, so a directory deleted and recreated under the same name is watched anew.
+    watched: HashMap<PathBuf, (bool, Option<(u64, u64)>)>,
+    /// Paths whose watch failed and was already reported (reported once until it succeeds).
+    watch_failed: HashSet<PathBuf>,
+    /// Stalled repos already warned about.
+    warned_stalled: HashSet<PathBuf>,
+}
+
+fn dir_id(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
 }
 
 fn make_watch(
@@ -254,18 +271,20 @@ fn make_watch(
         watcher,
         repos,
         watched: HashMap::new(),
+        watch_failed: HashSet::new(),
+        warned_stalled: HashSet::new(),
     }
 }
 
 impl Watch {
-    /// Makes the set of watches match `wanted`. Watches are only ever added or removed here;
-    /// nothing in the watched directories is touched.
-    fn sync(&mut self, wanted: HashMap<PathBuf, bool>, ctx: &Ctx) {
+    /// Adds the watches in `wanted` that are missing, and replaces watches whose directory was
+    /// deleted and recreated. With `prune`, also removes watches that are no longer wanted or
+    /// whose mode changed. Nothing in the watched directories is touched.
+    fn sync(&mut self, wanted: &HashMap<PathBuf, bool>, prune: bool, ctx: &Ctx) {
         let stale: Vec<PathBuf> = self
             .watched
             .iter()
-            // A deleted directory loses its inotify watch, so a recreated one needs a new one.
-            .filter(|(p, rec)| wanted.get(*p) != Some(*rec) || !p.exists())
+            .filter(|(p, (rec, id))| *id != dir_id(p) || (prune && wanted.get(*p) != Some(rec)))
             .map(|(p, _)| p.clone())
             .collect();
         for p in stale {
@@ -275,25 +294,33 @@ impl Watch {
             }
         }
         for (p, rec) in wanted {
-            if self.watched.contains_key(&p) || !p.exists() {
+            if self.watched.contains_key(p) {
                 continue;
             }
-            self.watched.insert(p.clone(), rec);
-            let mode = if rec {
+            let Some(id) = dir_id(p) else { continue };
+            let mode = if *rec {
                 RecursiveMode::Recursive
             } else {
                 RecursiveMode::NonRecursive
             };
-            if let Some(w) = &mut self.watcher
-                && let Err(e) = w.watch(&p, mode)
-            {
-                ctx.activity.log(
-                    "watch_error",
-                    Some(&p.display().to_string()),
-                    format!(
-                        "cannot watch (raise fs.inotify.max_user_watches?): {e}; relying on periodic passes"
-                    ),
-                );
+            let Some(w) = &mut self.watcher else { continue };
+            match w.watch(p, mode) {
+                Ok(()) => {
+                    self.watched.insert(p.clone(), (*rec, Some(id)));
+                    self.watch_failed.remove(p);
+                }
+                // Not recorded as watched, so the next rescan retries.
+                Err(e) => {
+                    if self.watch_failed.insert(p.clone()) {
+                        ctx.activity.log(
+                            "watch_error",
+                            Some(&p.display().to_string()),
+                            format!(
+                                "cannot watch (raise fs.inotify.max_user_watches?): {e}; relying on periodic passes"
+                            ),
+                        );
+                    }
+                }
             }
         }
     }
@@ -307,8 +334,32 @@ fn rescan(
     watch: &mut Watch,
     ctx: &Ctx,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    // Shallow watches first, then discover: a `.bare` created in a child between the two steps
+    // is then still seen as an event.
+    let mut wanted: HashMap<PathBuf, bool> = HashMap::new();
+    wanted.insert(root.to_path_buf(), false);
+    for g in groups {
+        let gdir = root.join(g);
+        wanted.insert(gdir.clone(), false);
+        for child in subdirs(&gdir) {
+            // Children that are not managed yet are watched shallowly so `.bare` appearing
+            // inside them (`grove add`, `grove import`) is noticed.
+            wanted.insert(child, false);
+        }
+    }
+    watch.sync(&wanted, false, ctx);
     let d = discover(root, groups);
     let found = d.managed;
+    for r in &d.stalled {
+        if watch.warned_stalled.insert(r.clone()) {
+            ctx.activity.log(
+                "repo_stalled",
+                Some(&r.display().to_string()),
+                "WARNING: left alone: an interrupted `grove add`/clone left `.grove-busy` or `.grove-stage` behind; check the repo and restore from the backups, then remove the marker by hand",
+            );
+        }
+    }
+    watch.warned_stalled.retain(|p| d.stalled.contains(p));
     let mut added = Vec::new();
     let mut removed = Vec::new();
     {
@@ -339,24 +390,11 @@ fn rescan(
             "no longer managed (directory gone or no longer a bare layout); files untouched",
         );
     }
-    let mut wanted: HashMap<PathBuf, bool> = HashMap::new();
-    wanted.insert(root.to_path_buf(), false);
-    let mut names: Vec<&String> = groups.iter().collect();
-    names.dedup();
-    for g in names {
-        let gdir = root.join(g);
-        wanted.insert(gdir.clone(), false);
-        for child in subdirs(&gdir) {
-            // Children that are not managed yet are watched shallowly so `.bare` appearing
-            // inside them (`grove add`, `grove import`) is noticed.
-            wanted.entry(child).or_insert(false);
-        }
-    }
     for r in &found {
         wanted.insert(r.clone(), true);
     }
     *watch.repos.lock().unwrap() = found.clone();
-    watch.sync(wanted, ctx);
+    watch.sync(&wanted, true, ctx);
     (found, added)
 }
 
@@ -465,7 +503,7 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
             }
             due_at.remove(&r);
             first_at.remove(&r);
-            if !is_bare_layout(&r) {
+            if !is_ready(&r) {
                 // Removed or migrated away since the last discovery: drop it, no error.
                 let (found, _) = rescan(&root, &groups, &mut watch, &ctx);
                 forget_removed(&found, &mut due_at, &mut first_at, &mut backoff_until);
@@ -475,7 +513,7 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
             // the network is retried at the first pass after the backoff expires.
             let offline = backoff_until.get(&r).is_some_and(|u| *u > now);
             let failures = pass(&r, &cfg, &st, &mut visibility, offline, &ctx);
-            if !is_bare_layout(&r) {
+            if !is_ready(&r) {
                 // It vanished mid-pass: whatever the pass reported is moot.
                 let (found, _) = rescan(&root, &groups, &mut watch, &ctx);
                 forget_removed(&found, &mut due_at, &mut first_at, &mut backoff_until);
@@ -521,6 +559,10 @@ fn pass(
     ctx: &Ctx,
 ) -> u32 {
     let name = repo.display().to_string();
+    if !is_ready(repo) {
+        // Being migrated/cloned (or gone): leave it alone, the rediscovery sorts it out.
+        return 0;
+    }
     set_phase(ctx, repo, "syncing");
     let group = group_of(repo).unwrap_or_default();
     // `auto_materialize` is per group; a repo whose group is gone from the config keeps the default.
@@ -718,6 +760,8 @@ mod tests {
         assert!(t("/r/g/repo"));
         assert!(t("/r/g/repo/.bare"));
         assert!(t("/r/g/repo/.git"));
+        assert!(t("/r/g/repo/.grove-busy"));
+        assert!(t("/r/g/repo/.grove-stage"));
         assert!(!t("/r/g/repo/main"));
         assert!(!t("/r/g/repo/main/.bare"));
         assert!(!t("/r/other"));
