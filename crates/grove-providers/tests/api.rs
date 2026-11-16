@@ -1,5 +1,5 @@
 use grove_core::config::ProviderKind;
-use grove_providers::{Error, GitHub, Gitea, MirrorSpec, NewRepo, Provider, token};
+use grove_providers::{Error, GitHub, Gitea, MirrorSpec, NewRepo, Provider, PullMirrorSpec, token};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
@@ -46,6 +46,33 @@ fn mock(replies: Vec<(u16, &'static str)>) -> (String, mpsc::Receiver<String>) {
         }
     });
     (url, rx)
+}
+
+/// Serialises the tests that change process-wide env vars.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Restores an env var on drop, also when an assertion panics.
+struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+
+impl EnvGuard {
+    fn set(k: &'static str, v: impl AsRef<std::ffi::OsStr>) -> Self {
+        let g = EnvGuard(k, std::env::var_os(k));
+        // SAFETY: callers hold ENV_LOCK; no other test reads these variables.
+        unsafe { std::env::set_var(k, v) };
+        g
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: as in `set`.
+        unsafe {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
 }
 
 fn body(req: &str) -> serde_json::Value {
@@ -179,7 +206,115 @@ fn unreachable_forge_is_a_network_error() {
 #[test]
 fn env_var_overrides_the_keyring() {
     assert_eq!(token::env_name("gitea-main"), "GROVE_TOKEN_GITEA_MAIN");
-    // SAFETY: tests in this binary that touch this variable run in this single test.
-    unsafe { std::env::set_var("GROVE_TOKEN_ENV_TEST", " abc ") };
+    let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = EnvGuard::set("GROVE_TOKEN_ENV_TEST", " abc ");
     assert_eq!(token::get("env-test").unwrap(), "abc");
+}
+
+#[test]
+fn gitea_pull_mirror_sends_credentials_only_for_private_sources() {
+    let reply = r#"{"name":"m","private":false,"clone_url":"u/m.git","owner":{"login":"Org"}}"#;
+    let (url, rx) = mock(vec![(201, reply), (201, reply)]);
+    let g = Gitea::new(ProviderKind::Gitea, &url, "secret".into());
+    let mut spec = PullMirrorSpec {
+        name: "m".into(),
+        owner: Some("Org".into()),
+        private: false,
+        source_url: "https://github.com/o/m.git".into(),
+        source_auth: None,
+        interval: "8h0m0s".into(),
+    };
+    assert_eq!(g.create_pull_mirror(&spec).unwrap().owner, "Org");
+    let req = rx.recv().unwrap();
+    assert!(req.starts_with("POST /api/v1/repos/migrate "), "{req}");
+    let b = body(&req);
+    assert_eq!(b["clone_addr"], "https://github.com/o/m.git");
+    assert_eq!(
+        (b["mirror"].as_bool(), b["repo_owner"].as_str()),
+        (Some(true), Some("Org"))
+    );
+    assert!(b.get("auth_password").is_none(), "{b}");
+
+    spec.private = true;
+    spec.owner = None;
+    spec.source_auth = Some(("me".into(), "ghtok".into()));
+    g.create_pull_mirror(&spec).unwrap();
+    let b = body(&rx.recv().unwrap());
+    assert_eq!(
+        (b["auth_username"].as_str(), b["auth_password"].as_str()),
+        (Some("me"), Some("ghtok"))
+    );
+    assert!(b.get("repo_owner").is_none(), "{b}");
+    assert_eq!(b["private"], true);
+}
+
+#[test]
+fn github_cannot_pull_mirror() {
+    let g = GitHub::new("http://127.0.0.1:9", "t".into());
+    assert!(!g.capabilities().pull_mirror);
+    let spec = PullMirrorSpec {
+        name: "m".into(),
+        owner: None,
+        private: false,
+        source_url: "x".into(),
+        source_auth: None,
+        interval: "8h0m0s".into(),
+    };
+    assert!(matches!(
+        g.create_pull_mirror(&spec),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+/// Changes PATH and GROVE_NO_CLI_TOKENS under ENV_LOCK; both are restored on drop.
+#[test]
+fn falls_back_to_tea_and_gh_logins() {
+    use grove_core::config::Provider as ProviderCfg;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!(
+        "grove-clitok-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // tea's credential helper answers only for its host; gh echoes the host it was asked for.
+    let scripts = [
+        (
+            "tea",
+            "#!/bin/sh\nin=\"\"; while IFS= read -r l; do in=\"$in $l\"; done\ncase \"$in\" in *host=git.example.com*) printf 'protocol=https\\nhost=git.example.com\\nusername=u\\npassword=teatok\\n';; *) exit 1;; esac\n",
+        ),
+        (
+            "gh",
+            "#!/bin/sh\n[ \"$4\" = github.com ] && echo ' ghtok ' || exit 1\n",
+        ),
+    ];
+    for (name, body) in scripts {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _path = EnvGuard::set("PATH", &dir);
+    let off = EnvGuard::set("GROVE_NO_CLI_TOKENS", "0");
+    let gitea = |url: &str| ProviderCfg {
+        kind: ProviderKind::Gitea,
+        url: Some(url.into()),
+    };
+    let github = ProviderCfg {
+        kind: ProviderKind::Github,
+        url: None,
+    };
+    let id = format!("clitok-{}", std::process::id());
+    let got = token::resolve(&id, &gitea("https://git.example.com/")).unwrap();
+    assert_eq!(got, ("teatok".to_string(), token::Source::Tea));
+    assert!(token::resolve(&id, &gitea("https://other.example.com")).is_err());
+    let got = token::resolve(&id, &github).unwrap();
+    assert_eq!(got, ("ghtok".to_string(), token::Source::Gh));
+    drop(off);
+    let _off = EnvGuard::set("GROVE_NO_CLI_TOKENS", "1");
+    assert!(token::resolve(&id, &github).is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

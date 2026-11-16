@@ -37,7 +37,7 @@ impl fmt::Display for Error {
             Error::Unsupported(m) => write!(f, "not supported by this forge: {m}"),
             Error::NoToken(id) => write!(
                 f,
-                "no token for provider {id:?} (run `grove login {id}` or set GROVE_TOKEN_*)"
+                "no token for provider {id:?} (log in with `tea`/`gh`, run `grove login {id}` or set GROVE_TOKEN_*)"
             ),
             Error::Other(m) => f.write_str(m),
         }
@@ -80,7 +80,23 @@ pub struct MirrorSpec {
 pub struct Capabilities {
     /// The forge can push-mirror a repo to another forge by itself.
     pub push_mirror: bool,
+    /// The forge can create a repo that pulls (mirrors) another forge's repo on a schedule.
+    pub pull_mirror: bool,
     pub orgs: bool,
+}
+
+/// A repo on this forge that mirrors `source_url` (another forge) by pulling it.
+#[derive(Debug, Clone)]
+pub struct PullMirrorSpec {
+    pub name: String,
+    /// Create under this organisation instead of the authenticated user.
+    pub owner: Option<String>,
+    pub private: bool,
+    pub source_url: String,
+    /// Credentials for a private source; `None` for a public one (nothing is stored).
+    pub source_auth: Option<(String, String)>,
+    /// Go-style duration (`8h0m0s`).
+    pub interval: String,
 }
 
 pub trait Provider {
@@ -91,6 +107,8 @@ pub trait Provider {
     fn list_repos(&self) -> Result<Vec<RemoteRepo>>;
     fn create_repo(&self, new: &NewRepo) -> Result<RemoteRepo>;
     fn configure_mirror(&self, owner: &str, repo: &str, spec: &MirrorSpec) -> Result<()>;
+    /// Creates a pull mirror (see [`Capabilities::pull_mirror`]).
+    fn create_pull_mirror(&self, spec: &PullMirrorSpec) -> Result<RemoteRepo>;
 }
 
 /// Builds the provider described by `cfg`, using `token`.

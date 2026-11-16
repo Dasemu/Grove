@@ -1,5 +1,7 @@
 use crate::http::Http;
-use crate::{Capabilities, Error, MirrorSpec, NewRepo, Provider, RemoteRepo, Result};
+use crate::{
+    Capabilities, Error, MirrorSpec, NewRepo, Provider, PullMirrorSpec, RemoteRepo, Result,
+};
 use grove_core::config::ProviderKind;
 use serde_json::{Value, json};
 
@@ -39,6 +41,7 @@ impl Provider for GitHub {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             push_mirror: false,
+            pull_mirror: false,
             orgs: true,
         }
     }
@@ -82,6 +85,12 @@ impl Provider for GitHub {
     fn configure_mirror(&self, _: &str, _: &str, _: &MirrorSpec) -> Result<()> {
         Err(Error::Unsupported(
             "GitHub has no push mirrors; use a Gitea pull mirror or the daemon's branch push",
+        ))
+    }
+
+    fn create_pull_mirror(&self, _: &PullMirrorSpec) -> Result<RemoteRepo> {
+        Err(Error::Unsupported(
+            "GitHub cannot pull-mirror another forge",
         ))
     }
 }

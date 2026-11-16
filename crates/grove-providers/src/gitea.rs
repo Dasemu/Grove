@@ -1,5 +1,7 @@
 use crate::http::Http;
-use crate::{Capabilities, Error, MirrorSpec, NewRepo, Provider, RemoteRepo, Result};
+use crate::{
+    Capabilities, Error, MirrorSpec, NewRepo, Provider, PullMirrorSpec, RemoteRepo, Result,
+};
 use grove_core::config::ProviderKind;
 use serde_json::{Value, json};
 
@@ -40,6 +42,7 @@ impl Provider for Gitea {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             push_mirror: true,
+            pull_mirror: true,
             orgs: true,
         }
     }
@@ -93,5 +96,29 @@ impl Provider for Gitea {
                 Some(&body),
             )
             .map(|_| ())
+    }
+
+    fn create_pull_mirror(&self, spec: &PullMirrorSpec) -> Result<RemoteRepo> {
+        let mut body = json!({
+            "clone_addr": spec.source_url,
+            "repo_name": spec.name,
+            "mirror": true,
+            "mirror_interval": spec.interval,
+            "private": spec.private,
+            "service": "git",
+            "description": "Mirror managed by grove",
+        });
+        if let Some(o) = &spec.owner {
+            body["repo_owner"] = json!(o);
+        }
+        if let Some((user, token)) = &spec.source_auth {
+            body["auth_username"] = json!(user);
+            body["auth_password"] = json!(token);
+        }
+        Ok(repo(&self.http.ok(
+            "POST",
+            "/repos/migrate",
+            Some(&body),
+        )?))
     }
 }
