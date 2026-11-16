@@ -65,9 +65,11 @@ impl Provider for GitHub {
         let mut r = repo(&v);
         // `internal` repos (GitHub Enterprise) have `private: true` but are readable by the
         // whole enterprise: only an explicit "private" counts as private.
-        if let Some(vis) = v["visibility"].as_str() {
-            r.private = vis == "private";
-        }
+        // Without the field we cannot tell private from internal: refuse to guess.
+        let vis = v["visibility"]
+            .as_str()
+            .ok_or_else(|| Error::Other("response has no `visibility` field".into()))?;
+        r.private = vis == "private";
         Ok(r)
     }
 
