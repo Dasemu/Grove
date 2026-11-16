@@ -8,3 +8,4 @@ pub mod migrate;
 pub mod receive;
 pub mod snapshot;
 pub mod state;
+pub mod sync;
