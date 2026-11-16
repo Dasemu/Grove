@@ -109,13 +109,39 @@ pub enum Received {
     Declined(String),
 }
 
+/// A dirty worktree that is behind its upstream is normally left alone. The exception is when its
+/// content is exactly the upstream tree (typical: another machine's snapshot was applied here and
+/// its author then committed and pushed it). Then moving the branch and index to upstream with a
+/// mixed reset changes no file and loses nothing.
+fn adopt_if_identical(
+    g: &Git,
+    machine: &str,
+    stamp: &str,
+    st: State,
+) -> Result<Received, GitError> {
+    let worktree_tree = crate::snapshot::worktree_tree(g.dir())?;
+    let upstream_tree = g.run(&["rev-parse", "@{upstream}^{tree}"])?;
+    if worktree_tree != upstream_tree {
+        return Ok(Received::Skipped(st));
+    }
+    let from = g.run(&["rev-parse", "HEAD"])?;
+    let bref = backup_ref(machine, stamp, &format!("receive/{}", current_branch(g)?));
+    g.run(&["update-ref", &bref, &from])?;
+    g.run(&["reset", "-q", "@{upstream}"])?;
+    let to = g.run(&["rev-parse", "HEAD"])?;
+    Ok(Received::FastForwarded { from, to })
+}
+
 /// Fast-forward a clean, strictly-behind worktree to its upstream. Anything else is skipped.
 pub fn receive(worktree: &Path, machine: &str, stamp: &str) -> Result<Received, GitError> {
     let st = state(worktree);
+    let g = Git::new(worktree);
+    if st == State::BehindDirty {
+        return adopt_if_identical(&g, machine, stamp, st);
+    }
     if st != State::Behind {
         return Ok(Received::Skipped(st));
     }
-    let g = Git::new(worktree);
     let clash = ignored_conflicts(&g, "@{upstream}")?;
     if !clash.is_empty() {
         return Ok(Received::Declined(format!(
