@@ -31,6 +31,8 @@ pub struct WorktreeReport {
     pub applied: Option<(String, Applied)>,
     pub state: State,
     pub errors: Vec<String>,
+    /// Large files left out of the snapshot (see `sync.max_file_mb`).
+    pub skipped: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -81,6 +83,7 @@ pub fn sync_repo(path: &Path, o: &Options) -> Result<SyncReport, GitError> {
             applied: None,
             state: State::Synced,
             errors: Vec::new(),
+            skipped: Vec::new(),
         };
         if let Some(branch) = &wt.branch {
             sync_worktree(&mut r, branch, o, rep.fetch_error.is_none());
@@ -109,7 +112,10 @@ fn sync_worktree(r: &mut WorktreeReport, branch: &str, o: &Options, fetched: boo
     // A clean worktree still refreshes an existing snapshot so a stale WIP never lingers.
     if dirty || has_ref {
         match take(&path, &o.machine, &o.stamp) {
-            Ok(Outcome::Created(_)) => r.snapshot = Some("created"),
+            Ok(Outcome::Created(s)) => {
+                r.snapshot = Some("created");
+                r.skipped = s.skipped;
+            }
             Ok(Outcome::Unchanged(_)) => r.snapshot = Some("unchanged"),
             Err(e) => {
                 r.errors.push(format!("snapshot: {e}"));

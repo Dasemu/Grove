@@ -15,13 +15,13 @@ pub const REMOTE_SYNC: &str = "refs/sync-remote";
 
 /// Backup refs live in `refs/sync-backup/<machine>/<stamp>/<kind>`; each kind has its own
 /// sub-namespace so refs of different operations in one pass can never collide (D/F conflict).
-fn backup_ref(machine: &str, stamp: &str, kind: &str) -> String {
+pub(crate) fn backup_ref(machine: &str, stamp: &str, kind: &str) -> String {
     format!("refs/sync-backup/{machine}/{stamp}/{kind}")
 }
 
 /// Paths the incoming change would add that already exist locally as *ignored* files.
 /// `git status` does not report those, but a merge/read-tree would silently overwrite them.
-fn ignored_conflicts(g: &Git, target: &str) -> Result<Vec<String>, GitError> {
+pub(crate) fn ignored_conflicts(g: &Git, target: &str) -> Result<Vec<String>, GitError> {
     let added = g.run(&[
         "diff",
         "--no-renames",

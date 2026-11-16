@@ -72,6 +72,9 @@ pub struct Sync {
     pub fetch_interval_s: u64,
     #[serde(default)]
     pub ignore_extra: Vec<String>,
+    /// Changed files larger than this many MiB are not snapshotted (0 = no limit).
+    #[serde(default = "default_max_file_mb")]
+    pub max_file_mb: u64,
 }
 
 impl Default for Sync {
@@ -80,6 +83,7 @@ impl Default for Sync {
             snapshot_debounce_ms: default_debounce(),
             fetch_interval_s: default_fetch(),
             ignore_extra: Vec::new(),
+            max_file_mb: default_max_file_mb(),
         }
     }
 }
@@ -95,6 +99,9 @@ fn yes() -> bool {
 }
 fn default_debounce() -> u64 {
     2000
+}
+fn default_max_file_mb() -> u64 {
+    50
 }
 fn default_fetch() -> u64 {
     60

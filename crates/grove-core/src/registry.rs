@@ -67,6 +67,18 @@ pub fn clone_bare_layout(
         f = f.with_env(k, v);
     }
     f.run(&["fetch", "-q", "--prune", "origin"])?;
+    // `clone --bare` creates local branches without upstream config; worktrees made from them
+    // would then never be classified as ahead/behind.
+    let b = Git::new(&bare);
+    let heads = b.run(&["for-each-ref", "--format=%(refname:short)", "refs/heads"])?;
+    for br in heads.lines() {
+        let up = format!("origin/{br}");
+        if b.probe(&["rev-parse", "-q", "--verify", &format!("refs/remotes/{up}")])?
+            .is_some()
+        {
+            b.run(&["branch", "-q", &format!("--set-upstream-to={up}"), br])?;
+        }
+    }
     materialize(dir, "origin")
 }
 

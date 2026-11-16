@@ -35,6 +35,13 @@ fn new_repo_pushes_and_a_fresh_machine_clones_it_into_the_bare_layout() {
     let b = base.join("B/g/proj");
     let made = clone_bare_layout(url, &b, &[]).unwrap();
     assert_eq!(made.len(), 1);
+    assert_eq!(
+        Git::new(b.join("main"))
+            .run(&["rev-parse", "--abbrev-ref", "@{upstream}"])
+            .unwrap(),
+        "origin/main",
+        "cloned worktrees must track their remote branch"
+    );
     assert!(b.join("main/.git").exists() && b.join(".bare").is_dir());
     assert_eq!(
         Git::new(b.join("main"))

@@ -5,7 +5,9 @@ use grove_core::git::Git;
 use grove_core::inspect::{state, worktrees};
 use grove_core::migrate::migrate;
 use grove_core::receive::{Applied, Archived, Received};
+use grove_core::resolve::{Choice, resolve};
 use grove_core::snapshot::{Outcome, take};
+use grove_core::state::State;
 use grove_core::sync::{Options, SyncReport, git_dir_for, sync_repo};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +30,26 @@ enum Cmd {
     Status {
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Also say what the next sync pass would do (no network, nothing changed)
+        #[arg(long)]
+        plan: bool,
+    },
+    /// Resolve a diverged worktree (an explicit choice; backups are always written)
+    Resolve {
+        /// The worktree directory
+        path: PathBuf,
+        /// Discard local commits, move to the remote tip
+        #[arg(long, group = "how")]
+        take_remote: bool,
+        /// Overwrite the remote branch with the local one
+        #[arg(long, group = "how")]
+        keep_local: bool,
+        /// Keep local commits on a new branch (own worktree), then take the remote tip
+        #[arg(long, value_name = "BRANCH", group = "how")]
+        save_as: Option<String>,
+        /// Open both sides in your difftool and change nothing
+        #[arg(long, group = "how")]
+        compare: bool,
     },
     /// Take a snapshot of the worktree at PATH into refs/sync/<machine>/<branch>
     Snapshot {
@@ -207,11 +229,47 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
         Cmd::Daemon { action } => daemon(action),
-        Cmd::Status { path } => status(path),
+        Cmd::Status { path, plan } => status(path, *plan),
+        Cmd::Resolve {
+            path,
+            take_remote,
+            keep_local,
+            save_as,
+            compare,
+        } => {
+            let cfg = load_config(&cli.config)?;
+            let choice = match (take_remote, keep_local, save_as, compare) {
+                (true, ..) => Choice::TakeRemote,
+                (_, true, ..) => Choice::KeepLocal,
+                (_, _, Some(b), _) => Choice::SaveAsBranch(b.clone()),
+                (.., true) => {
+                    let ok = std::process::Command::new("git")
+                        .current_dir(path)
+                        .args(["difftool", "-d", "HEAD", "@{upstream}"])
+                        .status()?
+                        .success();
+                    if !ok {
+                        bail!("git difftool failed (is a difftool configured?)");
+                    }
+                    return Ok(());
+                }
+                _ => bail!(
+                    "choose one of --take-remote, --keep-local, --save-as <branch>, --compare"
+                ),
+            };
+            println!("{}", resolve(path, &cfg.machine.name, &stamp(), &choice)?);
+            Ok(())
+        }
         Cmd::Snapshot { path } => {
             let cfg = load_config(&cli.config)?;
+            grove_core::snapshot::set_max_file_bytes(cfg.sync.max_file_mb * 1024 * 1024);
             match take(path, &cfg.machine.name, &stamp())? {
-                Outcome::Created(s) => println!("created {} {}", s.refname, s.commit),
+                Outcome::Created(s) => {
+                    println!("created {} {}", s.refname, s.commit);
+                    for f in &s.skipped {
+                        println!("left out (over the size limit): {f}");
+                    }
+                }
                 Outcome::Unchanged(c) => println!("unchanged {c}"),
             }
             Ok(())
@@ -234,6 +292,7 @@ fn main() -> Result<()> {
         }
         Cmd::Sync { path, offline } => {
             let cfg = load_config(&cli.config)?;
+            grove_core::snapshot::set_max_file_bytes(cfg.sync.max_file_mb * 1024 * 1024);
             let rep = sync_repo(
                 path,
                 &Options {
@@ -324,15 +383,29 @@ fn main() -> Result<()> {
     }
 }
 
-fn status(path: &Path) -> Result<()> {
+fn plan_for(s: &State) -> &'static str {
+    match s {
+        State::Synced => "nothing to do",
+        State::Dirty => "snapshot the working changes and push the snapshot ref",
+        State::Ahead => "nothing automatic: push your commits yourself",
+        State::Behind => "fast-forward to the remote tip",
+        State::BehindDirty => {
+            "keep your edits; adopt the remote tip only if the content is identical"
+        }
+        State::Diverged => "nothing automatic: run `grove resolve` to choose",
+        State::Error(_) => "retry; see the error",
+    }
+}
+
+fn status(path: &Path, plan: bool) -> Result<()> {
     for wt in worktrees(&git_dir_for(path))? {
         let branch = wt.branch.as_deref().unwrap_or("(detached)");
-        println!(
-            "{:<24} {:?}  {}",
-            branch,
-            state(&wt.path),
-            wt.path.display()
-        );
+        let st = state(&wt.path);
+        print!("{:<24} {:?}  {}", branch, st, wt.path.display());
+        if plan {
+            print!("\n    next: {}", plan_for(&st));
+        }
+        println!();
     }
     Ok(())
 }
@@ -361,6 +434,9 @@ fn print_report(rep: &SyncReport) -> Result<()> {
         let mut notes = Vec::new();
         if let Some(s) = w.snapshot {
             notes.push(format!("snapshot {s}"));
+        }
+        if !w.skipped.is_empty() {
+            notes.push(format!("left out (too large): {}", w.skipped.join(", ")));
         }
         match &w.received {
             Some(Received::FastForwarded { .. }) => notes.push("fast-forwarded".into()),
