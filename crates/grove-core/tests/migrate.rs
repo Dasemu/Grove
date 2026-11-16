@@ -170,19 +170,39 @@ fn refuses_unsafe_situations_without_touching_anything() {
     fs::write(subm.join(".gitmodules"), "").unwrap();
     assert!(refused(migrate(&subm, "m", &bk, "1")).contains("submodule"));
 
-    let multi = base.join("multi");
-    let g = init(&multi);
+    let locked = base.join("locked");
+    let g = init(&locked);
     commit(&g, "a", "1");
-    g.run(&[
-        "worktree",
-        "add",
-        "-q",
-        "-b",
-        "x",
-        base.join("extra").to_str().unwrap(),
-    ])
-    .unwrap();
-    assert!(refused(migrate(&multi, "m", &bk, "1")).contains("linked worktrees"));
+    let lw = base.join("locked-wt");
+    g.run(&["worktree", "add", "-q", "-b", "x", lw.to_str().unwrap()])
+        .unwrap();
+    g.run(&["worktree", "lock", lw.to_str().unwrap()]).unwrap();
+    assert!(refused(migrate(&locked, "m", &bk, "1")).contains("locked"));
+    assert!(locked.join(".git").is_dir(), "refusal touches nothing");
+
+    let prunable = base.join("prunable");
+    let g = init(&prunable);
+    commit(&g, "a", "1");
+    let pw = base.join("prunable-wt");
+    g.run(&["worktree", "add", "-q", "-b", "x", pw.to_str().unwrap()])
+        .unwrap();
+    fs::remove_dir_all(&pw).unwrap();
+    assert!(refused(migrate(&prunable, "m", &bk, "1")).contains("missing"));
+
+    let busy = base.join("busy");
+    let g = init(&busy);
+    commit(&g, "a", "1");
+    let bw = base.join("busy-wt");
+    g.run(&["worktree", "add", "-q", "-b", "x", bw.to_str().unwrap()])
+        .unwrap();
+    let meta = fs::read_to_string(bw.join(".git")).unwrap();
+    let meta = meta.trim().strip_prefix("gitdir: ").unwrap();
+    fs::write(std::path::Path::new(meta).join("MERGE_HEAD"), "x").unwrap();
+    let m = refused(migrate(&busy, "m", &bk, "1"));
+    assert!(
+        m.contains("in progress") && m.contains("linked worktree"),
+        "{m}"
+    );
 
     let done = base.join("done");
     let g = init(&done);
@@ -208,4 +228,170 @@ fn refuses_unsafe_situations_without_touching_anything() {
     // Subdirectory is not a repo root.
     fs::create_dir(inside.join("sub")).unwrap();
     assert!(refused(migrate(&inside.join("sub"), "m", &bk, "1")).contains("plain clone"));
+}
+
+/// Observable state of a worktree: HEAD, branch and `status --ignored`.
+fn wt_state(dir: &std::path::Path) -> String {
+    let g = Git::new(dir);
+    format!(
+        "{}|{}|{}",
+        g.run(&["rev-parse", "HEAD"]).unwrap(),
+        g.probe(&["symbolic-ref", "-q", "HEAD"])
+            .unwrap()
+            .unwrap_or_default(),
+        g.run(&["status", "--porcelain", "--ignored"]).unwrap()
+    )
+}
+
+/// A repo with a detached worktree nested in it and a dirty branch worktree next to it.
+fn repo_with_linked(
+    base: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let repo = base.join("proj");
+    let g = messy_repo(&repo);
+    let nested = repo.join(".claude/worktrees/wt1");
+    fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    g.run(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        nested.to_str().unwrap(),
+    ])
+    .unwrap();
+    fs::write(nested.join("src/a.txt"), "nested edit\n").unwrap();
+    fs::write(nested.join("nested-untracked.txt"), "n\n").unwrap();
+    fs::write(nested.join("nested.env"), "ignored\n").unwrap();
+    let outside = base.join("proj-feature");
+    g.run(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feat/out",
+        outside.to_str().unwrap(),
+    ])
+    .unwrap();
+    fs::write(outside.join("b.txt"), "outside edit\n").unwrap();
+    fs::write(outside.join("new-staged.txt"), "s\n").unwrap();
+    Git::new(&outside).run(&["add", "new-staged.txt"]).unwrap();
+    fs::write(outside.join("out-untracked.txt"), "u\n").unwrap();
+    fs::write(outside.join("out.env"), "ignored\n").unwrap();
+    (repo, nested, outside)
+}
+
+fn same_links(wt: &std::path::Path, bare: &std::path::Path) {
+    let pointer = fs::read_to_string(wt.join(".git")).unwrap();
+    let meta = std::path::PathBuf::from(pointer.trim().strip_prefix("gitdir: ").unwrap());
+    assert!(meta.starts_with(bare.join("worktrees")), "{pointer}");
+    let back = fs::read_to_string(meta.join("gitdir")).unwrap();
+    assert_eq!(back.trim(), wt.join(".git").to_str().unwrap());
+}
+
+#[test]
+fn migrates_with_nested_detached_and_outside_branch_worktrees() {
+    let base = tmpdir("linked");
+    let (repo, nested, outside) = repo_with_linked(&base);
+    let (nested_before, outside_before) = (wt_state(&nested), wt_state(&outside));
+    let main_before = wt_state(&repo);
+    assert!(nested_before.contains("nested-untracked.txt"));
+
+    let r = migrate(&repo, "m", &base.join("bk"), "1").unwrap();
+
+    let root = repo.canonicalize().unwrap();
+    let new_nested = root.join("main/.claude/worktrees/wt1");
+    assert_eq!(names(&root), vec![".bare", "main"]);
+    assert_eq!(r.linked.len(), 2);
+    let find = |p: &std::path::Path| r.linked.iter().find(|l| l.path == p).unwrap();
+    assert_eq!(find(&new_nested).branch, None);
+    assert_eq!(
+        find(&new_nested).old_path,
+        root.join(".claude/worktrees/wt1")
+    );
+    let out_canon = outside.canonicalize().unwrap();
+    assert_eq!(find(&out_canon).branch.as_deref(), Some("feat/out"));
+    assert_eq!(find(&out_canon).old_path, out_canon);
+    assert_eq!(
+        r.linked_backups.len(),
+        1,
+        "outside worktree gets its own tar"
+    );
+    assert!(r.linked_backups[0].metadata().unwrap().len() > 0);
+
+    // Same observable state in all three worktrees, and links point both ways.
+    assert_eq!(wt_state(&r.worktree), main_before);
+    assert_eq!(wt_state(&new_nested), nested_before);
+    assert_eq!(wt_state(&outside), outside_before);
+    same_links(&new_nested, &r.bare_dir);
+    same_links(&outside.canonicalize().unwrap(), &r.bare_dir);
+    assert!(!root.join(".claude").exists());
+    assert_eq!(
+        fs::read_to_string(outside.join("b.txt")).unwrap(),
+        "outside edit\n"
+    );
+    assert!(outside.join("out.env").exists());
+    assert!(new_nested.join("nested.env").exists());
+
+    let list = Git::new(&r.worktree)
+        .run(&["worktree", "list", "--porcelain"])
+        .unwrap();
+    assert!(list.contains(&format!("worktree {}", new_nested.display())));
+    assert!(list.contains(&format!(
+        "worktree {}",
+        outside.canonicalize().unwrap().display()
+    )));
+    assert!(!list.contains("prunable"), "{list}");
+
+    // They are still usable: commit on the outside branch, status in the nested one.
+    let og = Git::new(&outside);
+    og.run(&["commit", "-qam", "more"]).unwrap();
+    assert!(Git::new(&new_nested).run(&["status"]).is_ok());
+}
+
+#[test]
+fn rollback_restores_linked_worktrees_at_every_step() {
+    for step in [
+        Step::Staged,
+        Step::GitMoved,
+        Step::WorktreeAdded,
+        Step::Filled,
+        Step::Relinked,
+        Step::IndexMoved,
+        Step::Verified,
+    ] {
+        let base = tmpdir("rblinked");
+        let (repo, nested, outside) = repo_with_linked(&base);
+        let before = (wt_state(&repo), wt_state(&nested), wt_state(&outside));
+        let files = (
+            fs::read_to_string(nested.join(".git")).unwrap(),
+            fs::read_to_string(outside.join(".git")).unwrap(),
+        );
+        let names_before = names(&repo);
+
+        let err = migrate_failing_after(&repo, "m", &base.join("bk"), "1", step).unwrap_err();
+        let MigrateError::Failed { rolled_back, .. } = err else {
+            panic!("{step:?}: expected Failed")
+        };
+        assert!(rolled_back, "{step:?}");
+
+        assert_eq!(names(&repo), names_before, "{step:?}");
+        assert_eq!(
+            (wt_state(&repo), wt_state(&nested), wt_state(&outside)),
+            before,
+            "{step:?}"
+        );
+        assert_eq!(fs::read_to_string(nested.join(".git")).unwrap(), files.0);
+        assert_eq!(fs::read_to_string(outside.join(".git")).unwrap(), files.1);
+        let g = Git::new(&repo);
+        let list = g.run(&["worktree", "list", "--porcelain"]).unwrap();
+        assert_eq!(list.matches("worktree ").count(), 3, "{step:?}: {list}");
+        assert!(!list.contains("prunable"), "{step:?}: {list}");
+        assert_eq!(
+            fs::read_dir(repo.join(".git/worktrees")).unwrap().count(),
+            2,
+            "{step:?}: only the original worktree metadata remains"
+        );
+        // And a retry succeeds afterwards.
+        migrate(&repo, "m", &base.join("bk"), "2").unwrap();
+    }
 }
