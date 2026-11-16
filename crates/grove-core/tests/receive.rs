@@ -9,6 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 struct World {
+    _tmp: common::tmp::TempDir,
     base: PathBuf,
     remote: PathBuf,
     g1: Git,
@@ -19,7 +20,8 @@ struct World {
 
 /// Bare remote plus two plain clones (machines "m1" and "m2") sharing `main` with one commit.
 fn world() -> World {
-    let base = tmpdir("recv");
+    let tmp = tmpdir("recv");
+    let base = tmp.to_path_buf();
     let remote = base.join("remote.git");
     Git::new(&base)
         .run(&[
@@ -51,6 +53,7 @@ fn world() -> World {
     g2.run(&["config", "user.email", "t@t"]).unwrap();
     g2.run(&["config", "user.name", "t"]).unwrap();
     World {
+        _tmp: tmp,
         base,
         remote,
         g1,

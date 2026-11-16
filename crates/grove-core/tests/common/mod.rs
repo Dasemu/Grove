@@ -1,19 +1,14 @@
 #![allow(dead_code)]
 use grove_core::git::Git;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-pub fn tmpdir(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "grove-test-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&p).unwrap();
-    p
+#[path = "../../../../test-support/tmp.rs"]
+pub mod tmp;
+
+/// A unique temp dir that is removed (recursively) when dropped, also if the test fails.
+pub fn tmpdir(tag: &str) -> tmp::TempDir {
+    tmp::TempDir::new(tag)
 }
 
 pub fn init(dir: &Path) -> Git {

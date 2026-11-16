@@ -1,21 +1,10 @@
 use grove_core::git::Git;
 use grove_core::inspect::{state, worktrees};
 use grove_core::state::State;
+mod common;
+use common::tmpdir;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-fn tmpdir(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "grove-test-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&p).unwrap();
-    p
-}
 
 fn commit(g: &Git, dir: &Path, file: &str, body: &str) {
     fs::write(dir.join(file), body).unwrap();
@@ -24,7 +13,7 @@ fn commit(g: &Git, dir: &Path, file: &str, body: &str) {
 }
 
 /// A bare "remote" plus two clones (two machines) tracking its `main`.
-fn setup() -> (Git, PathBuf, Git, PathBuf) {
+fn setup() -> (common::tmp::TempDir, Git, PathBuf, Git, PathBuf) {
     let base = tmpdir("inspect");
     let remote = base.join("remote.git");
     Git::new(&base)
@@ -60,12 +49,12 @@ fn setup() -> (Git, PathBuf, Git, PathBuf) {
     g2.run(&["pull", "-q", "origin", "main"]).unwrap();
     g2.run(&["branch", "-q", "--set-upstream-to=origin/main", "main"])
         .unwrap();
-    (g1, d1, g2, d2)
+    (base, g1, d1, g2, d2)
 }
 
 #[test]
 fn classifies_real_repos() {
-    let (g1, d1, g2, d2) = setup();
+    let (_base, g1, d1, g2, d2) = setup();
     assert_eq!(state(&d1), State::Synced);
 
     fs::write(d1.join("wip.txt"), "x").unwrap();
