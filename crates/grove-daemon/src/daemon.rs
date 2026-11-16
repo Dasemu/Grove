@@ -3,7 +3,7 @@
 //! so passes never overlap.
 
 use crate::activity::{Activity, now_secs};
-use crate::discover::{discover, group_of};
+use crate::discover::{discover, group_of, is_bare_layout, subdirs};
 use crate::ipc;
 use crate::visibility::{RealForge, Visibility, snapshot_gate};
 use grove_core::config::Config;
@@ -19,6 +19,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+/// Quiet time after the first layout event before rediscovery runs (`grove add` does several
+/// renames in a row).
+const RESCAN_DEBOUNCE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -87,6 +90,8 @@ pub struct Shared {
 
 pub enum Msg {
     Changed(PathBuf),
+    /// The layout under a group directory may have changed: rediscover (debounced).
+    Rescan,
     /// Sync one repo (or all) as soon as possible.
     SyncNow(Option<PathBuf>),
     Shutdown,
@@ -180,13 +185,40 @@ fn repo_of<'a>(path: &Path, repos: &'a [PathBuf]) -> Option<&'a PathBuf> {
     repos.iter().find(|r| path.starts_with(r))
 }
 
+/// True for events that may change what is managed: a child directory of a configured group
+/// appearing, disappearing or being renamed, a group directory itself doing so under the root, or
+/// `.bare` / `.git` appearing or disappearing inside such a child.
+pub fn triggers_rediscovery(path: &Path, root: &Path, groups: &[String]) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let in_group = |n: &String| groups.contains(n);
+    match parts.as_slice() {
+        [g] => in_group(g),
+        [g, _] => in_group(g),
+        [g, _, f] => in_group(g) && (f == ".bare" || f == ".git"),
+        _ => false,
+    }
+}
+
 struct Watch {
     watcher: Option<notify::RecommendedWatcher>,
     repos: Arc<Mutex<Vec<PathBuf>>>,
-    watched: Vec<PathBuf>,
+    /// Watched paths and whether the watch is recursive.
+    watched: HashMap<PathBuf, bool>,
 }
 
-fn make_watch(tx: Sender<Msg>, extra: Vec<String>, ctx: &Ctx) -> Watch {
+fn make_watch(
+    tx: Sender<Msg>,
+    extra: Vec<String>,
+    root: PathBuf,
+    groups: Vec<String>,
+    ctx: &Ctx,
+) -> Watch {
     let repos: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
     let cb_repos = repos.clone();
     let handler = move |res: notify::Result<notify::Event>| {
@@ -196,6 +228,9 @@ fn make_watch(tx: Sender<Msg>, extra: Vec<String>, ctx: &Ctx) -> Watch {
         }
         let repos = cb_repos.lock().unwrap();
         for p in &ev.paths {
+            if triggers_rediscovery(p, &root, &groups) {
+                let _ = tx.send(Msg::Rescan);
+            }
             if let Some(r) = repo_of(p, &repos)
                 && let Ok(rel) = p.strip_prefix(r)
                 && !ignored(rel, &extra)
@@ -218,45 +253,111 @@ fn make_watch(tx: Sender<Msg>, extra: Vec<String>, ctx: &Ctx) -> Watch {
     Watch {
         watcher,
         repos,
-        watched: Vec::new(),
+        watched: HashMap::new(),
     }
 }
 
 impl Watch {
-    fn add(&mut self, repo: &Path, ctx: &Ctx) {
-        if self.watched.iter().any(|w| w == repo) {
-            return;
+    /// Makes the set of watches match `wanted`. Watches are only ever added or removed here;
+    /// nothing in the watched directories is touched.
+    fn sync(&mut self, wanted: HashMap<PathBuf, bool>, ctx: &Ctx) {
+        let stale: Vec<PathBuf> = self
+            .watched
+            .iter()
+            // A deleted directory loses its inotify watch, so a recreated one needs a new one.
+            .filter(|(p, rec)| wanted.get(*p) != Some(*rec) || !p.exists())
+            .map(|(p, _)| p.clone())
+            .collect();
+        for p in stale {
+            self.watched.remove(&p);
+            if let Some(w) = &mut self.watcher {
+                let _ = w.unwatch(&p);
+            }
         }
-        self.watched.push(repo.to_path_buf());
-        self.repos.lock().unwrap().push(repo.to_path_buf());
-        if let Some(w) = &mut self.watcher
-            && let Err(e) = w.watch(repo, RecursiveMode::Recursive)
-        {
-            ctx.activity.log(
-                "watch_error",
-                Some(&repo.display().to_string()),
-                format!(
-                    "cannot watch (raise fs.inotify.max_user_watches?): {e}; relying on periodic passes"
-                ),
-            );
+        for (p, rec) in wanted {
+            if self.watched.contains_key(&p) || !p.exists() {
+                continue;
+            }
+            self.watched.insert(p.clone(), rec);
+            let mode = if rec {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+            if let Some(w) = &mut self.watcher
+                && let Err(e) = w.watch(&p, mode)
+            {
+                ctx.activity.log(
+                    "watch_error",
+                    Some(&p.display().to_string()),
+                    format!(
+                        "cannot watch (raise fs.inotify.max_user_watches?): {e}; relying on periodic passes"
+                    ),
+                );
+            }
         }
     }
 }
 
-fn rescan(root: &Path, groups: &[String], watch: &mut Watch, ctx: &Ctx) -> Vec<PathBuf> {
+/// Re-runs discovery and makes the shared status, the watches and the repo list match it.
+/// Returns the managed repos found now and the ones that were not managed before.
+fn rescan(
+    root: &Path,
+    groups: &[String],
+    watch: &mut Watch,
+    ctx: &Ctx,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let d = discover(root, groups);
     let found = d.managed;
-    let mut shared = ctx.shared.lock().unwrap();
-    shared.not_migrated = d.not_migrated;
-    shared.repos.retain(|p, _| found.contains(p));
-    for r in &found {
-        shared.repos.entry(r.clone()).or_default();
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    {
+        let mut shared = ctx.shared.lock().unwrap();
+        shared.not_migrated = d.not_migrated;
+        shared.repos.retain(|p, _| {
+            let keep = found.contains(p);
+            if !keep {
+                removed.push(p.clone());
+            }
+            keep
+        });
+        for r in &found {
+            if !shared.repos.contains_key(r) {
+                shared.repos.insert(r.clone(), RepoStatus::default());
+                added.push(r.clone());
+            }
+        }
     }
-    drop(shared);
-    for r in &found {
-        watch.add(r, ctx);
+    for r in &added {
+        ctx.activity
+            .log("repo_added", Some(&r.display().to_string()), "now managed");
     }
-    found
+    for r in &removed {
+        ctx.activity.log(
+            "repo_removed",
+            Some(&r.display().to_string()),
+            "no longer managed (directory gone or no longer a bare layout); files untouched",
+        );
+    }
+    let mut wanted: HashMap<PathBuf, bool> = HashMap::new();
+    wanted.insert(root.to_path_buf(), false);
+    let mut names: Vec<&String> = groups.iter().collect();
+    names.dedup();
+    for g in names {
+        let gdir = root.join(g);
+        wanted.insert(gdir.clone(), false);
+        for child in subdirs(&gdir) {
+            // Children that are not managed yet are watched shallowly so `.bare` appearing
+            // inside them (`grove add`, `grove import`) is noticed.
+            wanted.entry(child).or_insert(false);
+        }
+    }
+    for r in &found {
+        wanted.insert(r.clone(), true);
+    }
+    *watch.repos.lock().unwrap() = found.clone();
+    watch.sync(wanted, ctx);
+    (found, added)
 }
 
 fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
@@ -265,7 +366,13 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
     let root = cfg.root_path();
     let groups: Vec<String> = cfg.groups.iter().map(|g| g.name.clone()).collect();
     let mut visibility = Visibility::load(st.visibility_cache.clone());
-    let mut watch = make_watch(ctx.tx.clone(), cfg.sync.ignore_extra.clone(), &ctx);
+    let mut watch = make_watch(
+        ctx.tx.clone(),
+        cfg.sync.ignore_extra.clone(),
+        root.clone(),
+        groups.clone(),
+        &ctx,
+    );
     rescan(&root, &groups, &mut watch, &ctx);
 
     // due_at: when a repo should next be synced; backoff_until: earliest retry after failures.
@@ -276,6 +383,8 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
     let mut first_at: HashMap<PathBuf, Instant> = HashMap::new();
     let max_wait = (debounce * 10).max(Duration::from_secs(5));
     let mut next_full = Instant::now();
+    // When a debounced rediscovery is due (set by the first event of a burst, never pushed back).
+    let mut rescan_at: Option<Instant> = None;
 
     loop {
         let now = Instant::now();
@@ -283,6 +392,7 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
             .values()
             .copied()
             .chain([next_full])
+            .chain(rescan_at)
             .min()
             .unwrap_or(next_full);
         let mut timeout = wake
@@ -306,6 +416,9 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
                     s.phase = "pending";
                 }
             }
+            Ok(Msg::Rescan) => {
+                rescan_at.get_or_insert(Instant::now() + RESCAN_DEBOUNCE);
+            }
             Ok(Msg::SyncNow(Some(r))) => {
                 backoff_until.remove(&r);
                 due_at.insert(r, Instant::now());
@@ -317,13 +430,23 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
             Ok(Msg::Shutdown) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
+        // Discovery also runs while paused so the status stays current; only syncing stops.
+        if rescan_at.is_some_and(|t| t <= Instant::now()) {
+            rescan_at = None;
+            let (found, added) = rescan(&root, &groups, &mut watch, &ctx);
+            forget_removed(&found, &mut due_at, &mut first_at, &mut backoff_until);
+            for r in added {
+                due_at.insert(r, Instant::now());
+            }
+        }
         if ctx.shared.lock().unwrap().paused {
             continue;
         }
         let now = Instant::now();
         if now >= next_full {
-            let found = rescan(&root, &groups, &mut watch, &ctx);
-            due_at.retain(|r, _| found.contains(r));
+            // Safety net for events the watcher missed (one `read_dir` per group).
+            let (found, _) = rescan(&root, &groups, &mut watch, &ctx);
+            forget_removed(&found, &mut due_at, &mut first_at, &mut backoff_until);
             for r in found {
                 due_at.insert(r, now);
             }
@@ -342,10 +465,22 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
             }
             due_at.remove(&r);
             first_at.remove(&r);
+            if !is_bare_layout(&r) {
+                // Removed or migrated away since the last discovery: drop it, no error.
+                let (found, _) = rescan(&root, &groups, &mut watch, &ctx);
+                forget_removed(&found, &mut due_at, &mut first_at, &mut backoff_until);
+                continue;
+            }
             // While backing off after a failure, still snapshot local work (no network needed);
             // the network is retried at the first pass after the backoff expires.
             let offline = backoff_until.get(&r).is_some_and(|u| *u > now);
             let failures = pass(&r, &cfg, &st, &mut visibility, offline, &ctx);
+            if !is_bare_layout(&r) {
+                // It vanished mid-pass: whatever the pass reported is moot.
+                let (found, _) = rescan(&root, &groups, &mut watch, &ctx);
+                forget_removed(&found, &mut due_at, &mut first_at, &mut backoff_until);
+                continue;
+            }
             if offline {
                 continue;
             }
@@ -362,6 +497,18 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
         }
     }
     ctx.activity.log("stop", None, "daemon stopped");
+}
+
+/// Drops scheduling state of repos that are no longer managed.
+fn forget_removed(
+    found: &[PathBuf],
+    due_at: &mut HashMap<PathBuf, Instant>,
+    first_at: &mut HashMap<PathBuf, Instant>,
+    backoff_until: &mut HashMap<PathBuf, Instant>,
+) {
+    due_at.retain(|r, _| found.contains(r));
+    first_at.retain(|r, _| found.contains(r));
+    backoff_until.retain(|r, _| found.contains(r));
 }
 
 /// One sync pass for `repo`; returns the number of consecutive failures (0 = success).
@@ -409,7 +556,10 @@ fn pass(
     };
     let result = sync_repo(repo, &opts);
     let mut shared = ctx.shared.lock().unwrap();
-    let status = shared.repos.entry(repo.to_path_buf()).or_default();
+    // The repo may have been dropped by a rediscovery while the pass ran.
+    let Some(status) = shared.repos.get_mut(repo) else {
+        return 0;
+    };
     let mut errors: Vec<String> = Vec::new();
     match result {
         Err(e) => errors.push(e.to_string()),
@@ -494,7 +644,9 @@ fn pass(
 /// Records why snapshots are withheld (or that they are pushed again), logging only changes.
 fn note_snapshot_gate(ctx: &Ctx, repo: &Path, name: &str, withheld: Option<String>) {
     let mut shared = ctx.shared.lock().unwrap();
-    let status = shared.repos.entry(repo.to_path_buf()).or_default();
+    let Some(status) = shared.repos.get_mut(repo) else {
+        return;
+    };
     status.gate_allowed = Some(withheld.is_none());
     if status.snapshots_withheld == withheld {
         return;
@@ -555,5 +707,21 @@ mod tests {
         assert!(ignored(Path::new("main/node_modules/x/y.js"), &extra));
         assert!(ignored(Path::new("main/src/.a.rs.swp"), &extra));
         assert!(!ignored(Path::new("main/src/a.rs"), &extra));
+    }
+
+    #[test]
+    fn layout_events_trigger_rediscovery() {
+        let root = Path::new("/r");
+        let g = vec!["g".to_string()];
+        let t = |p: &str| triggers_rediscovery(Path::new(p), root, &g);
+        assert!(t("/r/g"));
+        assert!(t("/r/g/repo"));
+        assert!(t("/r/g/repo/.bare"));
+        assert!(t("/r/g/repo/.git"));
+        assert!(!t("/r/g/repo/main"));
+        assert!(!t("/r/g/repo/main/.bare"));
+        assert!(!t("/r/other"));
+        assert!(!t("/r/other/x/.bare"));
+        assert!(!t("/elsewhere/g/x"));
     }
 }

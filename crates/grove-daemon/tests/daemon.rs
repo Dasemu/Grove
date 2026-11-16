@@ -527,3 +527,132 @@ fn snapshots_already_pushed_are_deleted_when_they_become_withheld() {
     let log = fs::read_to_string(w.base.join("pca.jsonl")).unwrap();
     assert!(log.contains("snapshots_purged"), "{log}");
 }
+
+/// A daemon whose periodic pass is far away, so only events (not the safety net) can notice changes.
+fn start_event_only(w: &World, machine: &str) -> (Daemon, PathBuf) {
+    let st = settings(w, machine);
+    let sock = st.socket.clone();
+    (
+        Daemon::start(config(w, machine, 200, 3600), st).unwrap(),
+        sock,
+    )
+}
+
+fn repo_paths(sock: &Path) -> Vec<String> {
+    let mut v: Vec<String> = status(sock)["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["path"].as_str().unwrap().to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn repo_migrated_after_start_is_picked_up_and_synced() {
+    let w = world("rd-migrate", &["pca"]);
+    let root = w.base.join("pca");
+    let plain = root.join("g/plain");
+    git(
+        &root.join("g"),
+        &["clone", "-q", w.remote.to_str().unwrap(), "plain"],
+    );
+    let (d, sock) = start_event_only(&w, "pca");
+    wait_until("plain clone reported", 10, || {
+        status(&sock)["not_migrated"] == json!([plain.display().to_string()])
+    });
+
+    // Migrate in place, as `grove add` does: the clone goes away, the bare layout takes its place.
+    fs::remove_dir_all(&plain).unwrap();
+    bare_layout(&plain, &w.remote);
+    wait_until("migrated repo managed", 10, || {
+        repo_paths(&sock).contains(&plain.display().to_string())
+            && status(&sock)["not_migrated"] == json!([])
+    });
+    fs::write(plain.join("main/wip.txt"), "wip\n").unwrap();
+    wait_until("snapshot of the new repo on the remote", 30, || {
+        git(&w.remote, &["for-each-ref", "refs/sync/pca/"]).contains("refs/sync/pca/main")
+    });
+    d.shutdown();
+}
+
+#[test]
+fn repo_cloned_with_bare_layout_after_start_is_picked_up() {
+    let w = world("rd-clone", &["pca"]);
+    let root = w.base.join("pca");
+    let (d, sock) = start_event_only(&w, "pca");
+    wait_until("initial repo listed", 10, || repo_paths(&sock).len() == 1);
+
+    // Like `grove import`: the directory appears first, `.bare` a moment later.
+    let new = root.join("g/imported");
+    fs::create_dir_all(&new).unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(repo_paths(&sock).len(), 1);
+    bare_layout(&new, &w.remote);
+    wait_until("imported repo managed", 10, || {
+        repo_paths(&sock).contains(&new.display().to_string())
+    });
+    fs::write(new.join("main/wip.txt"), "wip\n").unwrap();
+    wait_until("snapshot of the imported repo", 30, || {
+        git(&w.remote, &["for-each-ref", "refs/sync/pca/"]).contains("refs/sync/pca/main")
+    });
+    d.shutdown();
+}
+
+#[test]
+fn managed_repo_removed_after_start_disappears_without_crash() {
+    let w = world("rd-remove", &["pca"]);
+    let root = w.base.join("pca");
+    bare_layout(&root.join("g/second"), &w.remote);
+    let (d, sock) = start_event_only(&w, "pca");
+    wait_until("both repos listed", 10, || repo_paths(&sock).len() == 2);
+
+    // Keep the first repo busy so a pass may be running when the other one vanishes.
+    fs::write(root.join("g/repo/main/busy.txt"), "x\n").unwrap();
+    fs::remove_dir_all(root.join("g/second")).unwrap();
+    wait_until("removed repo dropped", 10, || {
+        repo_paths(&sock) == vec![root.join("g/repo").display().to_string()]
+    });
+    // The daemon is alive, the other repo still syncs, and the removal was not logged as an error.
+    assert_eq!(
+        ipc::request(&sock, &json!({"v":1,"cmd":"ping"})).unwrap()["data"],
+        "pong"
+    );
+    wait_until("remaining repo still synced", 30, || {
+        git(&w.remote, &["for-each-ref", "refs/sync/pca/"]).contains("refs/sync/pca/main")
+    });
+    let log = ipc::request(&sock, &json!({"v":1,"cmd":"log","limit":500})).unwrap();
+    let errors: Vec<_> = log["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "error")
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    d.shutdown();
+}
+
+#[test]
+fn not_migrated_list_follows_clones_added_and_removed() {
+    let w = world("rd-notmig", &["pca"]);
+    let root = w.base.join("pca");
+    let (d, sock) = start_event_only(&w, "pca");
+    wait_until("initial repo listed", 10, || repo_paths(&sock).len() == 1);
+    assert_eq!(status(&sock)["not_migrated"], json!([]));
+
+    let plain = root.join("g/plain");
+    git(
+        &root.join("g"),
+        &["clone", "-q", w.remote.to_str().unwrap(), "plain"],
+    );
+    wait_until("new clone reported", 10, || {
+        status(&sock)["not_migrated"] == json!([plain.display().to_string()])
+    });
+    // Deleted (e.g. moved to the trash): it must leave the list again.
+    fs::remove_dir_all(&plain).unwrap();
+    wait_until("deleted clone dropped", 10, || {
+        status(&sock)["not_migrated"] == json!([])
+    });
+    d.shutdown();
+}

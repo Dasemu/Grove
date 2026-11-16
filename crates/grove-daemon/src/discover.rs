@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-fn is_bare_layout(p: &Path) -> bool {
+pub fn is_bare_layout(p: &Path) -> bool {
     p.join(".bare").is_dir()
 }
 
@@ -22,7 +22,7 @@ fn is_plain_clone(p: &Path) -> bool {
     !is_bare_layout(p) && p.join(".git").exists() && !is_linked_worktree(p)
 }
 
-fn subdirs(p: &Path) -> Vec<PathBuf> {
+pub fn subdirs(p: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(p)
         .into_iter()
         .flatten()
