@@ -161,7 +161,7 @@ fn handle(req: &Request, ctx: &Ctx) -> Value {
                         "last_error": r.last_error,
                         "failures": r.failures,
                         "worktrees": r.worktrees.iter()
-                            .map(|w| json!({"branch": w.branch, "state": w.state}))
+                            .map(|w| json!({"branch": w.branch, "state": w.state, "path": w.path}))
                             .collect::<Vec<_>>(),
                     })
                 })

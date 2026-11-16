@@ -42,6 +42,7 @@ impl Settings {
 pub struct WtStatus {
     pub branch: Option<String>,
     pub state: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -417,6 +418,7 @@ fn pass(
                 now_wts.push(WtStatus {
                     branch: w.branch.clone(),
                     state,
+                    path: w.path.display().to_string(),
                 });
             }
             status.worktrees = now_wts;
