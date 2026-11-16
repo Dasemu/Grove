@@ -5,7 +5,6 @@ use crate::git::{Git, GitError};
 use crate::layout::dir_name;
 use crate::receive::{ensure_fetch_refspec, materialize};
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -53,7 +52,8 @@ pub fn clone_bare_layout(
     dir: &Path,
     envs: &[(String, String)],
 ) -> Result<Vec<PathBuf>, GitError> {
-    fs::create_dir_all(dir)?;
+    // Released last: until then the daemon ignores the half-built repo.
+    let _busy = crate::busy::BusyGuard::acquire(dir)?;
     let bare = dir.join(".bare");
     let mut g = Git::new(dir);
     for (k, v) in envs {
@@ -85,7 +85,7 @@ pub fn clone_bare_layout(
 /// Creates a brand new local repo in the bare layout with an initial empty commit on `main`,
 /// pointing at `url`. Nothing is pushed here.
 pub fn init_bare_layout(dir: &Path, url: &str) -> Result<PathBuf, GitError> {
-    fs::create_dir_all(dir)?;
+    let _busy = crate::busy::BusyGuard::acquire(dir)?;
     let bare = dir.join(".bare");
     let g = Git::new(dir);
     g.run(&[

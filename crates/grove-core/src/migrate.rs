@@ -19,6 +19,7 @@ use std::process::Command;
 
 const BARE: &str = ".bare";
 const STAGE: &str = ".grove-stage";
+const BUSY: &str = crate::busy::BUSY;
 
 #[derive(Debug)]
 pub enum MigrateError {
@@ -477,7 +478,9 @@ fn migrate_inner(
     let (backup_tar, backup_ref, linked_backups) =
         backup(&root, &git, machine, backup_dir, stamp, &linked)?;
 
-    let dir = dir_name(&branch, &[BARE, STAGE]);
+    let dir = dir_name(&branch, &[BARE, STAGE, BUSY]);
+    // From here on the daemon must leave the repo alone; dropped last, also after a rollback.
+    let _busy = crate::busy::BusyGuard::acquire(&root)?;
     let mut p = Progress {
         orig_ids: list_ids(&root.join(".git")),
         ..Progress::default()
@@ -573,7 +576,7 @@ fn run_steps(
     // 1. Move everything except .git into a staging dir.
     fs::create_dir(&stage).map_err(s)?;
     p.staged = true;
-    move_entries(root, &stage, &[".git", STAGE]).map_err(s)?;
+    move_entries(root, &stage, &[".git", STAGE, BUSY]).map_err(s)?;
     hook(inject, Step::Staged)?;
 
     // 2. .git -> .bare, make it bare.

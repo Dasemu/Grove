@@ -59,7 +59,7 @@ socket is refused; a stale socket file left by a crash is replaced.
 
 JSON lines in `<state dir>/activity.jsonl` (rotated at 5 MiB to `.jsonl.1`), the last 500 events in
 memory, and live via `subscribe`. Kinds: `start`, `stop`, `snapshot`, `fast_forward`, `applied`,
-`declined`, `snapshots_withheld`, `snapshots_enabled`, `snapshots_purged`, `state` (worktree state changed), `materialized`, `archived`, `error`, `watch_error`,
+`declined`, `snapshots_withheld`, `snapshots_enabled`, `snapshots_purged`, `state` (worktree state changed), `materialized`, `archived`, `repo_added`, `repo_removed`, `repo_stalled`, `error`, `watch_error`,
 `pause`, `resume`.
 
 ## CLI
@@ -99,6 +99,6 @@ discard the staged version).
 - Peer-credential check on the socket: access control is the 0700 directory only.
 - GUI/tray (Phase 3), providers and wizards (Phase 4).
 - Remote-change notifications (webhooks); only polling at `fetch_interval_s`.
-- Config reload: restart the daemon after editing `config.toml`.
+- Config reload: restart the daemon after editing `config.toml`. (Repos added, migrated or removed under the configured groups are picked up at runtime; see `docs/phase6.md`.)
 - Watching skips no heavy ignored directories (`node_modules`, `target`) at watch time; add them to
   `sync.ignore_extra` to avoid triggering passes, and raise the inotify limit if needed.

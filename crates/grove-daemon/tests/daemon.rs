@@ -527,3 +527,220 @@ fn snapshots_already_pushed_are_deleted_when_they_become_withheld() {
     let log = fs::read_to_string(w.base.join("pca.jsonl")).unwrap();
     assert!(log.contains("snapshots_purged"), "{log}");
 }
+
+/// A daemon whose periodic pass is far away, so only events (not the safety net) can notice changes.
+fn start_event_only(w: &World, machine: &str) -> (Daemon, PathBuf) {
+    let st = settings(w, machine);
+    let sock = st.socket.clone();
+    (
+        Daemon::start(config(w, machine, 200, 3600), st).unwrap(),
+        sock,
+    )
+}
+
+fn repo_paths(sock: &Path) -> Vec<String> {
+    let mut v: Vec<String> = status(sock)["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["path"].as_str().unwrap().to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn repo_migrated_after_start_is_picked_up_and_synced() {
+    let w = world("rd-migrate", &["pca"]);
+    let root = w.base.join("pca");
+    let plain = root.join("g/plain");
+    git(
+        &root.join("g"),
+        &["clone", "-q", w.remote.to_str().unwrap(), "plain"],
+    );
+    let (d, sock) = start_event_only(&w, "pca");
+    wait_until("plain clone reported", 10, || {
+        status(&sock)["not_migrated"] == json!([plain.display().to_string()])
+    });
+
+    // Migrate in place, as `grove add` does: the clone goes away, the bare layout takes its place.
+    fs::remove_dir_all(&plain).unwrap();
+    bare_layout(&plain, &w.remote);
+    wait_until("migrated repo managed", 10, || {
+        repo_paths(&sock).contains(&plain.display().to_string())
+            && status(&sock)["not_migrated"] == json!([])
+    });
+    fs::write(plain.join("main/wip.txt"), "wip\n").unwrap();
+    wait_until("snapshot of the new repo on the remote", 30, || {
+        git(&w.remote, &["for-each-ref", "refs/sync/pca/"]).contains("refs/sync/pca/main")
+    });
+    d.shutdown();
+}
+
+#[test]
+fn repo_cloned_with_bare_layout_after_start_is_picked_up() {
+    let w = world("rd-clone", &["pca"]);
+    let root = w.base.join("pca");
+    let (d, sock) = start_event_only(&w, "pca");
+    wait_until("initial repo listed", 10, || repo_paths(&sock).len() == 1);
+
+    // Like `grove import`: the directory appears first, `.bare` a moment later.
+    let new = root.join("g/imported");
+    fs::create_dir_all(&new).unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(repo_paths(&sock).len(), 1);
+    bare_layout(&new, &w.remote);
+    wait_until("imported repo managed", 10, || {
+        repo_paths(&sock).contains(&new.display().to_string())
+    });
+    fs::write(new.join("main/wip.txt"), "wip\n").unwrap();
+    wait_until("snapshot of the imported repo", 30, || {
+        git(&w.remote, &["for-each-ref", "refs/sync/pca/"]).contains("refs/sync/pca/main")
+    });
+    d.shutdown();
+}
+
+#[test]
+fn managed_repo_removed_after_start_disappears_without_crash() {
+    let w = world("rd-remove", &["pca"]);
+    let root = w.base.join("pca");
+    bare_layout(&root.join("g/second"), &w.remote);
+    let (d, sock) = start_event_only(&w, "pca");
+    wait_until("both repos listed", 10, || repo_paths(&sock).len() == 2);
+
+    // Keep the first repo busy so a pass may be running when the other one vanishes.
+    fs::write(root.join("g/repo/main/busy.txt"), "x\n").unwrap();
+    fs::remove_dir_all(root.join("g/second")).unwrap();
+    wait_until("removed repo dropped", 10, || {
+        repo_paths(&sock) == vec![root.join("g/repo").display().to_string()]
+    });
+    // The daemon is alive, the other repo still syncs, and the removal was not logged as an error.
+    assert_eq!(
+        ipc::request(&sock, &json!({"v":1,"cmd":"ping"})).unwrap()["data"],
+        "pong"
+    );
+    wait_until("remaining repo still synced", 30, || {
+        git(&w.remote, &["for-each-ref", "refs/sync/pca/"]).contains("refs/sync/pca/main")
+    });
+    let log = ipc::request(&sock, &json!({"v":1,"cmd":"log","limit":500})).unwrap();
+    let errors: Vec<_> = log["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "error")
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    d.shutdown();
+}
+
+#[test]
+fn not_migrated_list_follows_clones_added_and_removed() {
+    let w = world("rd-notmig", &["pca"]);
+    let root = w.base.join("pca");
+    let (d, sock) = start_event_only(&w, "pca");
+    wait_until("initial repo listed", 10, || repo_paths(&sock).len() == 1);
+    assert_eq!(status(&sock)["not_migrated"], json!([]));
+
+    let plain = root.join("g/plain");
+    git(
+        &root.join("g"),
+        &["clone", "-q", w.remote.to_str().unwrap(), "plain"],
+    );
+    wait_until("new clone reported", 10, || {
+        status(&sock)["not_migrated"] == json!([plain.display().to_string()])
+    });
+    // Deleted (e.g. moved to the trash): it must leave the list again.
+    fs::remove_dir_all(&plain).unwrap();
+    wait_until("deleted clone dropped", 10, || {
+        status(&sock)["not_migrated"] == json!([])
+    });
+    d.shutdown();
+}
+
+fn events(sock: &Path, kind: &str) -> Vec<serde_json::Value> {
+    let log = ipc::request(sock, &json!({"v":1,"cmd":"log","limit":500})).unwrap();
+    log["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == kind)
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn repo_with_busy_marker_is_ignored_until_the_marker_is_removed() {
+    let w = world("rd-busy", &["pca"]);
+    let root = w.base.join("pca");
+    let (d, sock) = start_event_only(&w, "pca");
+    wait_until("initial repo listed", 10, || repo_paths(&sock).len() == 1);
+
+    let new = root.join("g/halfway");
+    fs::create_dir_all(&new).unwrap();
+    fs::write(
+        new.join(".grove-busy"),
+        format!("{} 1\n", std::process::id()),
+    )
+    .unwrap();
+    bare_layout(&new, &w.remote);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(repo_paths(&sock).len(), 1, "busy repo must not be managed");
+    assert!(git(&w.remote, &["for-each-ref", "refs/sync/"]).is_empty());
+
+    fs::remove_file(new.join(".grove-busy")).unwrap();
+    wait_until("repo managed once the marker is gone", 10, || {
+        repo_paths(&sock).contains(&new.display().to_string())
+    });
+    d.shutdown();
+}
+
+#[test]
+fn stale_busy_marker_keeps_the_repo_out_and_warns_once() {
+    let w = world("rd-stale", &["pca"]);
+    let root = w.base.join("pca");
+    let stale = root.join("g/crashed");
+    fs::create_dir_all(&stale).unwrap();
+    bare_layout(&stale, &w.remote);
+    fs::write(stale.join(".grove-busy"), "999999999 1\n").unwrap();
+    let (d, sock) = start_event_only(&w, "pca");
+    wait_until("warning logged", 10, || {
+        !events(&sock, "repo_stalled").is_empty()
+    });
+    // Another rescan must not repeat the warning, and the marker is never deleted.
+    fs::create_dir_all(root.join("g/other")).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(events(&sock, "repo_stalled").len(), 1);
+    assert_eq!(repo_paths(&sock).len(), 1);
+    assert!(stale.join(".grove-busy").exists());
+    d.shutdown();
+}
+
+#[test]
+fn clone_appears_only_when_complete() {
+    let w = world("rd-clonecomplete", &["pca"]);
+    let root = w.base.join("pca");
+    let (d, sock) = start_event_only(&w, "pca");
+    wait_until("initial repo listed", 10, || repo_paths(&sock).len() == 1);
+
+    let new = root.join("g/cloned");
+    let url = w.remote.display().to_string();
+    let target = new.clone();
+    let h = std::thread::spawn(move || {
+        grove_core::registry::clone_bare_layout(&url, &target, &[]).unwrap()
+    });
+    let mut seen = false;
+    let end = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < end && !seen {
+        if repo_paths(&sock).contains(&new.display().to_string()) {
+            // Listed: the clone must be finished, never in the middle.
+            assert!(!new.join(".grove-busy").exists());
+            assert!(new.join(".bare/HEAD").exists());
+            assert!(new.join("main").is_dir());
+            seen = true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    h.join().unwrap();
+    assert!(seen, "cloned repo never managed");
+    d.shutdown();
+}
