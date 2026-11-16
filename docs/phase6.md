@@ -74,6 +74,42 @@ groups, repos directly under the root. Ignored plain clones inside a configured 
 "not migrated (run grove add)" by `grove daemon status` and `grove doctor`. Discovery reads one
 directory per configured group, so it stays cheap.
 
+### Rediscovery at runtime
+
+Discovery is not startup-only. The daemon watches (non-recursively) the root, each configured group
+directory and every child directory that is not managed yet; managed repos keep their recursive
+watch. A child directory created, deleted or renamed, or `.bare` / `.git` appearing or disappearing
+inside one (`grove add` migrating a clone, `grove import` cloning into `<group>/<name>/.bare`,
+a clone moved to the trash) triggers a debounced (500 ms) rediscovery and diff:
+
+- New bare-layout repos are managed at once: watches set up, a pass scheduled, activity event
+  `repo_added`.
+- Repos that are gone (or no longer bare layout) are dropped with their watches and state, one
+  `repo_removed` event, no error; their files are never touched. A repo whose directory vanishes
+  while a pass runs is dropped the same way.
+- The "not migrated" list is refreshed.
+
+A repo is only picked up when it is **ready**: `.bare/HEAD` exists, there is no `.grove-busy` and no
+`.grove-stage`. `grove add`, clone/import and init hold `<repo>/.grove-busy` (pid + start time) from
+before their first change until their very last step, also on rollback, so the daemon never
+fetches, materializes or snapshots a half-built layout (e.g. a `--no-checkout` worktree whose files
+are still in `.grove-stage`). Creating or removing `.grove-busy` / `.grove-stage` triggers a
+rediscovery, so the repo is picked up as soon as the marker goes. A marker whose process is gone
+(or a leftover `.grove-stage`) means an interrupted operation: the repo stays unmanaged, the daemon
+logs one `repo_stalled` warning to check it and restore from the backups, and never deletes the
+marker. `pass` re-checks readiness and skips unready repos. Clones are not built in a temp dir and
+renamed, because worktree link files hold absolute paths.
+
+Managed repos are watched recursively, including `node_modules` / `target`; notify cannot exclude
+subtrees, so raise `fs.inotify.max_user_watches` on machines with many large repos.
+
+As a safety net every full pass (every `fetch_interval_s`) re-runs discovery too, so missed
+inotify events delay detection by at most that interval. `grove daemon status` reflects the new set
+right after rediscovery, also while paused (discovery runs while paused, syncing does not).
+
+Config reload is still out of scope: restart the daemon after editing `config.toml` (new or removed
+groups are only picked up then).
+
 **Breaking change:** group names must now be plain directory names (non-empty, no `/`, no leading
 `.`); a config with other names no longer loads.
 

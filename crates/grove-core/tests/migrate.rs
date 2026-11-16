@@ -422,3 +422,34 @@ fn rollback_restores_linked_worktrees_at_every_step() {
         migrate(&repo, "m", &base.join("bk"), "2").unwrap();
     }
 }
+
+#[test]
+fn busy_marker_is_gone_after_success_and_after_rollback() {
+    let base = tmpdir("busy");
+    let repo = base.join("ok");
+    messy_repo(&repo);
+    migrate(&repo, "m", &base.join("bk"), "1").unwrap();
+    assert!(!repo.join(".grove-busy").exists());
+
+    let repo = base.join("failing");
+    messy_repo(&repo);
+    let err = migrate_failing_after(&repo, "m", &base.join("bk"), "2", Step::Filled).unwrap_err();
+    assert!(matches!(
+        err,
+        MigrateError::Failed {
+            rolled_back: true,
+            ..
+        }
+    ));
+    assert!(!repo.join(".grove-busy").exists());
+}
+
+#[test]
+fn migrate_refuses_while_another_operation_holds_the_marker() {
+    let base = tmpdir("busy2");
+    let repo = base.join("proj");
+    messy_repo(&repo);
+    let _held = grove_core::busy::BusyGuard::acquire(&repo.canonicalize().unwrap()).unwrap();
+    assert!(migrate(&repo, "m", &base.join("bk"), "1").is_err());
+    assert!(repo.join(".git").is_dir());
+}
