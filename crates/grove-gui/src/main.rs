@@ -250,6 +250,27 @@ fn render(ui: &MainWindow) {
                     .collect()
             })
             .unwrap_or_default();
+        // A result is shown until the daemon's list moves on, then it goes.
+        let listed: HashSet<&str> = snap
+            .status
+            .as_ref()
+            .and_then(|s| s["not_migrated"].as_array())
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if !st.migrating {
+            st.mig.retain(|p, _| listed.contains(p.as_str()));
+        }
+        let stalled: Vec<SharedString> = snap
+            .status
+            .as_ref()
+            .and_then(|s| s["stalled"].as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| p.as_str().map(SharedString::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ui.set_stalled(ModelRc::from(Rc::new(VecModel::from(stalled))));
         ui.set_migrating(st.migrating);
         ui.set_not_migrated(ModelRc::from(Rc::new(VecModel::from(nm))));
 

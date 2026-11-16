@@ -169,7 +169,8 @@ fn handle(req: &Request, ctx: &Ctx) -> Value {
                 .collect();
             ok(
                 json!({"machine": ctx.machine, "paused": s.paused, "now": now_secs(), "repos": repos,
-                       "not_migrated": s.not_migrated.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()}),
+                       "not_migrated": s.not_migrated.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                       "stalled": s.stalled.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()}),
             )
         }
         "pause" | "resume" => {

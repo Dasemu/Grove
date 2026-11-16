@@ -122,8 +122,12 @@ for confirmation first (the dialog names the backup directory, `<state dir>/back
 path or the refusal message (linked worktrees, submodules, detached HEAD...). The bridge only runs
 `add` for an existing, non-symlink directory directly under `<root>/<group>/` and passes no flags
 (so no custom backup directory). Afterwards the status is refreshed; the daemon computes its
-not-migrated list at start (a daemon-side fix is separate), so finished rows stay on screen with
-their result until the daemon list changes.
+not-migrated list at runtime, so after a migration the row keeps its result on screen until the
+next status refresh drops it. A second `grove add` is refused while a `.grove-busy` marker is held;
+Migrate all runs strictly one clone at a time and shows that refusal text on the row. Repos the
+daemon reports as `stalled` (interrupted operation, marker left behind) get their own card with
+the hint to check the backups; `repo_added`, `repo_removed` and `repo_stalled` (warning) appear in
+Activity.
 
 ## Diagnostics log
 

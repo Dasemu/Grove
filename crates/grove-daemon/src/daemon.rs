@@ -86,6 +86,8 @@ pub struct Shared {
     pub repos: BTreeMap<PathBuf, RepoStatus>,
     /// Plain clones in configured groups: ignored until migrated with `grove add`.
     pub not_migrated: Vec<PathBuf>,
+    /// Repos left alone because an interrupted `grove add`/clone left a marker behind.
+    pub stalled: Vec<PathBuf>,
 }
 
 pub enum Msg {
@@ -365,6 +367,7 @@ fn rescan(
     {
         let mut shared = ctx.shared.lock().unwrap();
         shared.not_migrated = d.not_migrated;
+        shared.stalled = d.stalled.clone();
         shared.repos.retain(|p, _| {
             let keep = found.contains(p);
             if !keep {

@@ -141,7 +141,7 @@ pub fn reconcile_outputs(outputs: &mut HashMap<String, OutRec>, states: &HashMap
 pub fn log_tone(kind: &str) -> &'static str {
     match kind {
         "error" | "watch_error" => "error",
-        "state" | "snapshots_withheld" | "snapshots_purged" | "declined" => "warn",
+        "state" | "snapshots_withheld" | "snapshots_purged" | "declined" | "repo_stalled" => "warn",
         _ => "ok",
     }
 }
@@ -453,6 +453,9 @@ mod tests {
         assert_eq!(log_tone("snapshots_purged"), "warn");
         assert_eq!(log_tone("snapshots_enabled"), "ok");
         assert_eq!(log_tone("watch_error"), "error");
+        assert_eq!(log_tone("repo_stalled"), "warn");
+        assert_eq!(log_tone("repo_added"), "ok");
+        assert_eq!(log_tone("repo_removed"), "ok");
     }
 
     #[test]

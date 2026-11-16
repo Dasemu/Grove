@@ -412,9 +412,13 @@ pub fn import(cfg: &Config, group_name: &str, wanted: &[String]) -> Result<()> {
         let res = (|| -> Result<()> {
             let url = r.git_url(forge.protocol)?.to_string();
             let dir = gdir.join(&r.name);
+            let existed = dir.exists();
             if let Err(e) = clone_bare_layout(&url, &dir, &forge.git_env) {
-                // Leave no empty directory behind (it only goes away when nothing was cloned).
-                let _ = fs::remove_dir(&dir);
+                // The busy marker is released by now. Remove only a directory this import
+                // created, and only while it is empty (`remove_dir` refuses anything else).
+                if !existed {
+                    let _ = fs::remove_dir(&dir);
+                }
                 return Err(e.into());
             }
             println!("imported {} -> {}", r.name, dir.display());

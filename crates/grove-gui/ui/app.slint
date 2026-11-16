@@ -189,6 +189,7 @@ export component MainWindow inherits Window {
     in property <[Repo]> repos;
     in property <[MigRow]> not-migrated;
     in property <bool> migrating;
+    in property <[string]> stalled;
     in property <string> migrate-confirm-text;
     in property <[LogRow]> log;
     in property <[string]> groups;
@@ -377,6 +378,22 @@ export component MainWindow inherits Window {
 
                             Muted {
                                 text: "Start it with `systemctl --user start groved` (or run `groved` in a terminal).";
+                            }
+                        }
+                        if !root.offline && root.stalled.length > 0: Card {
+                            Text {
+                                text: "Stalled repositories";
+                                font-weight: 700;
+                            }
+
+                            Muted {
+                                text: "An interrupted `grove add` or clone left a marker in these repositories, so grove leaves them alone. Check the repository and restore from the backups (see the Activity log), then remove the `.grove-busy` / `.grove-stage` marker by hand.";
+                            }
+
+                            for p in root.stalled: Muted {
+                                text: p;
+                                font-size: 12px;
+                                overflow: elide;
                             }
                         }
                         if !root.offline && root.not-migrated.length > 0: Card {

@@ -712,6 +712,10 @@ fn stale_busy_marker_keeps_the_repo_out_and_warns_once() {
     assert_eq!(events(&sock, "repo_stalled").len(), 1);
     assert_eq!(repo_paths(&sock).len(), 1);
     assert!(stale.join(".grove-busy").exists());
+    assert_eq!(
+        status(&sock)["stalled"],
+        json!([stale.display().to_string()])
+    );
     d.shutdown();
 }
 
