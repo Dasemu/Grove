@@ -1,6 +1,7 @@
 //! UI-independent logic: daemon status -> aggregate state, formatting, CLI output parsing.
 
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// What the tray icon and the status pill show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -84,7 +85,8 @@ pub fn aggregate(status: Option<&Value>) -> Aggregate {
         for w in wts {
             total += 1;
             match state_name(str_of(w, "state")) {
-                "diverged" | "error" => attention += 1,
+                // These need the user: nothing automatic will fix them.
+                "diverged" | "error" | "ahead" | "behinddirty" => attention += 1,
                 "synced" => {}
                 _ => dirty += 1,
             }
@@ -110,6 +112,29 @@ pub fn aggregate(status: Option<&Value>) -> Aggregate {
         worktrees: total,
         attention,
     }
+}
+
+/// Output of a CLI run shown under a worktree. It is dropped when the worktree's state changes
+/// after the first render that followed the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutRec {
+    pub ok: bool,
+    pub text: String,
+    pub baseline: Option<String>,
+}
+
+/// `states`: worktree path -> current state key.
+pub fn reconcile_outputs(outputs: &mut HashMap<String, OutRec>, states: &HashMap<String, String>) {
+    outputs.retain(|path, rec| match states.get(path) {
+        None => true,
+        Some(now) => match &rec.baseline {
+            None => {
+                rec.baseline = Some(now.clone());
+                true
+            }
+            Some(b) => b == now,
+        },
+    });
 }
 
 /// Colour key of an activity event kind.
@@ -378,6 +403,27 @@ mod tests {
             ["alpha", "beta", "gamma", "delta"]
         );
         assert!(parse_import_listing("nothing to import").is_empty());
+    }
+
+    #[test]
+    fn outputs_are_dropped_when_the_state_changes() {
+        let rec = |t: &str| OutRec {
+            ok: true,
+            text: t.into(),
+            baseline: None,
+        };
+        let mut o = HashMap::from([
+            ("/a".to_string(), rec("x")),
+            ("/gone".to_string(), rec("y")),
+        ]);
+        let st = |s: &str| HashMap::from([("/a".to_string(), s.to_string())]);
+        reconcile_outputs(&mut o, &st("diverged")); // first render sets the baseline
+        assert_eq!(o["/a"].baseline.as_deref(), Some("diverged"));
+        reconcile_outputs(&mut o, &st("diverged"));
+        assert!(o.contains_key("/a"));
+        reconcile_outputs(&mut o, &st("synced")); // state changed
+        assert!(!o.contains_key("/a"));
+        assert!(o.contains_key("/gone"), "unknown paths are kept");
     }
 
     #[test]

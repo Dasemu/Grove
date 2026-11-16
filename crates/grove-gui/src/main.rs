@@ -4,6 +4,7 @@
 //! the worker on daemon events, the tray service, the single-instance listener, and short-lived
 //! threads for CLI calls. Nothing runs on a timer while the daemon is quiet.
 
+mod autostart;
 mod bridge;
 mod instance;
 mod model;
@@ -15,14 +16,14 @@ use model::{Aggregate, TrayState};
 use serde_json::{Value, json};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel, Weak};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tray::Action;
 
@@ -114,7 +115,11 @@ struct Ctx {
 /// UI-thread state.
 struct UiState {
     snap: Option<Snapshot>,
-    outputs: HashMap<String, (bool, String)>,
+    outputs: HashMap<String, model::OutRec>,
+    inflight: HashSet<String>,
+    busy_count: u32,
+    branch_names: HashMap<String, String>,
+    detail_fp: String,
     filter: String,
     pending: Option<Vec<String>>,
     picks: Rc<VecModel<Pick>>,
@@ -127,6 +132,10 @@ thread_local! {
     static ST: RefCell<UiState> = RefCell::new(UiState {
         snap: None,
         outputs: HashMap::new(),
+        inflight: HashSet::new(),
+        busy_count: 0,
+        branch_names: HashMap::new(),
+        detail_fp: String::new(),
         filter: String::new(),
         pending: None,
         picks: Rc::new(VecModel::default()),
@@ -140,7 +149,13 @@ fn s(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
+/// Local UTC offset, computed once (one `date` process for the whole run).
 fn utc_offset_s() -> i64 {
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+    *OFFSET.get_or_init(read_utc_offset)
+}
+
+fn read_utc_offset() -> i64 {
     let out = std::process::Command::new("date").arg("+%z").output().ok();
     let z = out
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -199,6 +214,7 @@ fn render(ui: &MainWindow) {
         ui.set_wt_count(agg.worktrees as i32);
         ui.set_attention_count(agg.attention as i32);
         ui.set_has_config(snap.config.is_some());
+        ui.set_autostart(autostart::config_home().is_some_and(|d| autostart::is_enabled(&d)));
         let nm: Vec<SharedString> = snap
             .status
             .as_ref()
@@ -212,6 +228,18 @@ fn render(ui: &MainWindow) {
         ui.set_not_migrated(ModelRc::from(Rc::new(VecModel::from(nm))));
 
         let empty = Vec::new();
+        let mut states: HashMap<String, String> = HashMap::new();
+        for r in snap
+            .status
+            .as_ref()
+            .and_then(|s| s["repos"].as_array())
+            .unwrap_or(&empty)
+        {
+            for w in r["worktrees"].as_array().unwrap_or(&empty) {
+                states.insert(s(w, "path"), model::state_name(&s(w, "state")).to_string());
+            }
+        }
+        model::reconcile_outputs(&mut st.outputs, &states);
         let repos: Vec<Repo> = snap
             .status
             .as_ref()
@@ -230,10 +258,17 @@ fn render(ui: &MainWindow) {
                         let (out, out_ok) = st
                             .outputs
                             .get(&path)
-                            .map(|(ok, t)| (t.clone(), *ok))
+                            .map(|r| (r.text.clone(), r.ok))
                             .unwrap_or_default();
                         let branch = s(w, "branch");
+                        let bname = st
+                            .branch_names
+                            .get(&path)
+                            .cloned()
+                            .unwrap_or_else(|| format!("{branch}-local"));
                         Wt {
+                            bname: bname.into(),
+                            busy: st.inflight.contains(&path),
                             branch: if branch.is_empty() {
                                 "(detached)".into()
                             } else {
@@ -262,10 +297,30 @@ fn render(ui: &MainWindow) {
             .collect();
 
         let selected = ui.get_selected_path().to_string();
+        // The detail model is replaced only when something it shows changed: rebuilding it
+        // would reset the focus and text of the branch-name field every few seconds.
         if let Some(r) = repos.iter().find(|r| r.path == selected) {
-            ui.set_detail(r.clone());
+            let fp = format!(
+                "{}|{}|{}|{}",
+                r.path,
+                r.error,
+                r.withheld,
+                r.wts
+                    .iter()
+                    .map(|w| format!(
+                        "{}|{}|{}|{}|{}|{}|{}",
+                        w.branch, w.path, w.state, w.out, w.out_ok, w.busy, w.bname
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            );
+            if fp != st.detail_fp {
+                st.detail_fp = fp;
+                ui.set_detail(r.clone());
+            }
             ui.set_detail_found(true);
         } else {
+            st.detail_fp.clear();
             ui.set_detail_found(false);
         }
         // Long errors are cut in the list; the detail view shows them in full.
@@ -381,15 +436,44 @@ fn show_window(ui: &MainWindow, core: &Core) {
     render(ui);
 }
 
+/// Marks an operation as running: a global counter, and `key` (a worktree path) when it targets one.
+fn busy_begin(ui: &MainWindow, key: Option<&str>) {
+    ST.with(|st| {
+        let mut st = st.borrow_mut();
+        st.busy_count += 1;
+        if let Some(k) = key {
+            st.inflight.insert(k.to_string());
+        }
+    });
+    ui.set_busy(true);
+    if key.is_some() {
+        render(ui);
+    }
+}
+
+fn busy_end(ui: &MainWindow, key: Option<&str>) {
+    let n = ST.with(|st| {
+        let mut st = st.borrow_mut();
+        st.busy_count = st.busy_count.saturating_sub(1);
+        if let Some(k) = key {
+            st.inflight.remove(k);
+        }
+        st.busy_count
+    });
+    ui.set_busy(n > 0);
+}
+
 /// Runs an allow-listed `grove` subcommand off the UI thread; `done` runs on the UI thread.
+/// `key` is the worktree path the command acts on, if any.
 fn run_cli(
     ctx: &Ctx,
     ui: &MainWindow,
+    key: Option<String>,
     args: Vec<String>,
     stdin: String,
     done: impl FnOnce(&MainWindow, bool, String) + Send + 'static,
 ) {
-    ui.set_busy(true);
+    busy_begin(ui, key.as_deref());
     let (core, weak) = (ctx.core.clone(), ctx.weak.clone());
     std::thread::spawn(move || {
         let r = core.bridge.cli(&args, &stdin);
@@ -397,7 +481,7 @@ fn run_cli(
         let text = r["output"].as_str().unwrap_or("").to_string();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = weak.upgrade() {
-                ui.set_busy(false);
+                busy_end(&ui, key.as_deref());
                 done(&ui, ok, text);
             }
         });
@@ -419,6 +503,7 @@ fn scan(ctx: &Ctx, ui: &MainWindow, group: String) {
     run_cli(
         ctx,
         ui,
+        None,
         vec!["import".into(), group],
         String::new(),
         |ui, ok, text| {
@@ -505,7 +590,7 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
                 args.push("--public".into());
             }
             ui.set_new_out(out(true, String::new()));
-            run_cli(&c, &ui, args, String::new(), |ui, ok, text| {
+            run_cli(&c, &ui, None, args, String::new(), |ui, ok, text| {
                 ui.set_new_out(out(ok, text));
                 if ok {
                     toast(ui, "Repository created", false);
@@ -550,7 +635,7 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
             let mut args = vec!["import".to_string(), group.clone()];
             args.extend(picked);
             let c2 = c.clone();
-            run_cli(&c, &ui, args, String::new(), move |ui, ok, text| {
+            run_cli(&c, &ui, None, args, String::new(), move |ui, ok, text| {
                 ui.set_import_out(out(ok, text));
                 if ok {
                     scan(&c2, ui, group);
@@ -563,6 +648,10 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
         let w = ui.as_weak();
         move |path, mode, branch| {
             let Some(ui) = w.upgrade() else { return };
+            if ST.with(|st| st.borrow().inflight.contains(path.as_str())) {
+                toast(&ui, "A resolve is already running for this worktree", true);
+                return;
+            }
             let (flags, label): (Vec<String>, String) = match mode.as_str() {
                 "save" => {
                     let b = branch.trim().to_string();
@@ -576,12 +665,36 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
                     )
                 }
                 "remote" => (vec!["--take-remote".into()], "Discard your local commits and take the remote tip.".into()),
-                _ => (vec!["--keep-local".into()], "Overwrite the remote branch with your local commits.".into()),
+                "local" => (vec!["--keep-local".into()], "Overwrite the remote branch with your local commits.".into()),
+                other => {
+                    toast(&ui, &format!("Unknown resolve action {other:?}"), true);
+                    return;
+                }
             };
             let mut args = vec!["resolve".to_string(), path.to_string()];
             args.extend(flags);
             ST.with(|st| st.borrow_mut().pending = Some(args));
             ui.set_confirm_text(label.into());
+        }
+    });
+    ui.on_branch_edited(|path, text| {
+        ST.with(|st| {
+            st.borrow_mut()
+                .branch_names
+                .insert(path.to_string(), text.to_string())
+        });
+    });
+    ui.on_set_autostart({
+        let w = ui.as_weak();
+        move |on| {
+            let Some(ui) = w.upgrade() else { return };
+            let res = autostart::config_home()
+                .ok_or_else(|| std::io::Error::other("no config directory"))
+                .and_then(|d| autostart::set(&d, on));
+            if let Err(e) = res {
+                toast(&ui, &format!("Cannot change autostart: {e}"), true);
+            }
+            ui.set_autostart(autostart::config_home().is_some_and(|d| autostart::is_enabled(&d)));
         }
     });
     ui.on_confirm_cancel({
@@ -602,10 +715,40 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
                 return;
             };
             let path = args[1].clone();
-            run_cli(&c, &ui, args, String::new(), move |ui, ok, text| {
-                ST.with(|st| st.borrow_mut().outputs.insert(path, (ok, text)));
-                render(ui);
-            });
+            if ST.with(|st| st.borrow().inflight.contains(&path)) {
+                return;
+            }
+            let key = path.clone();
+            run_cli(
+                &c,
+                &ui,
+                Some(key),
+                args,
+                String::new(),
+                move |ui, ok, text| {
+                    let first = text.lines().next().unwrap_or("").to_string();
+                    ST.with(|st| {
+                        st.borrow_mut().outputs.insert(
+                            path,
+                            model::OutRec {
+                                ok,
+                                text,
+                                baseline: None,
+                            },
+                        )
+                    });
+                    toast(
+                        ui,
+                        &if ok {
+                            format!("Resolved. {first}")
+                        } else {
+                            format!("Resolve failed: {first}")
+                        },
+                        !ok,
+                    );
+                    render(ui);
+                },
+            );
         }
     });
 
@@ -619,7 +762,7 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
             } else {
                 args
             };
-            run_cli(&c, &ui, args, String::new(), |ui, ok, text| {
+            run_cli(&c, &ui, None, args, String::new(), |ui, ok, text| {
                 ui.set_settings_out(out(ok, text))
             });
         }
@@ -632,6 +775,7 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
             run_cli(
                 &c,
                 &ui,
+                None,
                 vec!["login".into(), provider],
                 format!("{token}\n"),
                 |ui, ok, text| {
@@ -668,27 +812,31 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
                 init.push(url.to_string());
             }
             let token = format!("{token}\n");
-            ui.set_busy(true);
+            // The onboarding view stays up until the whole flow succeeded, even though `init`
+            // makes the config appear half way.
+            ui.set_onboarding_active(true);
+            busy_begin(&ui, None);
             ui.set_onboard_out(out(true, String::new()));
             let (core, weak) = (c.core.clone(), c.weak.clone());
             std::thread::spawn(move || {
                 let mut steps: Vec<(Vec<String>, String)> = Vec::new();
-                // A previous attempt may already have written the config.
+                let mut lines: Vec<String> = Vec::new();
                 if core.bridge.config_json().is_none() {
                     steps.push((init, String::new()));
+                } else {
+                    lines.push(
+                        "config.toml already exists and is kept as it is: `grove init` is skipped, so the fields above are ignored. Edit the file by hand to change them."
+                            .into(),
+                    );
                 }
                 steps.push((vec!["login".into(), provider.to_string()], token));
                 steps.push((vec!["bootstrap".into()], String::new()));
-                let mut lines: Vec<String> = Vec::new();
-                let mut all_ok = true;
+                let mut failure: Option<String> = None;
                 for (args, stdin) in steps {
                     let r = core.bridge.cli(&args, &stdin);
                     let ok = r["ok"] == true;
-                    lines.push(format!(
-                        "$ grove {}\n{}",
-                        args[0],
-                        r["output"].as_str().unwrap_or("")
-                    ));
+                    let output = r["output"].as_str().unwrap_or("").to_string();
+                    lines.push(format!("$ grove {}\n{}", args[0], output));
                     let text = lines.join("\n\n");
                     let w = weak.clone();
                     let _ = slint::invoke_from_event_loop(move || {
@@ -697,16 +845,24 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
                         }
                     });
                     if !ok {
-                        all_ok = false;
+                        failure = Some(format!(
+                            "`grove {}` failed: {}",
+                            args[0],
+                            output.lines().last().unwrap_or("see the output below")
+                        ));
                         break;
                     }
                 }
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = weak.upgrade() {
-                        ui.set_busy(false);
-                        if all_ok {
-                            toast(&ui, "All set", false);
-                            ui.set_view("repos".into());
+                        busy_end(&ui, None);
+                        match failure {
+                            None => {
+                                ui.set_onboarding_active(false);
+                                toast(&ui, "All set", false);
+                                ui.set_view("repos".into());
+                            }
+                            Some(msg) => toast(&ui, &format!("Setup failed: {msg}"), true),
                         }
                     }
                 });
@@ -781,7 +937,7 @@ fn worker(
         if !visible {
             for (t, b) in &alerts {
                 let _ = std::process::Command::new("notify-send")
-                    .args(["-a", "Grove", "-i", "grove", t, b])
+                    .args(["-a", "Grove", "-i", "grove", "--", t, b])
                     .spawn()
                     .map(|mut c| std::thread::spawn(move || c.wait()));
             }
@@ -885,6 +1041,26 @@ fn main() -> Result<()> {
         instance::Role::Primary(l) => l,
     };
 
+    // Answer other launches right away; the window handle arrives later.
+    let late: Arc<Mutex<Option<Ctx>>> = Arc::new(Mutex::new(None));
+    let pending_show = Arc::new(AtomicBool::new(false));
+    {
+        let (late, pending) = (late.clone(), pending_show.clone());
+        std::thread::spawn(move || {
+            instance::serve(listener, move || match late.lock().unwrap().clone() {
+                Some(c) => {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = c.weak.upgrade() {
+                            show_window(&ui, &c.core);
+                        }
+                    });
+                }
+                None => pending.store(true, Ordering::SeqCst),
+            })
+        });
+    }
+    let _ = utc_offset_s(); // one `date` call, before the UI runs
+
     let bridge = Bridge {
         grove_bin: arg("--grove-bin")
             .map(PathBuf::from)
@@ -972,21 +1148,9 @@ fn main() -> Result<()> {
         let c = core.clone();
         std::thread::spawn(move || subscriber(c));
     }
-    {
-        let c = ctx.clone();
-        std::thread::spawn(move || {
-            instance::serve(listener, move || {
-                let c = c.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = c.weak.upgrade() {
-                        show_window(&ui, &c.core);
-                    }
-                });
-            })
-        });
-    }
+    *late.lock().unwrap() = Some(ctx.clone());
 
-    if !hidden || !core.tray_ok.load(Ordering::SeqCst) {
+    if !hidden || pending_show.load(Ordering::SeqCst) || !core.tray_ok.load(Ordering::SeqCst) {
         show_window(&ui, &core);
     } else {
         core.wake();

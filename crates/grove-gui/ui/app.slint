@@ -8,6 +8,8 @@ export struct Wt {
     plan: string,
     out: string,
     out-ok: bool,
+    bname: string,
+    busy: bool,
 }
 
 export struct Repo {
@@ -186,6 +188,8 @@ export component MainWindow inherits Window {
     in property <[Pick]> picks;
     in property <string> import-note;
     in property <bool> busy;
+    in-out property <bool> onboarding-active: false;
+    in property <bool> autostart;
     in property <string> toast-text;
     in property <bool> toast-bad;
     in property <string> confirm-text;
@@ -214,6 +218,8 @@ export component MainWindow inherits Window {
     callback login(string, string);
     callback onboard(string, string, string, string, string, string, string, string);
     callback view-changed(string);
+    callback branch-edited(string, string);
+    callback set-autostart(bool);
 
     function go(v: string) {
         root.view = v;
@@ -568,7 +574,6 @@ export component MainWindow inherits Window {
                                 if w.state == "diverged": diverged := VerticalLayout {
                                     spacing: 8px;
                                     alignment: start;
-                                    property <string> branch-name: w.branch + "-local";
                                     Text {
                                         text: "Diverged: " + w.branch + " has commits here and on the remote";
                                         font-weight: 700;
@@ -589,18 +594,19 @@ export component MainWindow inherits Window {
                                             spacing: 8px;
                                             Button {
                                                 text: "Save mine as a branch";
+                                                enabled: !w.busy;
                                                 clicked => {
-                                                    root.resolve(w.path, "save", diverged.branch-name);
+                                                    root.resolve(w.path, "save", bn.text);
                                                 }
                                             }
 
-                                            LineEdit {
+                                            bn := LineEdit {
                                                 horizontal-stretch: 1;
-                                                text: diverged.branch-name;
+                                                text: w.bname;
                                                 placeholder-text: "branch name";
                                                 accessible-label: "New branch name";
                                                 edited(t) => {
-                                                    diverged.branch-name = t;
+                                                    root.branch-edited(w.path, t);
                                                 }
                                             }
                                         }
@@ -610,6 +616,7 @@ export component MainWindow inherits Window {
                                             alignment: start;
                                             Button {
                                                 text: "Take remote";
+                                                enabled: !w.busy;
                                                 clicked => {
                                                     root.resolve(w.path, "remote", "");
                                                 }
@@ -617,6 +624,7 @@ export component MainWindow inherits Window {
 
                                             Button {
                                                 text: "Keep mine (overwrite remote)";
+                                                enabled: !w.busy;
                                                 clicked => {
                                                     root.resolve(w.path, "local", "");
                                                 }
@@ -828,7 +836,7 @@ export component MainWindow inherits Window {
                     }
 
                     // ---------- settings ----------
-                    if root.view == "settings" && root.has-config: VerticalLayout {
+                    if root.view == "settings" && root.has-config && !root.onboarding-active: VerticalLayout {
                         spacing: 12px;
                         alignment: start;
                         H1 {
@@ -926,6 +934,14 @@ export component MainWindow inherits Window {
                             }
                         }
 
+                        CheckBox {
+                            text: "Start Grove at login (tray only)";
+                            checked: root.autostart;
+                            toggled => {
+                                root.set-autostart(self.checked);
+                            }
+                        }
+
                         Text {
                             text: "Encrypted files (.env)";
                             font-size: 16px;
@@ -966,7 +982,7 @@ export component MainWindow inherits Window {
                     }
 
                     // ---------- onboarding ----------
-                    if root.view == "settings" && !root.has-config: VerticalLayout {
+                    if root.view == "settings" && (!root.has-config || root.onboarding-active): VerticalLayout {
                         spacing: 12px;
                         alignment: start;
                         H1 {
@@ -1114,6 +1130,7 @@ export component MainWindow inherits Window {
                 Button {
                     text: "Continue";
                     primary: true;
+                    enabled: !root.busy;
                     clicked => {
                         root.confirm-accept();
                     }
