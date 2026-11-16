@@ -712,7 +712,9 @@ dependencies = [
  "clap",
  "grove-core",
  "grove-daemon",
+ "grove-providers",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

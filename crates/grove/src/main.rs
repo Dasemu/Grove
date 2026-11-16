@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use grove_core::config::Config;
+use grove_core::config::{Config, ProviderKind};
 use grove_core::git::Git;
 use grove_core::inspect::{state, worktrees};
 use grove_core::migrate::migrate;
@@ -9,6 +9,8 @@ use grove_core::snapshot::{Outcome, take};
 use grove_core::sync::{Options, SyncReport, git_dir_for, sync_repo};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod workflow;
 
 #[derive(Parser)]
 #[command(name = "grove", about = "Keep git workspaces in sync across machines")]
@@ -49,6 +51,42 @@ enum Cmd {
     },
     /// Check the local setup
     Doctor,
+    /// Write a first config file for this machine
+    Init {
+        #[arg(long)]
+        machine: Option<String>,
+        #[arg(long, default_value = "~/Workspace")]
+        root: String,
+        /// Provider id (name used in the config and for the token)
+        #[arg(long, default_value = "main")]
+        provider: String,
+        #[arg(long, default_value = "gitea")]
+        kind: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long, default_value = "default")]
+        group: String,
+        /// Name of the private config repo to keep the repo registry in
+        #[arg(long)]
+        config_repo: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Store the API token for a provider (read from stdin, never from argv)
+    Login { provider: String },
+    /// Create a repo on the group's primary forge and set it up locally
+    New {
+        group: String,
+        name: String,
+        #[arg(long)]
+        public: bool,
+    },
+    /// List (or, with names, clone) remote repos that are not on this machine
+    Import { group: String, names: Vec<String> },
+    /// Create the config repo and register every repo already on disk
+    ConfigRepoInit,
+    /// Fresh machine: clone every repo listed in the config repo
+    Bootstrap,
     /// Talk to the running daemon (`groved`)
     Daemon {
         #[command(subcommand)]
@@ -209,6 +247,80 @@ fn main() -> Result<()> {
             print_report(&rep)
         }
         Cmd::Doctor => doctor(&cli.config),
+        Cmd::Init {
+            machine,
+            root,
+            provider,
+            kind,
+            url,
+            group,
+            config_repo,
+            force,
+        } => {
+            let path = cli
+                .config
+                .clone()
+                .or_else(Config::default_path)
+                .context("cannot determine config path (set --config)")?;
+            let kind = match kind.as_str() {
+                "gitea" => ProviderKind::Gitea,
+                "forgejo" => ProviderKind::Forgejo,
+                "github" => ProviderKind::Github,
+                k => bail!("unknown provider kind {k:?} (gitea, forgejo, github)"),
+            };
+            let machine = machine
+                .clone()
+                .or_else(|| {
+                    std::fs::read_to_string("/etc/hostname")
+                        .ok()
+                        .map(|h| h.trim().to_string())
+                })
+                .context("cannot determine the machine name (set --machine)")?;
+            workflow::init(
+                &path,
+                workflow::InitArgs {
+                    machine,
+                    root: root.clone(),
+                    provider: provider.clone(),
+                    kind,
+                    url: url.clone(),
+                    group: group.clone(),
+                    config_repo: config_repo.clone(),
+                },
+                *force,
+            )?;
+            println!("wrote {}", path.display());
+            println!("next: `grove login {provider}` to store the API token");
+            Ok(())
+        }
+        Cmd::Login { provider } => {
+            let cfg = load_config(&cli.config)?;
+            let mut tok = String::new();
+            std::io::stdin().read_line(&mut tok)?;
+            let who = workflow::login(&cfg, provider, tok.trim())?;
+            println!("logged in to {provider} as {who}; token stored in the Secret Service");
+            Ok(())
+        }
+        Cmd::New {
+            group,
+            name,
+            public,
+        } => {
+            let wt = workflow::new_repo(&load_config(&cli.config)?, group, name, !public)?;
+            println!("ready: {}", wt.display());
+            Ok(())
+        }
+        Cmd::Import { group, names } => workflow::import(&load_config(&cli.config)?, group, names),
+        Cmd::ConfigRepoInit => {
+            let n = workflow::config_repo_init(&load_config(&cli.config)?)?;
+            println!("config repo up to date ({n} repos registered)");
+            Ok(())
+        }
+        Cmd::Bootstrap => {
+            let (done, skipped) = workflow::bootstrap(&load_config(&cli.config)?)?;
+            println!("bootstrap finished: {done} cloned, {skipped} already present");
+            Ok(())
+        }
     }
 }
 
