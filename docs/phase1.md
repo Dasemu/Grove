@@ -61,3 +61,24 @@ they may only contain letters, digits, `-` and `_`.
 - Daemon, file watching, scheduling, IPC (Phase 2). Locking against concurrent user git commands.
 - Migration of repos with submodules or existing linked worktrees; `new` and provider code (Phase 4).
 - Resolve actions for `Diverged` (Phase 5): today it is only detected and left intact.
+
+## Validation on the real Gitea (2026-11-16)
+
+Two simulated machines (`pca` as a plain clone, `pcb` migrated with `grove add`) against a
+throwaway private repo on git.zenvairo.es (Gitea 1.25.4, HTTPS), deleted afterwards. All via the
+`grove` binary:
+
+| Scenario | Result |
+|---|---|
+| `add` on a plain clone | Migrated, backup tar + ref created |
+| Uncommitted + untracked work on A, `sync` on both | Snapshot pushed to `refs/sync/pca/main`, applied on B |
+| B has local edits when A's work arrives | `BehindDirty`, local edits untouched, snapshot declined |
+| A commits and pushes, B clean | B fast-forwarded |
+| Branch created then deleted upstream | Worktree materialized, then archived with a backup ref |
+| B has an unpushed commit, A pushes | `Diverged`, nothing modified |
+
+Not covered: real two-PC run (same code paths, but different machines/filesystems), push-mirror
+exclusion of `refs/sync/*` on this Gitea (needs a mirror target and credentials).
+
+Observed UX noise: a stale snapshot from another machine is reported as "not applied" on every
+pass until that machine syncs again.

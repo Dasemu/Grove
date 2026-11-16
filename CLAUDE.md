@@ -4,7 +4,7 @@
 Linux tool that keeps chosen git repos continuously in sync across machines, including
 uncommitted work, via snapshot refs (`refs/sync/<machine>/<branch>`) on a primary remote.
 Planned as a Rust workspace (core, providers, daemon, CLI, Tauri GUI). Currently in
-**Phase 0 done, Phase 1 implemented (pending real two-PC validation and review)**: `grove-core` + `grove` CLI (`status`, `snapshot`, `add`, `sync`, `doctor`); daemon, GUI and providers do not exist yet. Do not start a
+**Phase 0 done, Phase 1 implemented and validated against the real Gitea with two simulated machines (real two-PC run still pending)**: `grove-core` + `grove` CLI (`status`, `snapshot`, `add`, `sync`, `doctor`); daemon, GUI and providers do not exist yet. Do not start a
 new phase before its predecessor's results are written to `docs/`.
 
 ## Commands
