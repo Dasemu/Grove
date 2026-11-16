@@ -155,6 +155,10 @@ pub struct Sync {
     /// Default snapshot push policy; a group can override it.
     #[serde(default)]
     pub snapshots: SnapshotPolicy,
+    /// Directory under the root that repos deleted on their forge are moved to (and so stop
+    /// syncing). Empty disables the move.
+    #[serde(default = "default_purged_dir")]
+    pub purged_dir: String,
 }
 
 impl Default for Sync {
@@ -165,6 +169,7 @@ impl Default for Sync {
             ignore_extra: Vec::new(),
             max_file_mb: default_max_file_mb(),
             snapshots: SnapshotPolicy::default(),
+            purged_dir: default_purged_dir(),
         }
     }
 }
@@ -183,6 +188,9 @@ fn default_debounce() -> u64 {
 }
 fn default_max_file_mb() -> u64 {
     50
+}
+fn default_purged_dir() -> String {
+    "Purged".into()
 }
 fn default_fetch() -> u64 {
     60
@@ -274,6 +282,19 @@ impl Config {
             return bad(format!(
                 "machine.name {n:?} must be non-empty and use only letters, digits, '-' or '_'"
             ));
+        }
+        let pd = &self.sync.purged_dir;
+        if !pd.is_empty() {
+            if pd.starts_with('.') || pd.contains(['/', '\\']) {
+                return bad(format!(
+                    "sync.purged_dir {pd:?} must be a plain directory name"
+                ));
+            }
+            if self.groups.iter().any(|g| &g.name == pd) {
+                return bad(format!(
+                    "sync.purged_dir {pd:?} is also a group: purged repos would keep syncing"
+                ));
+            }
         }
         for g in &self.groups {
             // Group names are directory names under the root.
@@ -381,6 +402,24 @@ name = "grove-config"
         let c = Config::parse("[machine]\nname=\"a\"\n[root]\npath=\"/x\"\n").unwrap();
         assert!(c.groups.is_empty());
         assert_eq!(c.root_path(), PathBuf::from("/x"));
+    }
+
+    #[test]
+    fn purged_dir_defaults_and_must_not_be_a_group() {
+        let base = "[machine]\nname=\"a\"\n[root]\npath=\"/x\"\n[providers.p]\nkind=\"github\"\n";
+        assert_eq!(Config::parse(base).unwrap().sync.purged_dir, "Purged");
+        let off = format!("{base}[sync]\npurged_dir=\"\"\n");
+        assert_eq!(Config::parse(&off).unwrap().sync.purged_dir, "");
+        for bad in [
+            format!("{base}[sync]\npurged_dir=\"a/b\"\n"),
+            format!("{base}[sync]\npurged_dir=\".x\"\n"),
+            format!("{base}[[groups]]\nname=\"Purged\"\nprimary=\"p\"\n"),
+        ] {
+            assert!(
+                matches!(Config::parse(&bad), Err(ConfigError::Invalid(_))),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

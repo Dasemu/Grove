@@ -118,6 +118,38 @@ groups are only picked up then).
 **Breaking change:** group names must now be plain directory names (non-empty, no `/`, no leading
 `.`); a config with other names no longer loads.
 
+### Repos deleted on the forge
+
+A managed repo whose remote was deleted is moved out of the synced tree, never deleted locally:
+
+```toml
+[sync]
+purged_dir = "Purged"           # default; "" disables the move
+```
+
+- Trigger: a fetch fails with a "not found"-style error. That is only a hint: the forge serving
+  `origin` must then answer 404 while the same token works (`test_connection`), and still do so
+  `purge::CONFIRM_AFTER_SECS` (10 min) after the first confirmation (a gap of more than twice
+  that starts over). A working fetch, or the forge seeing the repo again, clears it. Network or
+  token errors change nothing.
+- Only repos owned by the token's account, or by an organisation named in some group's `owners`
+  for that provider, are ever moved: someone else's repo turning private or revoking access looks
+  the same as a deletion. Being removed from one of your own `owners` organisations is still
+  indistinguishable and moves its repos.
+- Never while busy: the move holds `.grove-busy` and is skipped (`purge_failed`, retried next
+  pass) when `.grove-stage` exists or a worktree has a git operation in progress (`index.lock`,
+  rebase, merge, cherry-pick, revert, bisect).
+- Action: `root/<group>/<repo>` moves to `root/<purged_dir>/<group>/<repo>` (a `-<stamp>` suffix
+  if taken) by `rename` (same file system only; otherwise it stays and `purge_failed` is logged),
+  then `git worktree repair` fixes the in-repo and linked worktrees (paths compared after
+  resolving symlinks). Worktrees whose directory is missing at that moment are listed in the
+  `purged` entry for a later `git worktree repair`. The directory is not a configured group, so
+  the daemon stops syncing it.
+- Activity log: `purge_pending` (first confirmation), `purged` (moved, with the destination),
+  `purge_failed` (not moved, with the reason).
+- `purged_dir` must be a plain directory name and must not also be a group.
+- The confirmation state is in memory: a daemon restart restarts the 10-minute wait.
+
 ### Snapshot policy
 
 WIP snapshots (`refs/sync/<machine>/<branch>`) contain uncommitted work, so on a public repo anyone
