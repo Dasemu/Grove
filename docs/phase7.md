@@ -29,6 +29,11 @@ Quit exits. If no StatusNotifier host exists, closing the window quits. A transi
 Single instance: `$XDG_RUNTIME_DIR/grove/gui.sock`. A second `grove-gui` asks the first to show
 its window and exits; `grove-gui --hidden` (autostart) only checks and never raises the window.
 
+Daemon scope and snapshot policy (Phase 6) in the GUI: each repo shows `snapshots withheld: <reason>`
+(list and detail), the repositories view lists the `not_migrated` clones with the hint to run
+`grove add`, settings show the default snapshot policy and per-group overrides, and Activity colours
+`snapshots_withheld`/`snapshots_purged` as warnings and `snapshots_enabled` as ok.
+
 Screens (parity with Phase 3): repositories with per-worktree state, repository detail with the
 resolve panel (confirmation first), activity with filter, new repository, import (scan, pick,
 import), settings (machine, providers, groups incl. public route and `owners`, config repo, token
@@ -59,15 +64,15 @@ X11 loaded at runtime) and the software renderer.
 
 | State | Software renderer (used) | femtovg (GL) |
 |---|---|---|
-| Started with `--hidden` | 24-25 MB | 94 MB |
-| Window open | 33.5 MB | 105 MB |
-| After closing the window (hidden again) | 28 MB | not measured |
+| Started with `--hidden` | 24 MB | 94 MB |
+| Window open | 31 MB | 105 MB |
+| After closing the window (hidden again) | 25 MB | not measured |
 
 Idle CPU hidden: 0 ticks in 20 s. 9 threads.
 
 ## Limits
 
-- Showing an already visible window does not raise it (no xdg-activation token is passed).
+- Slint does not expose xdg-activation, so launching again (or clicking the tray) on a visible window re-maps it (hide + show); the compositor focuses the fresh window (checked on KWin: keyboard focus arrives). The compositor picks the window position again.
 - Activity timestamps use the local UTC offset read via `date +%z` (no timezone crate).
 - The activity list shows the first line of each message, repository errors are cut at 160 characters
   in the list (full text in the detail view).
