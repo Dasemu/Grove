@@ -1,0 +1,22 @@
+[package]
+name = "grove-gui"
+description = "Native desktop GUI for grove: tray icon, window, daemon IPC"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "grove-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+grove-daemon = { version = "0.1.0", path = "../grove-daemon" }
+# async-io instead of the default tokio: no second async runtime in a small tray app.
+ksni = { version = "0.3.7", default-features = false, features = ["async-io", "blocking"] }
+serde_json = "1.0.154"
+slint = { version = "=1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2"] }
+toml = "1.2.1"
+
+[build-dependencies]
+slint-build = "=1.18.1"

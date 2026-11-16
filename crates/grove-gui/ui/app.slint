@@ -1,0 +1,1093 @@
+import { Button, CheckBox, ComboBox, LineEdit, Palette, ScrollView } from "std-widgets.slint";
+
+export struct Wt {
+    branch: string,
+    path: string,
+    state: string,
+    label: string,
+    plan: string,
+    out: string,
+    out-ok: bool,
+}
+
+export struct Repo {
+    name: string,
+    path: string,
+    phase: string,
+    last-sync: string,
+    error: string,
+    wts: [Wt],
+}
+
+export struct LogRow {
+    time: string,
+    kind: string,
+    repo: string,
+    msg: string,
+}
+
+export struct Kv {
+    key: string,
+    value: string,
+}
+
+export struct Section {
+    title: string,
+    rows: [Kv],
+}
+
+export struct Pick {
+    name: string,
+    checked: bool,
+}
+
+export struct Out {
+    text: string,
+    ok: bool,
+}
+
+// Pill / badge colour by state key.
+global Tone {
+    pure public function of(key: string) -> color {
+        if key == "synced" || key == "ok" {
+            return #2e9e5b;
+        }
+        if key == "diverged" || key == "error" || key == "bad" {
+            return #d9483b;
+        }
+        if key == "paused" || key == "offline" || key == "muted" {
+            return #8a8f98;
+        }
+        return #d98e1f;
+    }
+}
+
+component Card inherits Rectangle {
+    background: Palette.control-background;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Palette.border;
+    VerticalLayout {
+        padding: 14px;
+        spacing: 8px;
+        alignment: start;
+        @children
+    }
+}
+
+component Badge inherits Rectangle {
+    in property <string> text;
+    in property <string> key;
+    background: Tone.of(key).with-alpha(0.18);
+    border-radius: 10px;
+    height: 20px;
+    width: label.preferred-width + 16px;
+    label := Text {
+        text: root.text;
+        color: Tone.of(root.key);
+        font-size: 11px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component H1 inherits VerticalLayout {
+    in property <string> title;
+    in property <string> sub;
+    spacing: 2px;
+    alignment: start;
+    Text {
+        text: root.title;
+        font-size: 22px;
+        font-weight: 700;
+    }
+
+    Text {
+        text: root.sub;
+        color: Palette.foreground.with-alpha(0.65);
+        wrap: word-wrap;
+    }
+}
+
+component Muted inherits Text {
+    color: Palette.foreground.with-alpha(0.65);
+    wrap: word-wrap;
+}
+
+component Term inherits Rectangle {
+    in property <Out> out;
+    visible: out.text != "";
+    height: out.text == "" ? 0px : label.preferred-height + 20px;
+    background: out.ok ? Palette.control-background : #d9483b.with-alpha(0.14);
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: out.ok ? Palette.border : #d9483b;
+    label := Text {
+        x: 10px;
+        y: 10px;
+        width: parent.width - 20px;
+        text: root.out.text;
+        font-family: "monospace";
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+}
+
+component NavItem inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked;
+    height: 34px;
+    border-radius: 6px;
+    background: active ? Palette.accent-background.with-alpha(0.22) : ta.has-hover ? Palette.foreground.with-alpha(0.08) : transparent;
+    Text {
+        x: 12px;
+        text: root.text;
+        vertical-alignment: center;
+        font-weight: root.active ? 700 : 400;
+    }
+
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Grove";
+    icon: @image-url("../../../assets/grove.png");
+    min-width: 760px;
+    min-height: 520px;
+    preferred-width: 980px;
+    preferred-height: 700px;
+
+    // ---- state pushed from Rust ----
+    in-out property <string> view: "repos";
+    in property <bool> loading: true;
+    in property <bool> offline: false;
+    in property <bool> paused: false;
+    in property <bool> has-config: true;
+    in property <string> pill-text: "Connecting…";
+    in property <string> pill-key: "muted";
+    in property <string> machine;
+    in property <int> repo-count;
+    in property <int> wt-count;
+    in property <int> attention-count;
+    in property <[Repo]> repos;
+    in property <[LogRow]> log;
+    in property <[string]> groups;
+    in property <[string]> providers;
+    in property <[Section]> sections;
+    in property <[Pick]> picks;
+    in property <string> import-note;
+    in property <bool> busy;
+    in property <string> toast-text;
+    in property <bool> toast-bad;
+    in property <string> confirm-text;
+    in property <Repo> detail;
+    in property <bool> detail-found;
+    in-out property <string> selected-path;
+    in property <Out> new-out;
+    in property <Out> import-out;
+    in property <Out> settings-out;
+    in property <Out> onboard-out;
+
+    // ---- actions towards Rust ----
+    callback open-repo(string);
+    callback sync-repo(string);
+    callback sync-all();
+    callback toggle-pause();
+    callback filter-changed(string);
+    callback create-repo(string, string, bool);
+    callback scan-import(string);
+    callback import-selected(string);
+    callback pick-toggled(int, bool);
+    callback resolve(string, string, string);
+    callback confirm-accept();
+    callback confirm-cancel();
+    callback run-settings(string);
+    callback login(string, string);
+    callback onboard(string, string, string, string, string, string, string, string);
+    callback view-changed(string);
+
+    function go(v: string) {
+        root.view = v;
+        root.selected-path = "";
+        root.view-changed(v);
+    }
+
+    background: Palette.background;
+
+    HorizontalLayout {
+        // ---- sidebar ----
+        Rectangle {
+            width: 200px;
+            background: Palette.control-background;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 4px;
+                Text {
+                    text: "Grove";
+                    font-size: 20px;
+                    font-weight: 800;
+                    color: #2e9e5b;
+                }
+
+                Rectangle {
+                    height: 10px;
+                }
+
+                NavItem {
+                    text: "Repositories";
+                    active: root.view == "repos";
+                    clicked => {
+                        root.go("repos");
+                    }
+                }
+
+                NavItem {
+                    text: "Activity";
+                    active: root.view == "activity";
+                    clicked => {
+                        root.go("activity");
+                    }
+                }
+
+                NavItem {
+                    text: "New repository";
+                    active: root.view == "new";
+                    clicked => {
+                        root.go("new");
+                    }
+                }
+
+                NavItem {
+                    text: "Import";
+                    active: root.view == "import";
+                    clicked => {
+                        root.go("import");
+                    }
+                }
+
+                NavItem {
+                    text: "Settings";
+                    active: root.view == "settings";
+                    clicked => {
+                        root.go("settings");
+                    }
+                }
+
+                Rectangle { }
+
+                Muted {
+                    text: root.machine == "" ? "" : "Machine " + root.machine;
+                    font-size: 11px;
+                }
+            }
+        }
+
+        // ---- main column ----
+        VerticalLayout {
+            // top bar
+            Rectangle {
+                height: 52px;
+                HorizontalLayout {
+                    padding-left: 20px;
+                    padding-right: 20px;
+                    spacing: 8px;
+                    alignment: end;
+                    Badge {
+                        y: (parent.height - self.height) / 2;
+                        text: root.pill-text;
+                        key: root.pill-key;
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                    }
+
+                    Button {
+                        y: (parent.height - self.height) / 2;
+                        text: root.paused ? "Resume sync" : "Pause sync";
+                        enabled: !root.offline;
+                        clicked => {
+                            root.toggle-pause();
+                        }
+                    }
+
+                    Button {
+                        y: (parent.height - self.height) / 2;
+                        text: "Sync now";
+                        primary: true;
+                        enabled: !root.offline && !root.paused;
+                        clicked => {
+                            root.sync-all();
+                        }
+                    }
+                }
+            }
+
+            ScrollView {
+                VerticalLayout {
+                    padding: 20px;
+                    padding-top: 4px;
+                    spacing: 12px;
+                    alignment: start;
+
+                    // ---------- repositories ----------
+                    if root.view == "repos": VerticalLayout {
+                        spacing: 12px;
+                        alignment: start;
+                        H1 {
+                            title: "Repositories";
+                            sub: "Everything grove keeps in sync on this machine.";
+                        }
+
+                        if root.offline: Card {
+                            Text {
+                                text: "The grove daemon is not running.";
+                                font-weight: 700;
+                            }
+
+                            Muted {
+                                text: "Start it with `systemctl --user start groved` (or run `groved` in a terminal).";
+                            }
+                        }
+                        if !root.offline && root.loading: Muted {
+                            text: "Loading…";
+                        }
+                        if !root.offline && !root.loading && root.repos.length == 0: Card {
+                            Muted {
+                                text: "No repositories yet. Create one under “New repository” or clone existing ones with “Import”.";
+                            }
+                        }
+                        if !root.offline && !root.loading && root.repos.length > 0: VerticalLayout {
+                            spacing: 12px;
+                            alignment: start;
+                            HorizontalLayout {
+                                spacing: 12px;
+                                for s[i] in [
+                                    {n: root.repo-count, l: "Repositories"},
+                                    {n: root.wt-count, l: "Worktrees"},
+                                    {n: root.attention-count, l: "Need attention"},
+                                ]: Card {
+                                    Text {
+                                        text: s.n;
+                                        font-size: 26px;
+                                        font-weight: 700;
+                                    }
+
+                                    Muted {
+                                        text: s.l;
+                                    }
+                                }
+                            }
+
+                            for r in root.repos: Rectangle {
+                                height: rcard.preferred-height;
+                                rcard := Card {
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        Text {
+                                            text: r.name;
+                                            font-weight: 700;
+                                            font-size: 15px;
+                                        }
+
+                                        Muted {
+                                            text: r.path;
+                                            font-size: 11px;
+                                        }
+
+                                        if r.error != "": Text {
+                                            text: r.error;
+                                            color: #d9483b;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 4px;
+                                        for w in r.wts: HorizontalLayout {
+                                            spacing: 6px;
+                                            alignment: end;
+                                            Muted {
+                                                text: w.branch;
+                                                vertical-alignment: center;
+                                            }
+
+                                            Badge {
+                                                text: w.label;
+                                                key: w.state;
+                                            }
+                                        }
+                                    }
+
+                                    VerticalLayout {
+                                        width: 90px;
+                                        alignment: center;
+                                        Muted {
+                                            text: r.phase;
+                                            horizontal-alignment: right;
+                                        }
+
+                                        Muted {
+                                            text: r.last-sync;
+                                            horizontal-alignment: right;
+                                            font-size: 11px;
+                                        }
+                                    }
+                                }
+
+                                }
+
+                                TouchArea {
+                                    clicked => {
+                                        root.open-repo(r.path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---------- repository detail ----------
+                    if root.view == "repo": VerticalLayout {
+                        spacing: 12px;
+                        alignment: start;
+                        HorizontalLayout {
+                            alignment: start;
+                            Button {
+                                text: "← Repositories";
+                                clicked => {
+                                    root.go("repos");
+                                }
+                            }
+                        }
+
+                        if root.offline: Card {
+                            Text {
+                                text: "The grove daemon is not running.";
+                                font-weight: 700;
+                            }
+                        }
+                        if !root.offline && !root.detail-found: Muted {
+                            text: "Repository not found.";
+                        }
+                        if !root.offline && root.detail-found: VerticalLayout {
+                            spacing: 12px;
+                            alignment: start;
+                            H1 {
+                                title: root.detail.name;
+                                sub: root.detail.path;
+                            }
+
+                            HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: "Sync this repository";
+                                    clicked => {
+                                        root.sync-repo(root.detail.path);
+                                    }
+                                }
+                            }
+
+                            if root.detail.error != "": Text {
+                                text: root.detail.error;
+                                color: #d9483b;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "Worktrees";
+                                font-size: 16px;
+                                font-weight: 700;
+                            }
+
+                            for w in root.detail.wts: Card {
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        Text {
+                                            text: w.branch;
+                                            font-weight: 700;
+                                        }
+
+                                        Muted {
+                                            text: w.path;
+                                            font-size: 11px;
+                                        }
+                                    }
+
+                                    Badge {
+                                        y: 2px;
+                                        text: w.label;
+                                        key: w.state;
+                                    }
+                                }
+
+                                Muted {
+                                    text: w.plan;
+                                }
+
+                                if w.state == "diverged": diverged := VerticalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    property <string> branch-name: w.branch + "-local";
+                                    Text {
+                                        text: "Diverged: " + w.branch + " has commits here and on the remote";
+                                        font-weight: 700;
+                                        color: #d9483b;
+                                    }
+
+                                    Muted {
+                                        text: "Grove never merges for you. Pick what should win:";
+                                    }
+
+                                    if w.path == "": Muted {
+                                        text: "This daemon does not report the worktree path. Update groved.";
+                                    }
+                                    if w.path != "": VerticalLayout {
+                                        spacing: 8px;
+                                        alignment: start;
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Button {
+                                                text: "Save mine as a branch";
+                                                clicked => {
+                                                    root.resolve(w.path, "save", diverged.branch-name);
+                                                }
+                                            }
+
+                                            LineEdit {
+                                                horizontal-stretch: 1;
+                                                text: diverged.branch-name;
+                                                placeholder-text: "branch name";
+                                                accessible-label: "New branch name";
+                                                edited(t) => {
+                                                    diverged.branch-name = t;
+                                                }
+                                            }
+                                        }
+
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            alignment: start;
+                                            Button {
+                                                text: "Take remote";
+                                                clicked => {
+                                                    root.resolve(w.path, "remote", "");
+                                                }
+                                            }
+
+                                            Button {
+                                                text: "Keep mine (overwrite remote)";
+                                                clicked => {
+                                                    root.resolve(w.path, "local", "");
+                                                }
+                                            }
+                                        }
+
+                                        Muted {
+                                            text: "To inspect both sides first, run `grove resolve " + w.path + " --compare` in a terminal.";
+                                            font-size: 11px;
+                                        }
+                                    }
+                                }
+                                Term {
+                                    out: {text: w.out, ok: w.out-ok};
+                                }
+                            }
+                        }
+                    }
+
+                    // ---------- activity ----------
+                    if root.view == "activity": VerticalLayout {
+                        spacing: 12px;
+                        alignment: start;
+                        H1 {
+                            title: "Activity";
+                            sub: "What the daemon did, newest first.";
+                        }
+
+                        if root.offline: Card {
+                            Text {
+                                text: "The grove daemon is not running.";
+                                font-weight: 700;
+                            }
+                        }
+                        if !root.offline: VerticalLayout {
+                            spacing: 12px;
+                            alignment: start;
+                            LineEdit {
+                                placeholder-text: "Filter…";
+                                accessible-label: "Filter activity";
+                                edited(t) => {
+                                    root.filter-changed(t);
+                                }
+                            }
+
+                            if root.log.length == 0: Muted {
+                                text: "No activity yet.";
+                            }
+                            Card {
+                                for e in root.log: HorizontalLayout {
+                                    spacing: 10px;
+                                    Muted {
+                                        width: 64px;
+                                        text: e.time;
+                                        font-size: 12px;
+                                    }
+
+                                    Text {
+                                        width: 90px;
+                                        text: e.kind;
+                                        color: Tone.of(e.kind == "error" || e.kind == "watch_error" ? "error" : e.kind == "state" ? "warn" : "ok");
+                                        font-size: 12px;
+                                        font-weight: 700;
+                                    }
+
+                                    Muted {
+                                        width: 130px;
+                                        text: e.repo;
+                                        font-size: 12px;
+                                        overflow: elide;
+                                    }
+
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: e.msg;
+                                        font-size: 12px;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---------- new repository ----------
+                    if root.view == "new": VerticalLayout {
+                        spacing: 12px;
+                        alignment: start;
+                        H1 {
+                            title: "New repository";
+                            sub: "Creates the remote, the local checkout, the mirrors and registers it for your other machines.";
+                        }
+
+                        if !root.has-config: Card {
+                            Muted {
+                                text: "Finish onboarding first (Settings).";
+                            }
+                        }
+                        if root.has-config: VerticalLayout {
+                            spacing: 12px;
+                            alignment: start;
+                            Card {
+                                Muted {
+                                    text: "Group";
+                                }
+
+                                new-group := ComboBox {
+                                    model: root.groups;
+                                }
+
+                                Muted {
+                                    text: "Name";
+                                }
+
+                                new-name := LineEdit {
+                                    placeholder-text: "my-project";
+                                    accessible-label: "Repository name";
+                                }
+
+                                Muted {
+                                    text: "Created on the group’s primary forge, with an initial commit and the bare + worktrees layout.";
+                                    font-size: 11px;
+                                }
+
+                                new-public := CheckBox {
+                                    text: "Public repository";
+                                }
+
+                                HorizontalLayout {
+                                    alignment: start;
+                                    Button {
+                                        text: root.busy ? "Working…" : "Create repository";
+                                        primary: true;
+                                        enabled: !root.busy && new-name.text != "";
+                                        clicked => {
+                                            root.create-repo(new-group.current-value, new-name.text, new-public.checked);
+                                        }
+                                    }
+                                }
+                            }
+
+                            Term {
+                                out: root.new-out;
+                            }
+                        }
+                    }
+
+                    // ---------- import ----------
+                    if root.view == "import": VerticalLayout {
+                        spacing: 12px;
+                        alignment: start;
+                        H1 {
+                            title: "Import";
+                            sub: "Clone repositories that exist on your forge but not on this machine.";
+                        }
+
+                        if !root.has-config: Card {
+                            Muted {
+                                text: "Finish onboarding first (Settings).";
+                            }
+                        }
+                        if root.has-config: VerticalLayout {
+                            spacing: 12px;
+                            alignment: start;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                imp-group := ComboBox {
+                                    model: root.groups;
+                                    width: 260px;
+                                }
+
+                                Button {
+                                    text: "Scan remote";
+                                    enabled: !root.busy;
+                                    clicked => {
+                                        root.scan-import(imp-group.current-value);
+                                    }
+                                }
+                            }
+
+                            if root.import-note != "": Muted {
+                                text: root.import-note;
+                            }
+                            if root.picks.length > 0: Card {
+                                for p[i] in root.picks: CheckBox {
+                                    text: p.name;
+                                    checked: p.checked;
+                                    toggled => {
+                                        root.pick-toggled(i, self.checked);
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    alignment: start;
+                                    Button {
+                                        text: "Import selected";
+                                        primary: true;
+                                        enabled: !root.busy;
+                                        clicked => {
+                                            root.import-selected(imp-group.current-value);
+                                        }
+                                    }
+                                }
+                            }
+                            Term {
+                                out: root.import-out;
+                            }
+                        }
+                    }
+
+                    // ---------- settings ----------
+                    if root.view == "settings" && root.has-config: VerticalLayout {
+                        spacing: 12px;
+                        alignment: start;
+                        H1 {
+                            title: "Settings";
+                            sub: "Read from config.toml. Tokens live in the system keyring, never in the file.";
+                        }
+
+                        for sec in root.sections: VerticalLayout {
+                            spacing: 6px;
+                            alignment: start;
+                            Text {
+                                text: sec.title;
+                                font-size: 16px;
+                                font-weight: 700;
+                            }
+
+                            Card {
+                                for kv in sec.rows: HorizontalLayout {
+                                    spacing: 12px;
+                                    Muted {
+                                        width: 170px;
+                                        text: kv.key;
+                                    }
+
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: kv.value;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            Button {
+                                text: "Register repos on disk";
+                                enabled: !root.busy;
+                                clicked => {
+                                    root.run-settings("config-repo-init");
+                                }
+                            }
+
+                            Button {
+                                text: "Bootstrap from config repo";
+                                enabled: !root.busy;
+                                clicked => {
+                                    root.run-settings("bootstrap");
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "Sign in to a provider";
+                            font-size: 16px;
+                            font-weight: 700;
+                        }
+
+                        Card {
+                            Muted {
+                                text: "Provider";
+                            }
+
+                            tok-prov := ComboBox {
+                                model: root.providers;
+                            }
+
+                            Muted {
+                                text: "Token";
+                            }
+
+                            tok := LineEdit {
+                                input-type: password;
+                                placeholder-text: "API token";
+                                accessible-label: "API token";
+                            }
+
+                            Muted {
+                                text: "Needs repository read/write scope. Sent to the forge only.";
+                                font-size: 11px;
+                            }
+
+                            HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: "Verify and store";
+                                    primary: true;
+                                    enabled: !root.busy && tok.text != "";
+                                    clicked => {
+                                        root.login(tok-prov.current-value, tok.text);
+                                        tok.text = "";
+                                    }
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "Encrypted files (.env)";
+                            font-size: 16px;
+                            font-weight: 700;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            Button {
+                                text: "Create this machine’s key";
+                                enabled: !root.busy;
+                                clicked => {
+                                    root.run-settings("secrets-init");
+                                }
+                            }
+
+                            Button {
+                                text: "Pull secrets";
+                                enabled: !root.busy;
+                                clicked => {
+                                    root.run-settings("secrets-pull");
+                                }
+                            }
+
+                            Button {
+                                text: "Re-encrypt for all machines";
+                                enabled: !root.busy;
+                                clicked => {
+                                    root.run-settings("secrets-rekey");
+                                }
+                            }
+                        }
+
+                        Term {
+                            out: root.settings-out;
+                        }
+                    }
+
+                    // ---------- onboarding ----------
+                    if root.view == "settings" && !root.has-config: VerticalLayout {
+                        spacing: 12px;
+                        alignment: start;
+                        H1 {
+                            title: "Welcome to Grove";
+                            sub: "Set up this machine. On a second computer this is all you do: sign in and your workspace appears.";
+                        }
+
+                        Card {
+                            Muted {
+                                text: "Machine name (letters, digits, - and _; unique per computer)";
+                            }
+
+                            ob-machine := LineEdit {
+                                text: "my-laptop";
+                            }
+
+                            Muted {
+                                text: "Workspace folder";
+                            }
+
+                            ob-root := LineEdit {
+                                text: "~/Workspace";
+                            }
+
+                            Muted {
+                                text: "Forge type";
+                            }
+
+                            ob-kind := ComboBox {
+                                model: ["gitea", "forgejo", "github"];
+                            }
+
+                            Muted {
+                                text: "Provider id";
+                            }
+
+                            ob-provider := LineEdit {
+                                text: "main";
+                            }
+
+                            Muted {
+                                text: "Forge URL (empty for github.com)";
+                            }
+
+                            ob-url := LineEdit {
+                                placeholder-text: "https://git.example.com";
+                            }
+
+                            Muted {
+                                text: "First group";
+                            }
+
+                            ob-group := LineEdit {
+                                text: "work";
+                            }
+
+                            Muted {
+                                text: "Config repository (private repo holding the list of your repos, so a new machine only needs to sign in)";
+                            }
+
+                            ob-crepo := LineEdit {
+                                text: "grove-config";
+                            }
+
+                            Muted {
+                                text: "API token";
+                            }
+
+                            ob-token := LineEdit {
+                                input-type: password;
+                                accessible-label: "API token";
+                            }
+
+                            HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: root.busy ? "Working…" : "Set up grove";
+                                    primary: true;
+                                    enabled: !root.busy && ob-token.text != "";
+                                    clicked => {
+                                        root.onboard(ob-machine.text, ob-root.text, ob-kind.current-value, ob-provider.text, ob-url.text, ob-group.text, ob-crepo.text, ob-token.text);
+                                        ob-token.text = "";
+                                    }
+                                }
+                            }
+                        }
+
+                        Term {
+                            out: root.onboard-out;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- toast ----
+    if root.toast-text != "": Rectangle {
+        x: parent.width - self.width - 20px;
+        y: parent.height - self.height - 20px;
+        width: min(420px, parent.width - 40px);
+        height: toast-label.preferred-height + 24px;
+        background: root.toast-bad ? #d9483b : #2e9e5b;
+        border-radius: 8px;
+        toast-label := Text {
+            x: 12px;
+            y: 12px;
+            width: parent.width - 24px;
+            text: root.toast-text;
+            color: white;
+            wrap: word-wrap;
+        }
+    }
+
+    // ---- confirmation ----
+    if root.confirm-text != "": Rectangle {
+        background: #00000088;
+        TouchArea { }
+
+        Card {
+            width: min(460px, parent.width - 40px);
+            height: self.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Palette.background;
+            Text {
+                text: root.confirm-text;
+                wrap: word-wrap;
+            }
+
+            Muted {
+                text: "A backup ref is written first, so nothing is lost.";
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                Button {
+                    text: "Cancel";
+                    clicked => {
+                        root.confirm-cancel();
+                    }
+                }
+
+                Button {
+                    text: "Continue";
+                    primary: true;
+                    clicked => {
+                        root.confirm-accept();
+                    }
+                }
+            }
+        }
+    }
+}

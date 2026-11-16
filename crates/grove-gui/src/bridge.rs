@@ -1,5 +1,4 @@
-//! Everything the GUI needs from the machine, behind three calls. The Tauri shell and the
-//! localhost dev server both expose exactly these.
+//! Everything the GUI needs from the machine: daemon IPC, allow-listed `grove` calls, config.
 
 use serde_json::{Value, json};
 use std::io::Write;
@@ -91,7 +90,18 @@ impl Bridge {
 /// Per-command flag table: (flags without value, flags taking one value).
 fn flag_spec(sub: &str) -> (&'static [&'static str], &'static [&'static str]) {
     match sub {
-        "init" => (&[], &["--machine", "--root", "--provider", "--kind", "--group", "--config-repo", "--url"]),
+        "init" => (
+            &[],
+            &[
+                "--machine",
+                "--root",
+                "--provider",
+                "--kind",
+                "--group",
+                "--config-repo",
+                "--url",
+            ],
+        ),
         "new" => (&["--public"], &[]),
         "resolve" => (&["--take-remote", "--keep-local"], &["--save-as"]),
         _ => (&[], &[]),
