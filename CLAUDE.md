@@ -28,8 +28,8 @@ user's branch or index.
 - The daemon manages only bare-layout repos at `root/<group>/<repo>` and pushes WIP snapshots only to private repos by default (`sync.snapshots`, per-group override); see `docs/phase6.md`.
 
 ## Workflow quirks
-- Remote: Gitea `git.zenvairo.es`, owner `dasemu` (section `Darío`), CLI `tea`. SSH (port 22)
-  is unreachable from the dev machine; use HTTPS with `git -c credential.helper='!tea login helper'`.
+- Remote: public GitHub `Dasemu/Grove` over SSH, CLI `gh`; PRs target `development` there.
+  `git.zenvairo.es/dasemu/Grove` is a read-only pull mirror of it (never push to it).
 - In zsh, aliases like `g`/`gg` shadow shell functions; use unusual function names in scripts.
 - Throwaway repos created on the real Gitea for tests must be deleted afterwards.
 
