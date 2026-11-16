@@ -37,8 +37,23 @@ they may only contain letters, digits, `-` and `_`.
   to the original layout (tested by injecting a failure after every step).
 - Every operation that rewrites a worktree writes a backup ref first.
 - `apply_snapshot` declines (changing nothing) on any local work; `read-tree -m -u` additionally
-  refuses to overwrite untracked files.
-- `archive_gone` keeps dirty worktrees and writes a backup ref before deleting a branch.
+  refuses to overwrite untracked files. Both it and the fast-forward in `receive` also decline when
+  the incoming change would overwrite a local *ignored* file (`ignored_conflicts`).
+- `archive_gone` keeps any worktree whose `status --porcelain --ignored` is non-empty (so `.env`
+  and similar are never deleted), never archives when the remote lists no branches, and writes a
+  backup ref before deleting a branch.
+- Backup refs live in per-kind namespaces (`refs/sync-backup/<machine>/<stamp>/<kind>`, kinds
+  `add`, `receive/<branch>`, `apply/<branch>`, `archive/<branch>`) so several in one pass cannot
+  collide as ref directory/file.
+- `add` also refuses sparse checkouts and `extensions.worktreeConfig`.
+
+## Known limitations
+
+- Nested untracked git repos are snapshotted only as gitlinks (their content is not synced).
+- No crash-resume: a hard kill in the middle of `add` leaves `.gitsync-stage`; the error says where
+  the files are, but recovery is manual (the backup tar and ref exist).
+- Machine-name uniqueness across machines is not enforced.
+- Split-index repos are untested.
 
 ## Not done yet (later phases)
 

@@ -13,8 +13,51 @@ pub const REMOTE: &str = "origin";
 /// Local namespace where other machines' snapshot refs are fetched to.
 pub const REMOTE_SYNC: &str = "refs/sync-remote";
 
-fn backup_ref(machine: &str, stamp: &str) -> String {
-    format!("refs/sync-backup/{machine}/{stamp}")
+/// Backup refs live in `refs/sync-backup/<machine>/<stamp>/<kind>`; each kind has its own
+/// sub-namespace so refs of different operations in one pass can never collide (D/F conflict).
+fn backup_ref(machine: &str, stamp: &str, kind: &str) -> String {
+    format!("refs/sync-backup/{machine}/{stamp}/{kind}")
+}
+
+/// Paths the incoming change would add that already exist locally as *ignored* files.
+/// `git status` does not report those, but a merge/read-tree would silently overwrite them.
+fn ignored_conflicts(g: &Git, target: &str) -> Result<Vec<String>, GitError> {
+    let added = g.run(&[
+        "diff",
+        "--no-renames",
+        "--diff-filter=A",
+        "--name-only",
+        "-z",
+        "HEAD",
+        target,
+    ])?;
+    let added: Vec<&str> = added.split('\0').filter(|p| !p.is_empty()).collect();
+    if added.is_empty() {
+        return Ok(vec![]);
+    }
+    let ignored = g.run(&[
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "-z",
+    ])?;
+    let ignored: Vec<&str> = ignored.split('\0').filter(|p| !p.is_empty()).collect();
+    Ok(added
+        .into_iter()
+        .filter(|a| {
+            ignored
+                .iter()
+                .any(|i| a == i || (i.ends_with('/') && a.starts_with(i)))
+        })
+        .map(String::from)
+        .collect())
+}
+
+fn current_branch(g: &Git) -> Result<String, GitError> {
+    g.probe(&["symbolic-ref", "--short", "-q", "HEAD"])?
+        .ok_or_else(|| GitError::Other("detached HEAD".into()))
 }
 
 /// Make sure a bare repo created with `git clone --bare` can track remote branches.
@@ -57,8 +100,13 @@ pub fn push_snapshot(worktree: &Path, machine: &str, remote: &str) -> Result<(),
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Received {
-    FastForwarded { from: String, to: String },
+    FastForwarded {
+        from: String,
+        to: String,
+    },
     Skipped(State),
+    /// Clean and behind, but the update would overwrite local ignored files.
+    Declined(String),
 }
 
 /// Fast-forward a clean, strictly-behind worktree to its upstream. Anything else is skipped.
@@ -68,8 +116,16 @@ pub fn receive(worktree: &Path, machine: &str, stamp: &str) -> Result<Received, 
         return Ok(Received::Skipped(st));
     }
     let g = Git::new(worktree);
+    let clash = ignored_conflicts(&g, "@{upstream}")?;
+    if !clash.is_empty() {
+        return Ok(Received::Declined(format!(
+            "would overwrite ignored local files: {}",
+            clash.join(", ")
+        )));
+    }
     let from = g.run(&["rev-parse", "HEAD"])?;
-    g.run(&["update-ref", &backup_ref(machine, stamp), &from])?;
+    let bref = backup_ref(machine, stamp, &format!("receive/{}", current_branch(&g)?));
+    g.run(&["update-ref", &bref, &from])?;
     g.run(&["merge", "-q", "--ff-only", "@{upstream}"])?;
     let to = g.run(&["rev-parse", "HEAD"])?;
     Ok(Received::FastForwarded { from, to })
@@ -108,7 +164,10 @@ pub fn foreign_snapshots(worktree: &Path, machine: &str) -> Result<Vec<ForeignSn
         if m == machine || b != branch {
             continue;
         }
-        let based_on = g.run(&["rev-parse", &format!("{oid}^1")])?;
+        // A snapshot taken on an unborn HEAD has no parent: nothing to base it on, skip it.
+        let Some(based_on) = g.probe(&["rev-parse", "-q", "--verify", &format!("{oid}^1")])? else {
+            continue;
+        };
         out.push(ForeignSnapshot {
             machine: m.to_string(),
             commit: oid.to_string(),
@@ -155,11 +214,19 @@ pub fn apply_snapshot(
     if snap_tree == g.run(&["rev-parse", "HEAD^{tree}"])? {
         return Ok(Applied::Nothing);
     }
-    g.run(&["update-ref", &backup_ref(machine, stamp), &head])?;
+    let clash = ignored_conflicts(&g, &snap.commit)?;
+    if !clash.is_empty() {
+        return Ok(Applied::Declined(format!(
+            "would overwrite ignored local files: {}",
+            clash.join(", ")
+        )));
+    }
+    let bref = backup_ref(machine, stamp, &format!("apply/{}", current_branch(&g)?));
+    g.run(&["update-ref", &bref, &head])?;
     if head != snap.based_on {
         g.run(&["merge", "-q", "--ff-only", &snap.based_on])?;
     }
-    // Two-way merge: refuses (without changing anything) if it would clobber untracked files.
+    // Two-way merge: refuses on untracked files; ignored ones were checked above.
     g.run(&["read-tree", "-m", "-u", "HEAD", &snap.commit])?;
     // Present the changes as working changes, like on the machine that made them.
     g.run(&["reset", "-q"])?;
@@ -232,6 +299,12 @@ pub enum Archived {
 pub fn archive_gone(root: &Path, machine: &str, stamp: &str) -> Result<Vec<Archived>, GitError> {
     let bare = root.join(".bare");
     let g = Git::new(&bare);
+    // A remote that currently shows no branches at all (empty, re-created, outage) would make
+    // every branch look "gone": never archive in that case.
+    let tracked = g.run(&["for-each-ref", "--format=%(refname)", "refs/remotes"])?;
+    if tracked.lines().all(|l| l.ends_with("/HEAD")) {
+        return Ok(vec![]);
+    }
     let listing = g.run(&[
         "for-each-ref",
         "--format=%(refname:short)|%(upstream:track)",
@@ -249,14 +322,18 @@ pub fn archive_gone(root: &Path, machine: &str, stamp: &str) -> Result<Vec<Archi
         let Some(wt) = wts.iter().find(|w| w.branch.as_deref() == Some(branch)) else {
             continue;
         };
-        if facts(&wt.path)?.dirty {
+        // Ignored files (.env, build output...) count as local work too.
+        if !Git::new(&wt.path)
+            .run(&["status", "--porcelain", "--ignored"])?
+            .is_empty()
+        {
             out.push(Archived::KeptDirty {
                 branch: branch.to_string(),
             });
             continue;
         }
         let tip = g.run(&["rev-parse", &format!("refs/heads/{branch}")])?;
-        let bref = format!("{}/{}", backup_ref(machine, stamp), branch);
+        let bref = backup_ref(machine, stamp, &format!("archive/{branch}"));
         g.run(&["update-ref", &bref, &tip])?;
         g.run(&["worktree", "remove", &wt.path.to_string_lossy()])?;
         g.run(&["branch", "-D", branch])?;

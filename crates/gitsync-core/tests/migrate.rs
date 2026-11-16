@@ -195,6 +195,16 @@ fn refuses_unsafe_situations_without_touching_anything() {
     commit(&g, "a", "1");
     assert!(refused(migrate(&inside, "m", &inside.join("bk"), "1")).contains("outside"));
     assert!(inside.join(".git").is_dir());
+    assert!(
+        !inside.join("bk").exists(),
+        "refusal must not create the backup dir"
+    );
+
+    let sparse = base.join("sparse");
+    let g = init(&sparse);
+    commit(&g, "a", "1");
+    g.run(&["config", "core.sparseCheckout", "true"]).unwrap();
+    assert!(refused(migrate(&sparse, "m", &bk, "1")).contains("sparse"));
     // Subdirectory is not a repo root.
     fs::create_dir(inside.join("sub")).unwrap();
     assert!(refused(migrate(&inside.join("sub"), "m", &bk, "1")).contains("plain clone"));

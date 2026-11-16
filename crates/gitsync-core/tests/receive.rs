@@ -81,7 +81,8 @@ fn clean_behind_worktree_fast_forwards_with_backup() {
     );
     assert!(w.d2.join("b.txt").exists());
     assert_eq!(
-        w.g2.run(&["rev-parse", "refs/sync-backup/m2/t1"]).unwrap(),
+        w.g2.run(&["rev-parse", "refs/sync-backup/m2/t1/receive/main"])
+            .unwrap(),
         old
     );
 }
@@ -241,7 +242,7 @@ fn materializes_new_remote_branches_and_archives_gone_ones() {
     assert!(!root.join("feat-x").exists());
     let bg = Git::new(&r.bare_dir);
     assert!(
-        bg.run(&["rev-parse", "refs/sync-backup/m2/t9/feat/x"])
+        bg.run(&["rev-parse", "refs/sync-backup/m2/t9/archive/feat/x"])
             .is_ok()
     );
     assert!(
@@ -277,4 +278,130 @@ fn gone_branch_with_local_changes_is_kept_and_flagged() {
 
 fn state_of(p: &std::path::Path) -> State {
     gitsync_core::inspect::state(p)
+}
+
+// ---- regression tests for the review findings ----
+
+#[test]
+fn archive_keeps_clean_worktree_that_holds_ignored_files() {
+    let w = world();
+    let r = migrate(&w.d2, "m2", &w.base.join("bk"), "1").unwrap();
+    let root = w.d2.canonicalize().unwrap();
+    w.g1.run(&["checkout", "-q", "-b", "feat/e"]).unwrap();
+    commit(&w.g1, "e.txt", "e\n");
+    w.g1.run(&["push", "-q", "-u", "origin", "feat/e"]).unwrap();
+    fetch(&r.bare_dir, REMOTE).unwrap();
+    materialize(&root, REMOTE).unwrap();
+    fs::write(root.join("feat-e/local.env"), "SECRET=1\n").unwrap(); // ignored by *.env
+    assert_eq!(
+        state_of(&root.join("feat-e")),
+        State::Synced,
+        "ignored files are invisible to status"
+    );
+    w.g1.run(&["push", "-q", "origin", "--delete", "feat/e"])
+        .unwrap();
+    fetch(&r.bare_dir, REMOTE).unwrap();
+    assert_eq!(
+        archive_gone(&root, "m2", "t").unwrap(),
+        vec![Archived::KeptDirty {
+            branch: "feat/e".into()
+        }]
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("feat-e/local.env")).unwrap(),
+        "SECRET=1\n"
+    );
+}
+
+#[test]
+fn archive_does_nothing_when_remote_shows_no_branches() {
+    let w = world();
+    let r = migrate(&w.d2, "m2", &w.base.join("bk"), "1").unwrap();
+    let root = w.d2.canonicalize().unwrap();
+    let bg = Git::new(&r.bare_dir);
+    for line in bg
+        .run(&["for-each-ref", "--format=%(refname)", "refs/remotes"])
+        .unwrap()
+        .lines()
+    {
+        bg.run(&["update-ref", "-d", line]).unwrap();
+    }
+    assert!(archive_gone(&root, "m2", "t").unwrap().is_empty());
+    assert!(root.join("main").exists());
+}
+
+#[test]
+fn fast_forward_declines_instead_of_overwriting_local_ignored_file() {
+    let w = world();
+    commit(&w.g1, "conf.local", "theirs\n");
+    w.g1.run(&["push", "-q"]).unwrap();
+    fs::write(w.d2.join(".git/info/exclude"), "conf.local\n").unwrap();
+    fs::write(w.d2.join("conf.local"), "mine\n").unwrap();
+    fetch(&w.d2, REMOTE).unwrap();
+    let head = w.g2.run(&["rev-parse", "HEAD"]).unwrap();
+    assert!(matches!(
+        receive(&w.d2, "m2", "t").unwrap(),
+        Received::Declined(_)
+    ));
+    assert_eq!(w.g2.run(&["rev-parse", "HEAD"]).unwrap(), head);
+    assert_eq!(
+        fs::read_to_string(w.d2.join("conf.local")).unwrap(),
+        "mine\n"
+    );
+}
+
+#[test]
+fn snapshot_apply_declines_instead_of_overwriting_local_ignored_file() {
+    let w = world();
+    fs::write(w.d1.join("conf.local"), "theirs\n").unwrap();
+    take(&w.d1, "m1", "t1").unwrap();
+    push_snapshot(&w.d1, "m1", REMOTE).unwrap();
+    fs::write(w.d2.join(".git/info/exclude"), "conf.local\n").unwrap();
+    fs::write(w.d2.join("conf.local"), "mine\n").unwrap();
+    fetch(&w.d2, REMOTE).unwrap();
+    let snap = foreign_snapshots(&w.d2, "m2").unwrap().remove(0);
+    assert!(matches!(
+        apply_snapshot(&w.d2, &snap, "m2", "t").unwrap(),
+        Applied::Declined(_)
+    ));
+    assert_eq!(
+        fs::read_to_string(w.d2.join("conf.local")).unwrap(),
+        "mine\n"
+    );
+}
+
+#[test]
+fn archive_and_receive_in_one_pass_do_not_collide_on_backup_refs() {
+    use gitsync_core::sync::{Options, sync_repo};
+    let w = world();
+    migrate(&w.d2, "m2", &w.base.join("bk"), "1").unwrap();
+    let root = w.d2.canonicalize().unwrap();
+    let o = |stamp: &str| Options {
+        machine: "m2".into(),
+        stamp: stamp.into(),
+        remote: "origin".into(),
+        offline: false,
+        materialize: true,
+    };
+    w.g1.run(&["checkout", "-q", "-b", "feat/z"]).unwrap();
+    commit(&w.g1, "z.txt", "z\n");
+    w.g1.run(&["push", "-q", "-u", "origin", "feat/z"]).unwrap();
+    sync_repo(&root, &o("s1")).unwrap();
+    assert!(root.join("feat-z").exists());
+
+    // Same pass: feat/z disappears upstream AND main moves.
+    w.g1.run(&["push", "-q", "origin", "--delete", "feat/z"])
+        .unwrap();
+    w.g1.run(&["checkout", "-q", "main"]).unwrap();
+    commit(&w.g1, "m.txt", "m\n");
+    w.g1.run(&["push", "-q", "origin", "main"]).unwrap();
+    let rep = sync_repo(&root, &o("s2")).unwrap();
+    assert_eq!(rep.archived.len(), 1);
+    for wt in &rep.worktrees {
+        assert!(wt.errors.is_empty(), "{:?}", wt.errors);
+    }
+    assert!(
+        root.join("main/m.txt").exists(),
+        "main fast-forwarded in the same pass"
+    );
 }

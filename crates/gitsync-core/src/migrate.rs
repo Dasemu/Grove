@@ -95,6 +95,8 @@ struct Progress {
     wt_meta: Option<PathBuf>,
     filled: bool,
     index_moved: bool,
+    /// Original `core.worktree`, restored on rollback.
+    orig_core_worktree: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -154,7 +156,7 @@ fn preflight(root: &Path) -> Result<String, MigrateError> {
     }
     if root.join(STAGE).exists() {
         return refuse(format!(
-            "{STAGE} exists: a previous migration was interrupted"
+            "{STAGE} exists: a previous migration was interrupted. Your files are in {STAGE} and the git dir in .bare; restore from the backup tar or move them back by hand"
         ));
     }
     if !dotgit.is_dir() {
@@ -188,6 +190,17 @@ fn preflight(root: &Path) -> Result<String, MigrateError> {
             ));
         }
     }
+    if matches!(
+        git.probe(&["config", "--get", "core.sparseCheckout"])?
+            .as_deref(),
+        Some("true")
+    ) || matches!(
+        git.probe(&["config", "--get", "extensions.worktreeConfig"])?
+            .as_deref(),
+        Some("true")
+    ) {
+        return refuse("sparse checkout / per-worktree config is not supported yet");
+    }
     if root.join(".gitmodules").exists() || dotgit.join("modules").exists() {
         return refuse("submodules are not supported yet");
     }
@@ -209,6 +222,10 @@ fn backup(
     backup_dir: &Path,
     stamp: &str,
 ) -> Result<(PathBuf, String), MigrateError> {
+    // Check before creating anything so a refusal never leaves stray directories behind.
+    if std::path::absolute(backup_dir)?.starts_with(root) {
+        return refuse("backup directory must be outside the repository");
+    }
     fs::create_dir_all(backup_dir)?;
     let backup_dir = backup_dir.canonicalize()?;
     if backup_dir.starts_with(root) {
@@ -236,7 +253,7 @@ fn backup(
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    let backup_ref = format!("refs/sync-backup/{machine}/{stamp}");
+    let backup_ref = format!("refs/sync-backup/{machine}/{stamp}/add");
     git.run(&["update-ref", &backup_ref, "HEAD"])?;
     Ok((tar, backup_ref))
 }
@@ -321,6 +338,9 @@ fn run_steps(
     p.git_moved = true;
     root_git
         .run(&["--git-dir", BARE, "config", "core.bare", "true"])
+        .map_err(s)?;
+    p.orig_core_worktree = root_git
+        .probe(&["--git-dir", BARE, "config", "--get", "core.worktree"])
         .map_err(s)?;
     root_git
         .probe(&["--git-dir", BARE, "config", "--unset", "core.worktree"])
@@ -416,12 +436,18 @@ fn rollback(root: &Path, p: &Progress) -> Result<(), String> {
         && meta.exists()
     {
         fs::remove_dir_all(meta).map_err(s)?;
-        let _ = fs::remove_dir(bare.join("worktrees"));
     }
     if p.git_moved {
-        Git::new(root)
-            .run(&["--git-dir", BARE, "config", "core.bare", "false"])
+        let g = Git::new(root);
+        // Drop metadata of a half-created worktree (e.g. `worktree add` failed midway).
+        let _ = g.probe(&["--git-dir", BARE, "worktree", "prune"]);
+        let _ = fs::remove_dir(bare.join("worktrees"));
+        g.run(&["--git-dir", BARE, "config", "core.bare", "false"])
             .map_err(s)?;
+        if let Some(w) = &p.orig_core_worktree {
+            g.run(&["--git-dir", BARE, "config", "core.worktree", w])
+                .map_err(s)?;
+        }
         fs::rename(&bare, root.join(".git")).map_err(s)?;
     }
     if p.staged && stage.exists() {

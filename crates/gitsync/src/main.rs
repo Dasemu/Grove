@@ -153,8 +153,10 @@ fn print_report(rep: &SyncReport) -> Result<()> {
         if let Some(s) = w.snapshot {
             notes.push(format!("snapshot {s}"));
         }
-        if let Some(Received::FastForwarded { .. }) = &w.received {
-            notes.push("fast-forwarded".into());
+        match &w.received {
+            Some(Received::FastForwarded { .. }) => notes.push("fast-forwarded".into()),
+            Some(Received::Declined(why)) => notes.push(format!("not fast-forwarded: {why}")),
+            _ => {}
         }
         if let Some((m, a)) = &w.applied {
             match a {
