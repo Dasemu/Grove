@@ -1,6 +1,7 @@
 use crate::http::Http;
 use crate::{
-    Capabilities, Error, MirrorSpec, NewRepo, Provider, PullMirrorSpec, RemoteRepo, Result,
+    Capabilities, Error, MergedPull, MirrorSpec, NewRepo, Provider, PullMirrorSpec, RemoteRepo,
+    Result, same_repo,
 };
 use grove_core::config::ProviderKind;
 use serde_json::{Value, json};
@@ -138,4 +139,28 @@ impl Provider for GitHub {
             "GitHub cannot pull-mirror another forge",
         ))
     }
+
+    fn merged_pulls(&self, owner: &str, name: &str) -> Result<Vec<MergedPull>> {
+        let v = self.http.ok(
+            "GET",
+            &format!(
+                "/repos/{owner}/{name}/pulls?state=closed&sort=updated&direction=desc&per_page=100"
+            ),
+            None,
+        )?;
+        Ok(v.as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["merged_at"].is_string() && same_repo(p))
+            .filter_map(pull)
+            .collect())
+    }
+}
+
+fn pull(p: &Value) -> Option<MergedPull> {
+    Some(MergedPull {
+        number: p["number"].as_u64()?,
+        head_ref: p["head"]["ref"].as_str()?.to_string(),
+        head_sha: p["head"]["sha"].as_str()?.to_string(),
+    })
 }

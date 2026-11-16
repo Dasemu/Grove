@@ -159,6 +159,14 @@ pub struct Sync {
     /// syncing). Empty disables the move.
     #[serde(default = "default_purged_dir")]
     pub purged_dir: String,
+    /// Remove worktrees whose branch was merged through a pull request on the forge (when they
+    /// hold no local work).
+    #[serde(default = "yes")]
+    pub prune_merged: bool,
+    /// Ignored files/directories (matched by name) that may be deleted with a pruned worktree:
+    /// regenerable build output and dependency caches. Any other ignored file keeps it.
+    #[serde(default = "default_disposable")]
+    pub prune_disposable: Vec<String>,
 }
 
 impl Default for Sync {
@@ -170,6 +178,8 @@ impl Default for Sync {
             max_file_mb: default_max_file_mb(),
             snapshots: SnapshotPolicy::default(),
             purged_dir: default_purged_dir(),
+            prune_merged: true,
+            prune_disposable: default_disposable(),
         }
     }
 }
@@ -191,6 +201,33 @@ fn default_max_file_mb() -> u64 {
 }
 fn default_purged_dir() -> String {
     "Purged".into()
+}
+fn default_disposable() -> Vec<String> {
+    [
+        "target",
+        "node_modules",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".gradle",
+        ".next",
+        ".nuxt",
+        ".svelte-kit",
+        ".turbo",
+        ".parcel-cache",
+        "dist",
+        "build",
+        "out",
+        "coverage",
+        ".cache",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 fn default_fetch() -> u64 {
     60
@@ -295,6 +332,16 @@ impl Config {
                     "sync.purged_dir {pd:?} is also a group: purged repos would keep syncing"
                 ));
             }
+        }
+        if let Some(d) = self
+            .sync
+            .prune_disposable
+            .iter()
+            .find(|d| d.is_empty() || *d == "." || *d == ".." || d.contains(['/', '\\']))
+        {
+            return bad(format!(
+                "sync.prune_disposable entry {d:?} must be a plain file or directory name"
+            ));
         }
         for g in &self.groups {
             // Group names are directory names under the root.
@@ -402,6 +449,22 @@ name = "grove-config"
         let c = Config::parse("[machine]\nname=\"a\"\n[root]\npath=\"/x\"\n").unwrap();
         assert!(c.groups.is_empty());
         assert_eq!(c.root_path(), PathBuf::from("/x"));
+    }
+
+    #[test]
+    fn prune_merged_defaults_on_and_disposable_names_are_plain() {
+        let base = "[machine]\nname=\"m\"\n[root]\npath=\"/x\"\n";
+        let c = Config::parse(base).unwrap();
+        assert!(c.sync.prune_merged);
+        assert!(c.sync.prune_disposable.iter().any(|d| d == "target"));
+        let own = format!("{base}[sync]\nprune_merged=false\nprune_disposable=[\"out\"]\n");
+        let c = Config::parse(&own).unwrap();
+        assert!(!c.sync.prune_merged);
+        assert_eq!(c.sync.prune_disposable, vec!["out".to_string()]);
+        for bad in ["\"\"", "\"a/b\"", "\"..\""] {
+            let t = format!("{base}[sync]\nprune_disposable=[{bad}]\n");
+            assert!(Config::parse(&t).is_err(), "{bad}");
+        }
     }
 
     #[test]
