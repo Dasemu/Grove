@@ -21,7 +21,7 @@ every event (reconnects every 5 s while the daemon is down); the tray service; t
 listener; short-lived threads for CLI calls so the UI never blocks. Fallback poll: 5 s with the
 window open, 30 s hidden. No Slint timers run while idle.
 
-Tray states: ok, syncing, attention (also sets the item to `NeedsAttention`), paused, daemon offline.
+Tray states: ok, syncing, attention (diverged, error, `ahead`, `behinddirty`; also sets the item to `NeedsAttention`), paused, daemon offline.
 Menu: Open, Sync now, Pause/Resume, Quit; left click opens the window. Closing the window hides it;
 Quit exits. If no StatusNotifier host exists, closing the window quits. A transition into
 `Diverged`/`Error` shows a toast when the window is open and calls `notify-send` (best effort) when hidden.
@@ -49,8 +49,9 @@ grove-gui --view settings                   # start on a view (activity, new, im
 ```
 
 `grove` is looked up next to the `grove-gui` binary, then in `PATH`. Packaging: `.deb` installs
-`grove-gui`, `contrib/grove.desktop`, `contrib/grove-autostart.desktop` (`/etc/xdg/autostart`) and
-`assets/grove.png`. Dev builds need no system Qt: Slint is built with the `winit` backend (Wayland and
+`grove-gui`, `contrib/grove.desktop`, `assets/grove.png` and a copy of the autostart file under
+`/usr/share/grove/`. Autostart is opt-in: Settings has a "Start Grove at login" toggle that writes or
+removes `~/.config/autostart/grove.desktop`. The deb recommends `libnotify-bin` (`notify-send`). Dev builds need no system Qt: Slint is built with the `winit` backend (Wayland and
 X11 loaded at runtime) and the software renderer.
 
 ## Dependencies
@@ -74,6 +75,8 @@ Idle CPU hidden: 0 ticks in 20 s. 9 threads.
 
 - Slint does not expose xdg-activation, so launching again (or clicking the tray) on a visible window re-maps it (hide + show); the compositor focuses the fresh window (checked on KWin: keyboard focus arrives). The compositor picks the window position again.
 - Activity timestamps use the local UTC offset read via `date +%z` (no timezone crate).
+- Onboarding stays on screen until login and bootstrap succeed. If a config already exists it is kept and `grove init` is skipped (the form fields are then ignored, the output says so).
+- Resolve output under a worktree disappears once that worktree's state changes after the run; a toast reports the result.
 - The activity list shows the first line of each message, repository errors are cut at 160 characters
   in the list (full text in the detail view).
 - Slint's wrapped text under-reports its height in layouts, so long text is elided, not wrapped.
