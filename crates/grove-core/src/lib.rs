@@ -1,5 +1,9 @@
 //! Sync engine core: git plumbing wrapper, config, snapshots and state classification.
 
+#[cfg(test)]
+#[path = "../../../test-support/tmp.rs"]
+mod test_tmp;
+
 pub mod busy;
 pub mod config;
 pub mod git;

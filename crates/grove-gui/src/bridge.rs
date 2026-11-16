@@ -219,7 +219,8 @@ mod tests {
 
     #[test]
     fn migrate_path_must_be_a_clone_directly_under_a_group() {
-        let base = std::env::temp_dir().join(format!("grove-mig-{}", std::process::id()));
+        let _tmp = crate::test_tmp::TempDir::new("grove-mig");
+        let base = _tmp.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("work/proj/sub")).unwrap();
         std::fs::create_dir_all(base.join("other/proj")).unwrap();
@@ -248,7 +249,8 @@ mod tests {
     #[test]
     fn add_runs_only_for_valid_clone_paths() {
         use std::os::unix::fs::PermissionsExt;
-        let base = std::env::temp_dir().join(format!("grove-add-{}", std::process::id()));
+        let _tmp = crate::test_tmp::TempDir::new("grove-add");
+        let base = _tmp.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("work/proj")).unwrap();
         std::fs::create_dir_all(base.join("elsewhere")).unwrap();

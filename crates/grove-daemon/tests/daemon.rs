@@ -1,6 +1,8 @@
 use grove_core::config::Config;
 use grove_daemon::{Daemon, Settings, ipc};
 use serde_json::json;
+#[path = "../../../test-support/tmp.rs"]
+mod tmp;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -39,18 +41,24 @@ fn wait_until(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
 struct World {
     base: PathBuf,
     remote: PathBuf,
+    // Declared last so it is dropped (and the dir removed) after everything else in the world.
+    _tmp: tmp::TempDir,
 }
 
-fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("grove-dt-{tag}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&d);
-    fs::create_dir_all(&d).unwrap();
-    d
+/// Kills and reaps a spawned `groved` (by its own handle) when dropped, also on panic.
+struct Spawned(std::process::Child);
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// A bare remote plus one seeded clone per machine under `<base>/<machine>/repo`.
 fn world(tag: &str, machines: &[&str]) -> World {
-    let base = tmpdir(tag);
+    let tmp = tmp::TempDir::new(tag);
+    let base = tmp.path().to_path_buf();
     let remote = base.join("remote.git");
     fs::create_dir_all(&remote).unwrap();
     git(&remote, &["init", "-q", "--bare", "-b", "main"]);
@@ -70,7 +78,11 @@ fn world(tag: &str, machines: &[&str]) -> World {
         fs::create_dir_all(&dir).unwrap();
         bare_layout(&dir.join("g/repo"), &remote);
     }
-    World { base, remote }
+    World {
+        base,
+        remote,
+        _tmp: tmp,
+    }
 }
 
 /// A bare + worktrees repo (`.bare`, worktree `main`) cloned from `remote`, as `grove add` leaves it.
@@ -274,22 +286,24 @@ fn killing_the_daemon_loses_nothing_and_a_restart_recovers() {
     let runtime = w.base.join("run");
     fs::create_dir_all(&runtime).unwrap();
     let spawn = || {
-        Command::new(env!("CARGO_BIN_EXE_groved"))
-            .arg("--config")
-            .arg(&cfg_path)
-            .env("XDG_RUNTIME_DIR", &runtime)
-            .env("XDG_STATE_HOME", w.base.join("state"))
-            .env("GIT_AUTHOR_NAME", "t")
-            .spawn()
-            .unwrap()
+        Spawned(
+            Command::new(env!("CARGO_BIN_EXE_groved"))
+                .arg("--config")
+                .arg(&cfg_path)
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .env("XDG_STATE_HOME", w.base.join("state"))
+                .env("GIT_AUTHOR_NAME", "t")
+                .spawn()
+                .unwrap(),
+        )
     };
     let mut child = spawn();
     std::thread::sleep(Duration::from_millis(300));
     fs::write(repo.join("wip.txt"), "precious\n").unwrap();
     // Kill at an arbitrary moment: maybe before, during or after a pass.
     std::thread::sleep(Duration::from_millis(400));
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
 
     assert_eq!(
         fs::read_to_string(repo.join("wip.txt")).unwrap(),
@@ -310,8 +324,8 @@ fn killing_the_daemon_loses_nothing_and_a_restart_recovers() {
         fs::read_to_string(repo.join("wip.txt")).unwrap(),
         "precious\n"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
 }
 
 #[test]
@@ -356,24 +370,26 @@ fn paused_daemon_does_not_spin() {
     .unwrap();
     let runtime = w.base.join("run");
     fs::create_dir_all(&runtime).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_groved"))
-        .arg("--config")
-        .arg(&cfg_path)
-        .env("XDG_RUNTIME_DIR", &runtime)
-        .env("XDG_STATE_HOME", w.base.join("state"))
-        .spawn()
-        .unwrap();
+    let mut child = Spawned(
+        Command::new(env!("CARGO_BIN_EXE_groved"))
+            .arg("--config")
+            .arg(&cfg_path)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_STATE_HOME", w.base.join("state"))
+            .spawn()
+            .unwrap(),
+    );
     let sock = runtime.join("grove/grove.sock");
     wait_until("daemon up", 10, || {
         ipc::request(&sock, &json!({"v":1,"cmd":"ping"})).is_ok()
     });
     ipc::request(&sock, &json!({"v":1,"cmd":"pause"})).unwrap();
     std::thread::sleep(Duration::from_millis(1500)); // let any in-flight pass finish
-    let before = cpu_ticks(child.id());
+    let before = cpu_ticks(child.0.id());
     std::thread::sleep(Duration::from_secs(3)); // well past several fetch intervals
-    let used = cpu_ticks(child.id()) - before;
-    child.kill().unwrap();
-    child.wait().unwrap();
+    let used = cpu_ticks(child.0.id()) - before;
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
     assert!(used < 30, "paused daemon burned {used} ticks of CPU in 3 s");
 }
 

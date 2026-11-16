@@ -1,3 +1,5 @@
+#[path = "../../../test-support/tmp.rs"]
+mod tmp;
 use grove_core::config::ProviderKind;
 use grove_providers::{Error, GitHub, Gitea, MirrorSpec, NewRepo, Provider, PullMirrorSpec, token};
 use std::io::{Read, Write};
@@ -273,15 +275,8 @@ fn github_cannot_pull_mirror() {
 fn falls_back_to_tea_and_gh_logins() {
     use grove_core::config::Provider as ProviderCfg;
     use std::os::unix::fs::PermissionsExt;
-    let dir = std::env::temp_dir().join(format!(
-        "grove-clitok-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tmp::TempDir::new("clitok");
+    let dir = tmp.path().to_path_buf();
     // tea's credential helper answers only for its host; gh echoes the host it was asked for.
     let scripts = [
         (
@@ -320,7 +315,6 @@ fn falls_back_to_tea_and_gh_logins() {
     drop(off);
     let _off = EnvGuard::set("GROVE_NO_CLI_TOKENS", "1");
     assert!(token::resolve(&id, &github).is_err());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

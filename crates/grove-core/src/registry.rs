@@ -218,8 +218,8 @@ mod tests {
 
     #[test]
     fn rollback_that_cannot_remove_everything_leaves_a_stage_marker() {
-        let d = std::env::temp_dir().join(format!("grove-rb-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
+        let tmp = crate::test_tmp::TempDir::new("rb");
+        let d = tmp.path().join("d");
         let locked = d.join(".bare/locked");
         fs::create_dir_all(&locked).unwrap();
         fs::write(locked.join("f"), "x").unwrap();

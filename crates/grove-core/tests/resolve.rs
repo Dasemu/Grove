@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 /// Two machines on the bare layout, both committed on main: diverged on B.
-fn diverged() -> (PathBuf, PathBuf, PathBuf) {
+fn diverged() -> (common::tmp::TempDir, PathBuf, PathBuf) {
     let base = tmpdir("resolve");
     let remote = base.join("r.git");
     Git::new(&base)

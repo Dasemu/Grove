@@ -670,7 +670,8 @@ owners = { github = "gh-org" }
     #[test]
     fn cache_persists_in_the_state_dir_with_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("grove-vis-{}", std::process::id()));
+        let _tmp = crate::test_tmp::TempDir::new("grove-vis");
+        let dir = _tmp.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&dir);
         let file = dir.join("visibility.json");
         let c = cfg();
@@ -714,7 +715,8 @@ owners = { github = "gh-org" }
     #[test]
     fn gate_uses_group_policy_and_every_push_url() {
         let c = cfg();
-        let base = std::env::temp_dir().join(format!("grove-gate-{}", std::process::id()));
+        let _tmp = crate::test_tmp::TempDir::new("grove-gate");
+        let base = _tmp.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&base);
         let f = Fake::default()
             .with("o/r", Ok(Seen::Private))
@@ -752,7 +754,8 @@ owners = { github = "gh-org" }
     #[test]
     fn gate_checks_all_push_urls_and_push_instead_of() {
         let c = cfg();
-        let base = std::env::temp_dir().join(format!("grove-gate2-{}", std::process::id()));
+        let _tmp = crate::test_tmp::TempDir::new("grove-gate2");
+        let base = _tmp.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&base);
         let f = Fake::default()
             .with("o/r", Ok(Seen::Private))
@@ -781,7 +784,8 @@ owners = { github = "gh-org" }
     #[test]
     fn gate_requires_mirror_targets_to_be_private_or_absent() {
         let c = cfg();
-        let base = std::env::temp_dir().join(format!("grove-gate3-{}", std::process::id()));
+        let _tmp = crate::test_tmp::TempDir::new("grove-gate3");
+        let base = _tmp.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&base);
         let repo = mk(&base, "mir", &["https://git.example.com:3000/o/r.git"], &[]);
         let gate = |f: &Fake| {

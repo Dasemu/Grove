@@ -73,8 +73,8 @@ mod tests {
 
     #[test]
     fn marker_lifecycle() {
-        let d = std::env::temp_dir().join(format!("grove-busy-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
+        let tmp = crate::test_tmp::TempDir::new("busy");
+        let d = tmp.path().join("d");
         assert_eq!(busy_state(&d), BusyState::Free);
         let g = BusyGuard::acquire(&d).unwrap();
         assert_eq!(busy_state(&d), BusyState::Active);

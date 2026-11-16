@@ -1,20 +1,9 @@
 use grove_core::git::Git;
 use grove_core::snapshot::{Outcome, take};
+mod common;
+use common::tmpdir;
 use std::fs;
-use std::path::{Path, PathBuf};
-
-fn tmpdir(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "grove-test-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&p).unwrap();
-    p
-}
+use std::path::Path;
 
 fn repo(dir: &Path) -> Git {
     let g = Git::new(dir);
