@@ -161,6 +161,7 @@ mod tests {
         let h = |kind, url: &str| {
             host(&ProviderCfg {
                 kind,
+                protocol: Default::default(),
                 url: Some(url.into()),
             })
         };

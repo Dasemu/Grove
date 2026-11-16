@@ -53,7 +53,24 @@ pub struct RemoteRepo {
     pub name: String,
     pub private: bool,
     pub clone_url: String,
+    /// SSH clone URL (empty when the forge did not report one).
+    pub ssh_url: String,
     pub default_branch: String,
+}
+
+impl RemoteRepo {
+    /// The URL local git should use for `protocol`.
+    pub fn git_url(&self, protocol: grove_core::config::Protocol) -> Result<&str> {
+        use grove_core::config::Protocol;
+        match protocol {
+            Protocol::Https => Ok(&self.clone_url),
+            Protocol::Ssh if self.ssh_url.is_empty() => Err(Error::Other(format!(
+                "the forge reported no SSH URL for {}/{}",
+                self.owner, self.name
+            ))),
+            Protocol::Ssh => Ok(&self.ssh_url),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +116,7 @@ pub struct PullMirrorSpec {
     pub interval: String,
 }
 
-pub trait Provider {
+pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     fn capabilities(&self) -> Capabilities;
     /// Verifies the token and returns the authenticated login.
@@ -107,6 +124,9 @@ pub trait Provider {
     /// One repo's metadata (notably its visibility): `GET /repos/{owner}/{repo}`.
     fn get_repo(&self, owner: &str, name: &str) -> Result<RemoteRepo>;
     fn list_repos(&self) -> Result<Vec<RemoteRepo>>;
+    /// The repos owned by `owner` (an organisation, or the authenticated user `login`), without
+    /// paging through everything else the token can see.
+    fn list_owner_repos(&self, owner: &str, login: &str) -> Result<Vec<RemoteRepo>>;
     fn create_repo(&self, new: &NewRepo) -> Result<RemoteRepo>;
     fn configure_mirror(&self, owner: &str, repo: &str, spec: &MirrorSpec) -> Result<()>;
     /// Creates a pull mirror (see [`Capabilities::pull_mirror`]).

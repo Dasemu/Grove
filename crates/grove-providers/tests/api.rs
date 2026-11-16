@@ -301,10 +301,12 @@ fn falls_back_to_tea_and_gh_logins() {
     let off = EnvGuard::set("GROVE_NO_CLI_TOKENS", "0");
     let gitea = |url: &str| ProviderCfg {
         kind: ProviderKind::Gitea,
+        protocol: Default::default(),
         url: Some(url.into()),
     };
     let github = ProviderCfg {
         kind: ProviderKind::Github,
+        protocol: Default::default(),
         url: None,
     };
     let id = format!("clitok-{}", std::process::id());
@@ -367,4 +369,76 @@ fn get_repo_reports_visibility_on_both_forges() {
             .unwrap()
             .private
     );
+}
+
+const REPO_A: &str = r#"{"name":"a","private":false,"clone_url":"https://h/o/a.git","ssh_url":"git@h:o/a.git","default_branch":"main","owner":{"login":"Org"}}"#;
+const REPO_B: &str = r#"{"name":"b","private":true,"clone_url":"https://h/me/b.git","ssh_url":"ssh://gitea@h:2222/me/b.git","default_branch":"main","owner":{"login":"me"}}"#;
+const REPO_C: &str = r#"{"name":"c","private":true,"clone_url":"https://h/x/c.git","ssh_url":"","default_branch":"main","owner":{"login":"x"}}"#;
+
+fn lines(req: &str) -> &str {
+    req.lines().next().unwrap()
+}
+
+#[test]
+fn gitea_owner_listing_uses_the_org_endpoint_or_the_users_own() {
+    let org = format!("[{REPO_A}]");
+    let user = format!("[{REPO_B},{REPO_C}]");
+    let (url, rx) = mock(vec![
+        (200, Box::leak(org.into_boxed_str())),
+        (200, Box::leak(user.into_boxed_str())),
+    ]);
+    let g = Gitea::new(ProviderKind::Gitea, &url, "t".into());
+    let r = g.list_owner_repos("Org", "me").unwrap();
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].ssh_url, "git@h:o/a.git");
+    assert!(lines(&rx.recv().unwrap()).starts_with("GET /api/v1/orgs/Org/repos?limit=50&page=1 "));
+    // The login itself: `/user/repos`, then only its own repos (org repos it can see are dropped).
+    let r = g.list_owner_repos("ME", "me").unwrap();
+    assert_eq!(r.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["b"]);
+    assert!(lines(&rx.recv().unwrap()).starts_with("GET /api/v1/user/repos?limit=50&page=1 "));
+}
+
+#[test]
+fn github_owner_listing_scopes_the_query_and_falls_back_for_users() {
+    let org = format!("[{REPO_A}]");
+    let mine = format!("[{REPO_B}]");
+    let (url, rx) = mock(vec![
+        (200, Box::leak(org.into_boxed_str())),
+        (200, Box::leak(mine.into_boxed_str())),
+        (404, r#"{"message":"Not Found"}"#),
+        (200, "[]"),
+    ]);
+    let g = GitHub::new(&url, "t".into());
+    assert_eq!(g.list_owner_repos("Org", "me").unwrap().len(), 1);
+    assert!(
+        lines(&rx.recv().unwrap()).starts_with("GET /orgs/Org/repos?type=all&per_page=100&page=1 ")
+    );
+    assert_eq!(g.list_owner_repos("me", "me").unwrap().len(), 1);
+    assert!(
+        lines(&rx.recv().unwrap())
+            .starts_with("GET /user/repos?affiliation=owner&per_page=100&page=1 ")
+    );
+    // Not an organisation (404): the other user's public repos.
+    assert!(g.list_owner_repos("someone", "me").unwrap().is_empty());
+    rx.recv().unwrap();
+    assert!(
+        lines(&rx.recv().unwrap()).starts_with("GET /users/someone/repos?per_page=100&page=1 ")
+    );
+}
+
+#[test]
+fn git_url_follows_the_protocol_and_needs_an_ssh_url_for_ssh() {
+    use grove_core::config::Protocol;
+    let (url, _rx) = mock(vec![(
+        200,
+        Box::leak(format!("[{REPO_B},{REPO_C}]").into_boxed_str()),
+    )]);
+    let g = Gitea::new(ProviderKind::Gitea, &url, "t".into());
+    let r = g.list_repos().unwrap();
+    assert_eq!(r[0].git_url(Protocol::Https).unwrap(), "https://h/me/b.git");
+    assert_eq!(
+        r[0].git_url(Protocol::Ssh).unwrap(),
+        "ssh://gitea@h:2222/me/b.git"
+    );
+    assert!(r[1].git_url(Protocol::Ssh).is_err());
 }

@@ -88,6 +88,9 @@ enum Cmd {
         kind: String,
         #[arg(long)]
         url: Option<String>,
+        /// How git talks to the forge: https (API token) or ssh (your keys)
+        #[arg(long, default_value = "https")]
+        protocol: String,
         #[arg(long, default_value = "default")]
         group: String,
         /// Name of the private config repo to keep the repo registry in
@@ -359,10 +362,16 @@ fn main() -> Result<()> {
             provider,
             kind,
             url,
+            protocol,
             group,
             config_repo,
             force,
         } => {
+            let protocol = match protocol.as_str() {
+                "https" => grove_core::config::Protocol::Https,
+                "ssh" => grove_core::config::Protocol::Ssh,
+                p => bail!("unknown protocol {p:?} (https, ssh)"),
+            };
             let path = cli
                 .config
                 .clone()
@@ -390,6 +399,7 @@ fn main() -> Result<()> {
                     provider: provider.clone(),
                     kind,
                     url: url.clone(),
+                    protocol,
                     group: group.clone(),
                     config_repo: config_repo.clone(),
                 },

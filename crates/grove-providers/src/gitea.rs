@@ -30,6 +30,7 @@ fn repo(v: &Value) -> RemoteRepo {
         name: s("name"),
         private: v["private"].as_bool().unwrap_or(false),
         clone_url: s("clone_url"),
+        ssh_url: s("ssh_url"),
         default_branch: v["default_branch"].as_str().unwrap_or("main").to_string(),
     }
 }
@@ -67,19 +68,33 @@ impl Provider for Gitea {
     }
 
     fn list_repos(&self) -> Result<Vec<RemoteRepo>> {
-        let mut out = Vec::new();
-        for page in 1..=200 {
-            let v = self
+        Ok(self
+            .http
+            .pages("/user/repos", 50, "limit")?
+            .iter()
+            .map(repo)
+            .collect())
+    }
+
+    fn list_owner_repos(&self, owner: &str, login: &str) -> Result<Vec<RemoteRepo>> {
+        let path = if owner.eq_ignore_ascii_case(login) {
+            "/user/repos".to_string()
+        } else {
+            format!("/orgs/{owner}/repos")
+        };
+        let items = match self.http.pages(&path, 50, "limit") {
+            Ok(v) => v,
+            // Not an organisation: another user's public repos.
+            Err(Error::Api { status: 404, .. }) if !owner.eq_ignore_ascii_case(login) => self
                 .http
-                .ok("GET", &format!("/user/repos?limit=50&page={page}"), None)?;
-            let items = v.as_array().cloned().unwrap_or_default();
-            let n = items.len();
-            out.extend(items.iter().map(repo));
-            if n < 50 {
-                break;
-            }
-        }
-        Ok(out)
+                .pages(&format!("/users/{owner}/repos"), 50, "limit")?,
+            Err(e) => return Err(e),
+        };
+        Ok(items
+            .iter()
+            .map(repo)
+            .filter(|r| r.owner.eq_ignore_ascii_case(owner))
+            .collect())
     }
 
     fn create_repo(&self, new: &NewRepo) -> Result<RemoteRepo> {

@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use grove_core::config::{
-    Config, Group, Layout, Machine, Provider as ProviderCfg, ProviderKind, Root,
+    Config, Group, Layout, Machine, Protocol, Provider as ProviderCfg, ProviderKind, Root,
 };
 use grove_core::git::Git;
 use grove_core::registry::{Entry, Registry, clone_bare_layout, init_bare_layout, push_initial};
@@ -17,6 +17,7 @@ pub struct Forge {
     pub token: String,
     /// Git environment that authenticates HTTPS operations with the stored token.
     pub git_env: Vec<(String, String)>,
+    pub protocol: Protocol,
 }
 
 pub fn connect(cfg: &Config, id: &str) -> Result<Forge> {
@@ -27,36 +28,58 @@ pub fn connect(cfg: &Config, id: &str) -> Result<Forge> {
     let (tok, _) = token::resolve(id, pc)?;
     let api = build(pc, tok.clone());
     let login = api.test_connection()?;
-    let git_env = match pc.kind {
-        ProviderKind::Gitea | ProviderKind::Forgejo => vec![
-            ("GIT_CONFIG_COUNT".into(), "1".into()),
-            ("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into()),
-            (
-                "GIT_CONFIG_VALUE_0".into(),
-                format!("Authorization: token {tok}"),
-            ),
-            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
-        ],
-        // GitHub git-over-HTTPS takes the token as Basic auth (any user name works).
-        ProviderKind::Github => vec![
-            ("GIT_CONFIG_COUNT".into(), "1".into()),
-            ("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into()),
-            (
-                "GIT_CONFIG_VALUE_0".into(),
-                format!(
-                    "Authorization: Basic {}",
-                    base64(&format!("x-access-token:{tok}"))
+    let git_env = if pc.protocol == Protocol::Ssh {
+        // The user's SSH keys/agent authenticate; never prompt.
+        ssh_env()
+    } else {
+        match pc.kind {
+            ProviderKind::Gitea | ProviderKind::Forgejo => vec![
+                ("GIT_CONFIG_COUNT".into(), "1".into()),
+                ("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into()),
+                (
+                    "GIT_CONFIG_VALUE_0".into(),
+                    format!("Authorization: token {tok}"),
                 ),
-            ),
-            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
-        ],
+                ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+            ],
+            // GitHub git-over-HTTPS takes the token as Basic auth (any user name works).
+            ProviderKind::Github => vec![
+                ("GIT_CONFIG_COUNT".into(), "1".into()),
+                ("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into()),
+                (
+                    "GIT_CONFIG_VALUE_0".into(),
+                    format!(
+                        "Authorization: Basic {}",
+                        base64(&format!("x-access-token:{tok}"))
+                    ),
+                ),
+                ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+            ],
+        }
     };
     Ok(Forge {
         api,
         login,
         token: tok,
         git_env,
+        protocol: pc.protocol,
     })
+}
+
+/// Git environment for SSH remotes: the user's keys/agent authenticate and nothing prompts.
+/// `BatchMode` is only forced when the user has no ssh command of their own.
+fn ssh_env() -> Vec<(String, String)> {
+    let mut env = vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
+    let custom = std::env::var_os("GIT_SSH_COMMAND").is_some()
+        || std::env::var_os("GIT_SSH").is_some()
+        || std::process::Command::new("git")
+            .args(["config", "--get", "core.sshCommand"])
+            .output()
+            .is_ok_and(|o| o.status.success() && !o.stdout.is_empty());
+    if !custom {
+        env.push(("GIT_SSH_COMMAND".into(), "ssh -o BatchMode=yes".into()));
+    }
+    env
 }
 
 /// The group's owner on `provider`, or `None` when that is the authenticated user itself
@@ -103,6 +126,7 @@ pub struct InitArgs {
     pub provider: String,
     pub kind: ProviderKind,
     pub url: Option<String>,
+    pub protocol: Protocol,
     pub group: String,
     pub config_repo: Option<String>,
 }
@@ -119,6 +143,7 @@ pub fn init(path: &Path, a: InitArgs, force: bool) -> Result<Config> {
         a.provider.clone(),
         ProviderCfg {
             kind: a.kind,
+            protocol: a.protocol,
             url: a.url,
         },
     );
@@ -179,7 +204,8 @@ pub fn new_repo(cfg: &Config, group_name: &str, name: &str, private: bool) -> Re
         "created {}/{} on {}",
         remote.owner, remote.name, route.primary
     );
-    let wt = init_bare_layout(&dir, &remote.clone_url)?;
+    let local_url = remote.git_url(primary.protocol)?.to_string();
+    let wt = init_bare_layout(&dir, &local_url)?;
     push_initial(&dir, &primary.git_env)?;
     println!("pushed initial commit; worktree {}", wt.display());
 
@@ -194,7 +220,7 @@ pub fn new_repo(cfg: &Config, group_name: &str, name: &str, private: bool) -> Re
         &Entry {
             group: grp.name.clone(),
             name: name.into(),
-            url: remote.clone_url,
+            url: local_url,
         },
     )?;
     Ok(wt)
@@ -256,6 +282,67 @@ fn select(repos: Vec<RemoteRepo>, owner: &str, private: Option<bool>) -> Vec<Rem
         .collect()
 }
 
+/// `host/owner/name` (lowercase) of a git remote URL in https, `ssh://` or scp-like form.
+fn remote_key(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
+    let (host, path) = match rest.split_once(['/', ':']) {
+        Some((h, p)) => (h, p),
+        None => return None,
+    };
+    // `host:2222/owner/repo` (ssh with a port): drop the port.
+    let path = match path.split_once('/') {
+        Some((port, p)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => p,
+        _ => path,
+    };
+    let path = path.trim_matches('/').trim_end_matches(".git");
+    let mut parts = path.rsplitn(2, '/');
+    let name = parts.next()?;
+    let owner = parts.next()?;
+    Some(format!("{host}/{owner}/{name}").to_lowercase())
+}
+
+/// What is already in a group directory: bare-layout repos by lowercase directory name and by
+/// the owner/name their `origin` points to.
+struct Local {
+    names: std::collections::HashSet<String>,
+    origins: std::collections::HashSet<String>,
+}
+
+impl Local {
+    fn scan(gdir: &Path) -> Local {
+        let mut l = Local {
+            names: Default::default(),
+            origins: Default::default(),
+        };
+        let Ok(rd) = fs::read_dir(gdir) else { return l };
+        for e in rd.filter_map(Result::ok) {
+            let bare = e.path().join(".bare");
+            if !bare.exists() {
+                continue;
+            }
+            l.names
+                .insert(e.file_name().to_string_lossy().to_lowercase());
+            if let Ok(Some(url)) = Git::new(&bare).probe(&["config", "--get", "remote.origin.url"])
+                && let Some(k) = remote_key(&url)
+            {
+                l.origins.insert(k);
+            }
+        }
+        l
+    }
+
+    /// Present when a repo of that name exists (case-insensitively: forge names are, and so are
+    /// many file systems) or an existing repo's origin is this very remote.
+    fn has(&self, r: &RemoteRepo) -> bool {
+        self.names.contains(&r.name.to_lowercase())
+            || [&r.clone_url, &r.ssh_url]
+                .iter()
+                .filter_map(|u| remote_key(u))
+                .any(|k| self.origins.contains(&k))
+    }
+}
+
 /// Lists the group's remote repos that are not on disk; clones the named ones.
 pub fn import(cfg: &Config, group_name: &str, wanted: &[String]) -> Result<()> {
     let grp = group(cfg, group_name)?;
@@ -268,14 +355,34 @@ pub fn import(cfg: &Config, group_name: &str, wanted: &[String]) -> Result<()> {
         None => vec![(grp.primary.clone(), None)],
     };
     let gdir = cfg.root_path().join(&grp.name);
+    // Both routes of a split group are queried at the same time.
+    let scanned: Vec<Result<(String, Forge, Vec<RemoteRepo>)>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = sides
+            .iter()
+            .map(|(pid, vis)| {
+                let grp = &grp;
+                sc.spawn(move || {
+                    let f = connect(cfg, pid)?;
+                    let owner = grp.owner(pid).unwrap_or(&f.login).to_string();
+                    let repos = select(f.api.list_owner_repos(&owner, &f.login)?, &owner, *vis);
+                    Ok((pid.clone(), f, repos))
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("provider scan panicked")))
+            })
+            .collect()
+    });
     let mut forges = Vec::new();
     let mut missing: Vec<(RemoteRepo, usize)> = Vec::new();
-    for (pid, vis) in sides {
-        let f = connect(cfg, &pid)?;
-        let owner = grp.owner(&pid).unwrap_or(&f.login).to_string();
-        for r in select(f.api.list_repos()?, &owner, vis) {
-            let here = gdir.join(&r.name).join(".bare").exists();
-            if !here && !missing.iter().any(|(m, _)| m.name == r.name) {
+    let local = Local::scan(&gdir);
+    for res in scanned {
+        let (pid, f, repos) = res?;
+        for r in repos {
+            if !local.has(&r) && !missing.iter().any(|(m, _)| m.name == r.name) {
                 missing.push((r, forges.len()));
             }
         }
@@ -295,22 +402,45 @@ pub fn import(cfg: &Config, group_name: &str, wanted: &[String]) -> Result<()> {
         println!("run `grove import {group_name} <name>...` to clone them");
         return Ok(());
     }
+    // One broken repo must not stop the others: collect failures and report them at the end.
+    let mut failed: Vec<String> = Vec::new();
     for w in wanted {
-        let (r, i) = missing
-            .iter()
-            .find(|(r, _)| &r.name == w)
-            .with_context(|| format!("{w:?} is not a remote repo missing locally"))?;
-        let dir = gdir.join(&r.name);
-        clone_bare_layout(&r.clone_url, &dir, &forges[*i].1.git_env)?;
-        println!("imported {} -> {}", r.name, dir.display());
-        register(
-            cfg,
-            &Entry {
-                group: grp.name.clone(),
-                name: r.name.clone(),
-                url: r.clone_url.clone(),
-            },
-        )?;
+        let Some((r, i)) = missing.iter().find(|(r, _)| &r.name == w) else {
+            println!("FAILED {w}: not a remote repo missing locally");
+            failed.push(w.clone());
+            continue;
+        };
+        let forge = &forges[*i].1;
+        let res = (|| -> Result<()> {
+            let url = r.git_url(forge.protocol)?.to_string();
+            let dir = gdir.join(&r.name);
+            if let Err(e) = clone_bare_layout(&url, &dir, &forge.git_env) {
+                // Leave no empty directory behind (it only goes away when nothing was cloned).
+                let _ = fs::remove_dir(&dir);
+                return Err(e.into());
+            }
+            println!("imported {} -> {}", r.name, dir.display());
+            register(
+                cfg,
+                &Entry {
+                    group: grp.name.clone(),
+                    name: r.name.clone(),
+                    url,
+                },
+            )
+        })();
+        if let Err(e) = res {
+            println!("FAILED {w}: {e:#}");
+            failed.push(w.clone());
+        }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "{} of {} imports failed: {}",
+            failed.len(),
+            wanted.len(),
+            failed.join(", ")
+        );
     }
     Ok(())
 }
@@ -338,7 +468,7 @@ pub(crate) fn config_repo_open(cfg: &Config, create: bool) -> Result<(PathBuf, F
             .into_iter()
             .find(|r| r.name == cr.name);
         let url = match exists {
-            Some(r) => r.clone_url,
+            Some(r) => r.git_url(forge.protocol)?.to_string(),
             None if create => {
                 let r = forge.api.create_repo(&NewRepo {
                     name: cr.name.clone(),
@@ -346,7 +476,7 @@ pub(crate) fn config_repo_open(cfg: &Config, create: bool) -> Result<(PathBuf, F
                     private: true,
                     description: "grove configuration (managed repos, machines)".into(),
                 })?;
-                r.clone_url
+                r.git_url(forge.protocol)?.to_string()
             }
             None => bail!(
                 "config repo {:?} does not exist on {}",
@@ -485,8 +615,49 @@ mod tests {
             name: name.into(),
             private,
             clone_url: format!("u/{name}.git"),
+            ssh_url: String::new(),
             default_branch: "main".into(),
         }
+    }
+
+    #[test]
+    fn remote_key_normalises_every_url_form() {
+        let want = Some("github.com/dasemu/synapse".to_string());
+        assert_eq!(remote_key("git@github.com:Dasemu/Synapse.git"), want);
+        assert_eq!(remote_key("https://github.com/Dasemu/Synapse.git"), want);
+        assert_eq!(remote_key("ssh://git@github.com/dasemu/synapse"), want);
+        assert_eq!(
+            remote_key("ssh://gitea@git.example.es:2222/dasemu/x.git").as_deref(),
+            Some("git.example.es/dasemu/x")
+        );
+        assert_eq!(remote_key("nonsense"), None);
+    }
+
+    #[test]
+    fn local_repos_match_by_name_or_origin_ignoring_case() {
+        let d = std::env::temp_dir().join(format!("grove-local-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        // `synapse` (lowercase dir) whose origin is Dasemu/Synapse; `other` with a renamed origin.
+        for (dir, origin) in [
+            ("synapse", "git@github.com:Dasemu/Synapse.git"),
+            ("renamed", "git@github.com:me/old-name.git"),
+        ] {
+            let bare = d.join(dir).join(".bare");
+            fs::create_dir_all(&bare).unwrap();
+            let g = Git::new(&bare);
+            g.run(&["init", "-q", "--bare"]).unwrap();
+            g.run(&["remote", "add", "origin", origin]).unwrap();
+        }
+        let l = Local::scan(&d);
+        let mut syn = r("Dasemu", "Synapse", false);
+        syn.clone_url = "https://github.com/Dasemu/Synapse.git".into();
+        assert!(l.has(&syn));
+        // Different directory name, same origin.
+        let mut moved = r("me", "new-name", false);
+        moved.ssh_url = "git@github.com:me/old-name.git".into();
+        assert!(l.has(&moved));
+        assert!(!l.has(&r("me", "absent", false)));
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -60,4 +60,24 @@ impl Http {
             .to_string();
         Err(Error::Api { status, message })
     }
+
+    /// Every item of a paginated list endpoint (`path` may already carry a query string).
+    pub fn pages(&self, path: &str, per_page: usize, size_param: &str) -> Result<Vec<Value>> {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let mut out = Vec::new();
+        for page in 1..=200 {
+            let v = self.ok(
+                "GET",
+                &format!("{path}{sep}{size_param}={per_page}&page={page}"),
+                None,
+            )?;
+            let items = v.as_array().cloned().unwrap_or_default();
+            let n = items.len();
+            out.extend(items);
+            if n < per_page {
+                break;
+            }
+        }
+        Ok(out)
+    }
 }

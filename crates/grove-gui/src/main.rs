@@ -126,6 +126,10 @@ struct UiState {
     filter: String,
     pending: Option<Vec<String>>,
     picks: Rc<VecModel<Pick>>,
+    /// Last successful scan per import group, for the session (names still to import).
+    import_cache: HashMap<String, Vec<String>>,
+    /// The group whose scan the list on screen belongs to.
+    import_current: String,
     toast_gen: u32,
     last_groups: Vec<String>,
     last_providers: Vec<String>,
@@ -142,6 +146,8 @@ thread_local! {
         filter: String::new(),
         pending: None,
         picks: Rc::new(VecModel::default()),
+        import_cache: HashMap::new(),
+        import_current: String::new(),
         toast_gen: 0,
         last_groups: Vec::new(),
         last_providers: Vec::new(),
@@ -499,41 +505,67 @@ fn out(ok: bool, text: String) -> Out {
     }
 }
 
-fn scan(ctx: &Ctx, ui: &MainWindow, group: String) {
-    ui.set_import_note("Scanning…".into());
+fn show_picks(ui: &MainWindow, names: Vec<String>, note: Option<String>) {
+    let empty = names.is_empty();
+    ST.with(|st| {
+        st.borrow().picks.set_vec(
+            names
+                .into_iter()
+                .map(|n| Pick {
+                    name: n.into(),
+                    checked: false,
+                })
+                .collect::<Vec<_>>(),
+        )
+    });
+    ui.set_import_scanned(true);
+    ui.set_import_note(match note {
+        Some(n) => n.into(),
+        None if empty => {
+            "Nothing to import: every remote repository is already on this machine.".into()
+        }
+        None => "".into(),
+    });
+}
+
+/// Lists the group's remote repos still to import. The scan runs on its own thread (never queued
+/// behind status polling) and its result is cached per group; `force` rescans.
+fn scan(ctx: &Ctx, ui: &MainWindow, group: String, force: bool, note: Option<String>) {
+    ST.with(|st| st.borrow_mut().import_current = group.clone());
     ui.set_import_out(out(true, String::new()));
+    if !force && let Some(names) = ST.with(|st| st.borrow().import_cache.get(&group).cloned()) {
+        show_picks(ui, names, note);
+        return;
+    }
+    ui.set_import_scanning(true);
+    ui.set_import_note("Scanning…".into());
     ST.with(|st| st.borrow().picks.set_vec(vec![]));
-    run_cli(
-        ctx,
-        ui,
-        None,
-        vec!["import".into(), group],
-        String::new(),
-        |ui, ok, text| {
-            ui.set_import_note("".into());
+    let (core, weak) = (ctx.core.clone(), ctx.weak.clone());
+    std::thread::spawn(move || {
+        let r = core.bridge.cli(&["import".to_string(), group.clone()], "");
+        let ok = r["ok"] == true;
+        let text = r["output"].as_str().unwrap_or("").to_string();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_import_scanning(false);
             if !ok {
+                ui.set_import_note("".into());
                 ui.set_import_out(out(false, text));
                 return;
             }
             let names = model::parse_import_listing(&text);
-            if names.is_empty() {
-                ui.set_import_note(
-                    "Nothing to import: every remote repository is already on this machine.".into(),
-                );
-            }
             ST.with(|st| {
-                st.borrow().picks.set_vec(
-                    names
-                        .into_iter()
-                        .map(|n| Pick {
-                            name: n.into(),
-                            checked: false,
-                        })
-                        .collect::<Vec<_>>(),
-                )
+                st.borrow_mut()
+                    .import_cache
+                    .insert(group.clone(), names.clone())
             });
-        },
-    );
+            if ST.with(|st| st.borrow().import_current == group) {
+                show_picks(&ui, names, note);
+            } else {
+                ui.set_import_note("".into());
+            }
+        });
+    });
 }
 
 fn first_or(v: &str, list: &ModelRc<SharedString>) -> String {
@@ -604,10 +636,10 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
 
     ui.on_scan_import({
         let c = ctx.clone();
-        move |group| {
+        move |group, force| {
             let Some(ui) = c.weak.upgrade() else { return };
             let group = model::group_name(&first_or(group.as_str(), &ui.get_groups())).to_string();
-            scan(&c, &ui, group);
+            scan(&c, &ui, group, force, None);
         }
     });
     ui.on_pick_toggled(|i, checked| {
@@ -639,10 +671,14 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
             args.extend(picked);
             let c2 = c.clone();
             run_cli(&c, &ui, None, args, String::new(), move |ui, ok, text| {
-                ui.set_import_out(out(ok, text));
-                if ok {
-                    scan(&c2, ui, group);
-                }
+                ui.set_import_out(out(ok, text.clone()));
+                // Rescan either way: what was cloned must leave the list.
+                let failed = model::parse_import_failures(&text);
+                let note = (!failed.is_empty()).then(|| {
+                    toast(ui, &format!("{} import(s) failed", failed.len()), true);
+                    format!("Failed to import: {}", failed.join(", "))
+                });
+                scan(&c2, ui, group, true, note);
             });
         }
     });
@@ -790,7 +826,7 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
 
     ui.on_onboard({
         let c = ctx.clone();
-        move |machine, root, kind, provider, url, group, crepo, token| {
+        move |machine, root, kind, protocol, provider, url, group, crepo, token| {
             let Some(ui) = c.weak.upgrade() else { return };
             let mut init: Vec<String> = [
                 "init",
@@ -802,6 +838,8 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
                 &provider,
                 "--kind",
                 &kind,
+                "--protocol",
+                &protocol,
                 "--group",
                 &group,
                 "--config-repo",

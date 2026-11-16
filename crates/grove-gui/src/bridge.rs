@@ -97,6 +97,7 @@ fn flag_spec(sub: &str) -> (&'static [&'static str], &'static [&'static str]) {
                 "--root",
                 "--provider",
                 "--kind",
+                "--protocol",
                 "--group",
                 "--config-repo",
                 "--url",

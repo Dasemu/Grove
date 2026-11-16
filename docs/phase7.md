@@ -87,3 +87,29 @@ Hidden CPU against a busy daemon (8 repos, 5 s fetch interval, ~4 events/s): abo
 - Side-by-side compare for `Diverged` stays in the CLI (`grove resolve --compare`).
 - Only the layout and read-only views were checked visually; forms and CLI-driven flows were not
   clicked through (no input injection available), only their parsing and logic are unit-tested.
+
+## Import speed, git protocol, import robustness
+
+- `Provider::list_owner_repos(owner, login)` lists only the owner's repos: Gitea `/orgs/{org}/repos`
+  or `/user/repos` (filtered by owner) for the login; GitHub `/orgs/{org}/repos?type=all` or
+  `/user/repos?affiliation=owner`. A 404 on the org endpoint falls back to `/users/{owner}/repos`.
+  The two sides of a split group are scanned in parallel threads. `grove import Darío` on the
+  owner's real forges: 3.5 s -> 1.3 s.
+- The GUI scan runs on its own thread (not the status worker), is cached per group for the session,
+  and has a Rescan button. Switching groups shows the cached list; an import drops the cache.
+- "Already on this machine" is case-insensitive by directory name, or when an existing bare repo's
+  `origin` points to the same host/owner/name (https, `ssh://` and scp-like forms).
+- A failing clone no longer aborts a multi-repo import: the others continue, failures are printed
+  as `FAILED <name>: <reason>`, the exit status is non-zero and the GUI lists the failed names.
+- Per-provider `protocol = "https" | "ssh"` (default `https`; also `grove init --protocol` and the
+  onboarding form). With `ssh`, `new`/`import`/`bootstrap` clone from the forge's `ssh_url`, registry
+  entries store that URL, and git gets no token header (only `GIT_TERMINAL_PROMPT=0`, plus
+  `GIT_SSH_COMMAND="ssh -o BatchMode=yes"` unless the user has their own ssh command). Mirrors stay
+  HTTPS with tokens (forge to forge). The Settings summary shows the protocol of each provider.
+
+```toml
+[providers.gitea]
+kind = "gitea"
+url = "https://git.example.com"
+protocol = "ssh"   # optional, default "https"
+```

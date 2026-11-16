@@ -29,6 +29,7 @@ fn repo(v: &Value) -> RemoteRepo {
         name: v["name"].as_str().unwrap_or_default().to_string(),
         private: v["private"].as_bool().unwrap_or(false),
         clone_url: v["clone_url"].as_str().unwrap_or_default().to_string(),
+        ssh_url: v["ssh_url"].as_str().unwrap_or_default().to_string(),
         default_branch: v["default_branch"].as_str().unwrap_or("main").to_string(),
     }
 }
@@ -74,21 +75,33 @@ impl Provider for GitHub {
     }
 
     fn list_repos(&self) -> Result<Vec<RemoteRepo>> {
-        let mut out = Vec::new();
-        for page in 1..=200 {
-            let v = self.http.ok(
-                "GET",
-                &format!("/user/repos?per_page=100&page={page}"),
-                None,
-            )?;
-            let items = v.as_array().cloned().unwrap_or_default();
-            let n = items.len();
-            out.extend(items.iter().map(repo));
-            if n < 100 {
-                break;
-            }
-        }
-        Ok(out)
+        Ok(self
+            .http
+            .pages("/user/repos", 100, "per_page")?
+            .iter()
+            .map(repo)
+            .collect())
+    }
+
+    fn list_owner_repos(&self, owner: &str, login: &str) -> Result<Vec<RemoteRepo>> {
+        let path = if owner.eq_ignore_ascii_case(login) {
+            "/user/repos?affiliation=owner".to_string()
+        } else {
+            format!("/orgs/{owner}/repos?type=all")
+        };
+        let items = match self.http.pages(&path, 100, "per_page") {
+            Ok(v) => v,
+            // Not an organisation: another user's public repos.
+            Err(Error::Api { status: 404, .. }) if !owner.eq_ignore_ascii_case(login) => self
+                .http
+                .pages(&format!("/users/{owner}/repos"), 100, "per_page")?,
+            Err(e) => return Err(e),
+        };
+        Ok(items
+            .iter()
+            .map(repo)
+            .filter(|r| r.owner.eq_ignore_ascii_case(owner))
+            .collect())
     }
 
     fn create_repo(&self, new: &NewRepo) -> Result<RemoteRepo> {

@@ -196,6 +196,15 @@ pub fn parse_import_listing(output: &str) -> Vec<String> {
     names
 }
 
+/// Repository names of the `FAILED <name>: <reason>` lines `grove import` prints per failed clone.
+pub fn parse_import_failures(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|l| l.strip_prefix("FAILED "))
+        .filter_map(|l| l.split_once(':').map(|(n, _)| n.trim().to_string()))
+        .collect()
+}
+
 fn names(v: Option<&Value>) -> Vec<String> {
     v.and_then(Value::as_array)
         .map(|a| {
@@ -288,7 +297,12 @@ pub fn settings_sections(cfg: &Value) -> Vec<Section> {
                     } else {
                         format!(" · {url}")
                     };
-                    (id.clone(), format!("{}{url}", str_of(p, "kind")))
+                    // `protocol` is how git talks to the forge; https when the key is absent.
+                    let proto = match str_of(p, "protocol") {
+                        "" => "https",
+                        p => p,
+                    };
+                    (id.clone(), format!("{} · {proto}{url}", str_of(p, "kind")))
                 })
                 .collect()
         })
@@ -406,6 +420,13 @@ mod tests {
     }
 
     #[test]
+    fn failed_imports_are_listed() {
+        let out = "imported a -> /x/a\nFAILED b: git clone failed: boom\nFAILED c: nope";
+        assert_eq!(parse_import_failures(out), ["b", "c"]);
+        assert!(parse_import_failures("imported a").is_empty());
+    }
+
+    #[test]
     fn outputs_are_dropped_when_the_state_changes() {
         let rec = |t: &str| OutRec {
             ok: true,
@@ -453,7 +474,7 @@ mod tests {
     fn settings_show_public_route_and_owners() {
         let cfg = json!({
             "machine": {"name": "pca"}, "root": {"path": "/w"},
-            "providers": {"gitea": {"kind": "gitea", "url": "https://g.example"}, "gh": {"kind": "github"}},
+            "providers": {"gitea": {"kind": "gitea", "protocol": "ssh", "url": "https://g.example"}, "gh": {"kind": "github"}},
             "groups": [{"name": "work", "primary": "gitea", "mirror_to": ["gh"],
                         "owners": {"gitea": "Org", "gh": "org-gh"},
                         "snapshots": "none",
@@ -468,8 +489,8 @@ mod tests {
             ("Snapshots (default)".into(), "private-only".into())
         );
         // Providers come out sorted by id.
-        assert_eq!(s[1].1[0].1, "github");
-        assert_eq!(s[1].1[1].1, "gitea · https://g.example");
+        assert_eq!(s[1].1[0].1, "github · https");
+        assert_eq!(s[1].1[1].1, "gitea · ssh · https://g.example");
         assert_eq!(
             s[2].1[0].1,
             "primary gitea · mirrors: gh · public: gh → gitea · snapshots: none · owners: gh=org-gh, gitea=Org · bare-worktrees"

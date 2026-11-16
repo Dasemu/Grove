@@ -187,6 +187,8 @@ export component MainWindow inherits Window {
     in property <[Section]> sections;
     in property <[Pick]> picks;
     in property <string> import-note;
+    in property <bool> import-scanning;
+    in property <bool> import-scanned;
     in property <bool> busy;
     in-out property <bool> onboarding-active: false;
     in property <bool> autostart;
@@ -208,7 +210,7 @@ export component MainWindow inherits Window {
     callback toggle-pause();
     callback filter-changed(string);
     callback create-repo(string, string, bool);
-    callback scan-import(string);
+    callback scan-import(string, bool);
     callback import-selected(string);
     callback pick-toggled(int, bool);
     callback resolve(string, string, string);
@@ -216,7 +218,7 @@ export component MainWindow inherits Window {
     callback confirm-cancel();
     callback run-settings(string);
     callback login(string, string);
-    callback onboard(string, string, string, string, string, string, string, string);
+    callback onboard(string, string, string, string, string, string, string, string, string);
     callback view-changed(string);
     callback branch-edited(string, string);
     callback set-autostart(bool);
@@ -794,13 +796,16 @@ export component MainWindow inherits Window {
                                 imp-group := ComboBox {
                                     model: root.groups;
                                     width: 260px;
+                                    selected(g) => {
+                                        root.scan-import(g, false);
+                                    }
                                 }
 
                                 Button {
-                                    text: "Scan remote";
-                                    enabled: !root.busy;
+                                    text: root.import-scanning ? "Scanning…" : (root.import-scanned ? "Rescan" : "Scan remote");
+                                    enabled: !root.import-scanning;
                                     clicked => {
-                                        root.scan-import(imp-group.current-value);
+                                        root.scan-import(imp-group.current-value, true);
                                     }
                                 }
                             }
@@ -1016,6 +1021,14 @@ export component MainWindow inherits Window {
                             }
 
                             Muted {
+                                text: "Git transport (ssh uses your SSH keys; https uses the API token)";
+                            }
+
+                            ob-protocol := ComboBox {
+                                model: ["https", "ssh"];
+                            }
+
+                            Muted {
                                 text: "Provider id";
                             }
 
@@ -1063,7 +1076,7 @@ export component MainWindow inherits Window {
                                     primary: true;
                                     enabled: !root.busy && ob-token.text != "";
                                     clicked => {
-                                        root.onboard(ob-machine.text, ob-root.text, ob-kind.current-value, ob-provider.text, ob-url.text, ob-group.text, ob-crepo.text, ob-token.text);
+                                        root.onboard(ob-machine.text, ob-root.text, ob-kind.current-value, ob-protocol.current-value, ob-provider.text, ob-url.text, ob-group.text, ob-crepo.text, ob-token.text);
                                         ob-token.text = "";
                                     }
                                 }
