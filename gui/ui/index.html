@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grove</title>
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand"><img src="logo.svg" alt="" width="26" height="26"><span>Grove</span></div>
+    <nav id="nav">
+      <a href="#/repos" data-route="repos">Repositories</a>
+      <a href="#/activity" data-route="activity">Activity</a>
+      <a href="#/new" data-route="new">New repository</a>
+      <a href="#/import" data-route="import">Import</a>
+      <a href="#/settings" data-route="settings">Settings</a>
+    </nav>
+    <div class="machine" id="machine"></div>
+  </aside>
+  <div class="main">
+    <header class="top">
+      <div id="pill" class="pill pill-muted"><span class="dot"></span><span id="pill-text">Connecting…</span></div>
+      <div class="spacer"></div>
+      <button id="btn-sync" class="btn">Sync now</button>
+      <button id="btn-pause" class="btn btn-primary">Pause sync</button>
+    </header>
+    <main id="view" class="view" aria-live="polite"></main>
+  </div>
+</div>
+<div id="toasts" class="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>
