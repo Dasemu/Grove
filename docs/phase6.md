@@ -89,6 +89,20 @@ a clone moved to the trash) triggers a debounced (500 ms) rediscovery and diff:
   while a pass runs is dropped the same way.
 - The "not migrated" list is refreshed.
 
+A repo is only picked up when it is **ready**: `.bare/HEAD` exists, there is no `.grove-busy` and no
+`.grove-stage`. `grove add`, clone/import and init hold `<repo>/.grove-busy` (pid + start time) from
+before their first change until their very last step, also on rollback, so the daemon never
+fetches, materializes or snapshots a half-built layout (e.g. a `--no-checkout` worktree whose files
+are still in `.grove-stage`). Creating or removing `.grove-busy` / `.grove-stage` triggers a
+rediscovery, so the repo is picked up as soon as the marker goes. A marker whose process is gone
+(or a leftover `.grove-stage`) means an interrupted operation: the repo stays unmanaged, the daemon
+logs one `repo_stalled` warning to check it and restore from the backups, and never deletes the
+marker. `pass` re-checks readiness and skips unready repos. Clones are not built in a temp dir and
+renamed, because worktree link files hold absolute paths.
+
+Managed repos are watched recursively, including `node_modules` / `target`; notify cannot exclude
+subtrees, so raise `fs.inotify.max_user_watches` on machines with many large repos.
+
 As a safety net every full pass (every `fetch_interval_s`) re-runs discovery too, so missed
 inotify events delay detection by at most that interval. `grove daemon status` reflects the new set
 right after rediscovery, also while paused (discovery runs while paused, syncing does not).

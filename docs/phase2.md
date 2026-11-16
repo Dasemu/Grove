@@ -59,7 +59,7 @@ socket is refused; a stale socket file left by a crash is replaced.
 
 JSON lines in `<state dir>/activity.jsonl` (rotated at 5 MiB to `.jsonl.1`), the last 500 events in
 memory, and live via `subscribe`. Kinds: `start`, `stop`, `snapshot`, `fast_forward`, `applied`,
-`declined`, `snapshots_withheld`, `snapshots_enabled`, `snapshots_purged`, `state` (worktree state changed), `materialized`, `archived`, `repo_added`, `repo_removed`, `error`, `watch_error`,
+`declined`, `snapshots_withheld`, `snapshots_enabled`, `snapshots_purged`, `state` (worktree state changed), `materialized`, `archived`, `repo_added`, `repo_removed`, `repo_stalled`, `error`, `watch_error`,
 `pause`, `resume`.
 
 ## CLI
