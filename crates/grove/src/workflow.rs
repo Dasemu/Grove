@@ -385,6 +385,50 @@ impl Local {
     }
 }
 
+/// The writable source of `r` when `r` is a read-only pull mirror: the source's forge (which
+/// must be a configured provider) and its repo. `Ok(None)` when `r` is no mirror.
+fn mirror_source(cfg: &Config, r: &RemoteRepo) -> Result<Option<(Forge, RemoteRepo)>> {
+    let Some(src) = &r.mirror_of else {
+        return Ok(None);
+    };
+    let (pid, _) = provider_for_url(cfg, src).with_context(|| {
+        format!(
+            "{}/{} is a read-only mirror of {src:?}, which is on no configured provider",
+            r.owner, r.name
+        )
+    })?;
+    let (owner, name) = url::owner_and_name(src)
+        .with_context(|| format!("cannot read owner/name from mirror source {src:?}"))?;
+    let f = connect(cfg, pid)?;
+    let sr = f.api.get_repo(&owner, &name)?;
+    Ok(Some((f, sr)))
+}
+
+/// Points `origin` of the repo at `path` to the writable source when it is a read-only pull
+/// mirror on a configured provider (pushes to a mirror are refused), then fetches it. Returns
+/// the new URL, or `None` when origin is no mirror or on no configured provider.
+pub fn repoint_mirror_origin(cfg: &Config, path: &Path) -> Result<Option<String>> {
+    let g = Git::new(path);
+    let Some(origin) = g.probe(&["config", "--get", "remote.origin.url"])? else {
+        return Ok(None);
+    };
+    let Some((pid, _)) = provider_for_url(cfg, &origin) else {
+        return Ok(None);
+    };
+    let (owner, name) = url::owner_and_name(&origin)
+        .with_context(|| format!("cannot read owner/name from origin {origin:?}"))?;
+    let here = connect(cfg, pid)?;
+    let Some((src, sr)) = mirror_source(cfg, &here.api.get_repo(&owner, &name)?)? else {
+        return Ok(None);
+    };
+    let target = src.clone_url(&sr)?;
+    g.run(&["remote", "set-url", "origin", &target])?;
+    with_env(Git::new(path), &src.git_env)
+        .run(&["fetch", "-q", "origin"])
+        .with_context(|| format!("origin repointed to {target}, but fetching it failed"))?;
+    Ok(Some(target))
+}
+
 /// Lists the group's remote repos that are not on disk; clones the named ones.
 pub fn import(cfg: &Config, group_name: &str, wanted: &[String]) -> Result<()> {
     let grp = group(cfg, group_name)?;
@@ -477,16 +521,39 @@ pub fn import(cfg: &Config, group_name: &str, wanted: &[String]) -> Result<()> {
         };
         let forge = &forges[*i].1;
         let res = (|| -> Result<()> {
+            // A read-only pull mirror is cloned from its writable source instead, under the
+            // mirror's name (the one listed, matched against what is on disk and registered).
+            let source;
+            let (forge, r) = match mirror_source(cfg, r)? {
+                Some(s) => {
+                    source = s;
+                    if source.1.private != r.private {
+                        bail!(
+                            "{}/{} is a mirror of {}/{}, whose visibility differs; import the source by hand",
+                            r.owner,
+                            r.name,
+                            source.1.owner,
+                            source.1.name
+                        );
+                    }
+                    println!(
+                        "{w}: {}/{} is a read-only mirror; cloning its source {}/{}",
+                        r.owner, r.name, source.1.owner, source.1.name
+                    );
+                    (&source.0, &source.1)
+                }
+                None => (forge, r),
+            };
             let url = forge.clone_url(r)?;
-            let dir = gdir.join(&r.name);
+            let dir = gdir.join(w);
             // Refuses a non-empty directory and cleans up after itself on failure.
             clone_bare_layout(&url, &dir, &forge.git_env)?;
-            println!("imported {} -> {}", r.name, dir.display());
+            println!("imported {w} -> {}", dir.display());
             register(
                 cfg,
                 &Entry {
                     group: grp.name.clone(),
-                    name: r.name.clone(),
+                    name: w.clone(),
                     url: forge.registry_url(r)?,
                 },
             )
@@ -745,6 +812,7 @@ mod tests {
             clone_url: format!("u/{name}.git"),
             ssh_url: String::new(),
             default_branch: "main".into(),
+            mirror_of: None,
         }
     }
 
@@ -817,6 +885,16 @@ mod tests {
         );
         assert_eq!(id("git@github.com:Dasemu/Synapse.git"), Some("gh"));
         assert_eq!(id("https://evil.example/dasemu/x.git"), None);
+    }
+
+    #[test]
+    fn a_mirror_of_an_unconfigured_host_is_refused_and_a_plain_repo_is_no_mirror() {
+        let cfg = two_provider_cfg();
+        assert!(mirror_source(&cfg, &r("me", "x", false)).unwrap().is_none());
+        let mut m = r("me", "x", false);
+        m.mirror_of = Some("https://evil.example/me/x.git".into());
+        let e = mirror_source(&cfg, &m).err().unwrap().to_string();
+        assert!(e.contains("read-only mirror"), "{e}");
     }
 
     #[test]

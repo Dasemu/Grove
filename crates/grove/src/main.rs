@@ -316,6 +316,11 @@ fn main() -> Result<()> {
                 .context("cannot determine backup dir (set --backup-dir)")?;
             let r = migrate(path, &cfg.machine.name, &dir, &stamp())?;
             println!("migrated: {}", r.worktree.display());
+            match workflow::repoint_mirror_origin(&cfg, &r.worktree) {
+                Ok(Some(u)) => println!("origin was a read-only mirror; now {u}"),
+                Ok(None) => {}
+                Err(e) => println!("warning: read-only mirror check of origin: {e:#}"),
+            }
             println!(
                 "backup:   {} (ref {})",
                 r.backup_tar.display(),
