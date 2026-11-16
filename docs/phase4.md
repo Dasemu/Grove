@@ -10,6 +10,7 @@ Service via `keyring` (service `grove`, user = provider id). Tokens are never wr
 file. `grove login <id>` reads the token from stdin (never argv), checks it against the forge and
 stores it. HTTPS git operations of the wizards authenticate through `http.extraHeader` set in the
 process environment only (Gitea/Forgejo); for GitHub they use the user's credential helper.
+Since phase 6 the `tea`/`gh` logins are used when grove has no token of its own (`phase6.md`).
 
 ## Commands
 
@@ -33,7 +34,8 @@ clone lives in `<state dir>/config-repo`. It is created on the first registratio
 Gitea/Forgejo: the primary creates a push mirror via `POST /repos/{o}/{r}/push_mirrors`
 (`sync_on_commit`, 8 h interval) to a repo created on the mirror provider. GitHub has no push
 mirrors: `configure_mirror` reports `Unsupported` and `new` warns. The daemon-side fallback (push
-branches and tags only, never `refs/sync/*`) is **not implemented**.
+branches and tags only, never `refs/sync/*`) is **not implemented**. Phase 6 adds a pull mirror on
+the Gitea side for GitHub primaries (`phase6.md`).
 
 ## Validation
 

@@ -18,7 +18,7 @@ Do not start new work before the previous results are written to `docs/`.
 - Throwaway e2e on a local Forgejo: `spikes/phase4-e2e.sh`
 
 ## Architecture
-See `docs/` (`phase0-spike.md` ... `phase5.md`, `DECISIONS.md`). Git is the storage layer; shell out to
+See `docs/` (`phase0-spike.md` ... `phase6.md`, `DECISIONS.md`). Git is the storage layer; shell out to
 system `git`; snapshots use a temp `GIT_INDEX_FILE` + `commit-tree`, never touching the
 user's branch or index.
 
