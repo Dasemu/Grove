@@ -68,14 +68,40 @@ fn world(tag: &str, machines: &[&str]) -> World {
     for m in machines {
         let dir = base.join(m);
         fs::create_dir_all(&dir).unwrap();
-        git(&dir, &["clone", "-q", remote.to_str().unwrap(), "repo"]);
+        bare_layout(&dir.join("g/repo"), &remote);
     }
     World { base, remote }
 }
 
+/// A bare + worktrees repo (`.bare`, worktree `main`) cloned from `remote`, as `grove add` leaves it.
+fn bare_layout(repo: &Path, remote: &Path) {
+    fs::create_dir_all(repo).unwrap();
+    git(
+        repo,
+        &["clone", "-q", "--bare", remote.to_str().unwrap(), ".bare"],
+    );
+    let bare = repo.join(".bare");
+    git(
+        &bare,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    git(&bare, &["fetch", "-q", "origin"]);
+    git(&bare, &["worktree", "add", "-q", "../main", "main"]);
+    git(
+        &repo.join("main"),
+        &["branch", "-q", "--set-upstream-to=origin/main", "main"],
+    );
+}
+
+const GROUP: &str = "[providers.p]\nkind = \"gitea\"\nurl = \"https://git.example.invalid\"\n[[groups]]\nname = \"g\"\nprimary = \"p\"\n";
+
 fn config(w: &World, machine: &str, debounce_ms: u64, fetch_s: u64) -> Config {
     Config::parse(&format!(
-        "[machine]\nname = \"{machine}\"\n[root]\npath = \"{}\"\n[sync]\nsnapshot_debounce_ms = {debounce_ms}\nfetch_interval_s = {fetch_s}\n",
+        "[machine]\nname = \"{machine}\"\n[root]\npath = \"{}\"\n{GROUP}[sync]\nsnapshots = \"all\"\nsnapshot_debounce_ms = {debounce_ms}\nfetch_interval_s = {fetch_s}\n",
         w.base.join(machine).display()
     ))
     .unwrap()
@@ -86,6 +112,7 @@ fn settings(w: &World, machine: &str) -> Settings {
         socket: w.base.join(format!("{machine}.sock")),
         activity_log: Some(w.base.join(format!("{machine}.jsonl"))),
         remote: "origin".into(),
+        visibility_cache: None,
     }
 }
 
@@ -98,20 +125,20 @@ fn edit_on_a_shows_up_on_b() {
     let w = world("converge", &["pca", "pcb"]);
     let a = start(&w, "pca");
     let b = start(&w, "pcb");
-    let file_a = w.base.join("pca/repo/new.txt");
+    let file_a = w.base.join("pca/g/repo/main/new.txt");
     fs::write(&file_a, "hello\n").unwrap();
-    fs::write(w.base.join("pca/repo/a.txt"), "one\nedited\n").unwrap();
-    let on_b = w.base.join("pcb/repo/new.txt");
+    fs::write(w.base.join("pca/g/repo/main/a.txt"), "one\nedited\n").unwrap();
+    let on_b = w.base.join("pcb/g/repo/main/new.txt");
     wait_until("new.txt on B", 30, || {
         fs::read_to_string(&on_b).is_ok_and(|s| s == "hello\n")
     });
     assert_eq!(
-        fs::read_to_string(w.base.join("pcb/repo/a.txt")).unwrap(),
+        fs::read_to_string(w.base.join("pcb/g/repo/main/a.txt")).unwrap(),
         "one\nedited\n"
     );
     // The user's branch on A was never touched by the daemon.
     assert_eq!(
-        git(&w.base.join("pca/repo"), &["log", "--oneline"])
+        git(&w.base.join("pca/g/repo/main"), &["log", "--oneline"])
             .lines()
             .count(),
         1
@@ -125,12 +152,12 @@ fn committed_work_fast_forwards_the_other_machine() {
     let w = world("ff", &["pca", "pcb"]);
     let a = start(&w, "pca");
     let b = start(&w, "pcb");
-    let ra = w.base.join("pca/repo");
+    let ra = w.base.join("pca/g/repo/main");
     fs::write(ra.join("c.txt"), "committed\n").unwrap();
     git(&ra, &["add", "-A"]);
     git(&ra, &["commit", "-qm", "c"]);
     git(&ra, &["push", "-q", "origin", "main"]);
-    let rb = w.base.join("pcb/repo");
+    let rb = w.base.join("pcb/g/repo/main");
     wait_until("B fast-forwarded", 30, || rb.join("c.txt").exists());
     wait_until("B synced", 30, || {
         git(&rb, &["status", "--porcelain"]).is_empty()
@@ -156,7 +183,7 @@ fn ipc_status_pause_resume_log_and_subscribe() {
     let unknown = ipc::request(&sock, &json!({"v":1,"cmd":"nope"})).unwrap();
     assert_eq!(unknown["ok"], false);
 
-    let repo = w.base.join("pca/repo");
+    let repo = w.base.join("pca/g/repo/main");
     wait_until("status lists the repo", 10, || {
         let s = ipc::request(&sock, &json!({"v":1,"cmd":"status"})).unwrap();
         s["data"]["repos"].as_array().is_some_and(|r| r.len() == 1)
@@ -234,12 +261,12 @@ fn second_daemon_on_same_socket_is_refused_and_stale_socket_is_reused() {
 #[test]
 fn killing_the_daemon_loses_nothing_and_a_restart_recovers() {
     let w = world("crash", &["pca"]);
-    let repo = w.base.join("pca/repo");
+    let repo = w.base.join("pca/g/repo/main");
     let cfg_path = w.base.join("config.toml");
     fs::write(
         &cfg_path,
         format!(
-            "[machine]\nname = \"pca\"\n[root]\npath = \"{}\"\n[sync]\nsnapshot_debounce_ms = 50\nfetch_interval_s = 1\n",
+            "[machine]\nname = \"pca\"\n[root]\npath = \"{}\"\n{GROUP}[sync]\nsnapshots = \"all\"\nsnapshot_debounce_ms = 50\nfetch_interval_s = 1\n",
             w.base.join("pca").display()
         ),
     )
@@ -269,7 +296,7 @@ fn killing_the_daemon_loses_nothing_and_a_restart_recovers() {
         "precious\n"
     );
     assert!(
-        !repo.join(".git/index.lock").exists(),
+        !repo.join("../.bare/worktrees/main/index.lock").exists(),
         "stale index.lock after kill"
     );
     git(&repo, &["fsck", "--no-dangling"]);
@@ -292,8 +319,8 @@ fn work_in_progress_then_committed_on_a_leaves_b_clean() {
     let w = world("wipcommit", &["pca", "pcb"]);
     let a = start(&w, "pca");
     let b = start(&w, "pcb");
-    let ra = w.base.join("pca/repo");
-    let rb = w.base.join("pcb/repo");
+    let ra = w.base.join("pca/g/repo/main");
+    let rb = w.base.join("pcb/g/repo/main");
     fs::write(ra.join("w.txt"), "wip\n").unwrap();
     wait_until("WIP on B", 30, || rb.join("w.txt").exists());
     git(&ra, &["add", "-A"]);
@@ -322,7 +349,7 @@ fn paused_daemon_does_not_spin() {
     fs::write(
         &cfg_path,
         format!(
-            "[machine]\nname = \"pca\"\n[root]\npath = \"{}\"\n[sync]\nsnapshot_debounce_ms = 50\nfetch_interval_s = 1\n",
+            "[machine]\nname = \"pca\"\n[root]\npath = \"{}\"\n{GROUP}[sync]\nsnapshots = \"all\"\nsnapshot_debounce_ms = 50\nfetch_interval_s = 1\n",
             w.base.join("pca").display()
         ),
     )
@@ -356,7 +383,7 @@ fn sync_accepts_a_non_canonical_repo_path_and_unknown_repos_are_rejected() {
     let st = settings(&w, "pca");
     let sock = st.socket.clone();
     let d = Daemon::start(config(&w, "pca", 200, 60), st).unwrap();
-    let repo = w.base.join("pca/repo");
+    let repo = w.base.join("pca/g/repo");
     wait_until("repo listed", 10, || {
         ipc::request(&sock, &json!({"v":1,"cmd":"status"})).unwrap()["data"]["repos"]
             .as_array()
@@ -368,4 +395,135 @@ fn sync_accepts_a_non_canonical_repo_path_and_unknown_repos_are_rejected() {
     let bad = ipc::request(&sock, &json!({"v":1,"cmd":"sync","repo":"/nonexistent"})).unwrap();
     assert_eq!(bad["ok"], false);
     d.shutdown();
+}
+
+fn status(sock: &Path) -> serde_json::Value {
+    ipc::request(sock, &json!({"v":1,"cmd":"status"})).unwrap()["data"].clone()
+}
+
+#[test]
+fn plain_clones_and_non_group_dirs_are_ignored_and_reported() {
+    let w = world("scope", &["pca"]);
+    let root = w.base.join("pca");
+    // A plain clone in the group, and a bare-layout repo in a directory that is no group.
+    git(
+        &root.join("g"),
+        &["clone", "-q", w.remote.to_str().unwrap(), "plain"],
+    );
+    bare_layout(&root.join("nogroup/repo"), &w.remote);
+    // Local work in the plain clone and the non-group repo must stay untouched and unsnapshotted.
+    fs::write(root.join("g/plain/wip.txt"), "x\n").unwrap();
+    fs::write(root.join("nogroup/repo/main/wip.txt"), "x\n").unwrap();
+    let st = settings(&w, "pca");
+    let sock = st.socket.clone();
+    let d = Daemon::start(config(&w, "pca", 100, 1), st).unwrap();
+    wait_until("managed repo listed", 10, || {
+        status(&sock)["repos"]
+            .as_array()
+            .is_some_and(|r| r.len() == 1)
+    });
+    wait_until("plain clone reported", 10, || {
+        status(&sock)["not_migrated"] == json!([root.join("g/plain").display().to_string()])
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    let s = status(&sock);
+    assert_eq!(
+        s["repos"][0]["path"],
+        root.join("g/repo").display().to_string()
+    );
+    assert!(git(&root.join("g/plain"), &["for-each-ref", "refs/sync/"]).is_empty());
+    assert!(
+        git(
+            &root.join("nogroup/repo/main"),
+            &["for-each-ref", "refs/sync/"]
+        )
+        .is_empty()
+    );
+    assert!(git(&w.remote, &["for-each-ref", "refs/sync/"]).is_empty());
+    d.shutdown();
+}
+
+#[test]
+fn private_only_withholds_snapshots_when_visibility_is_unknown() {
+    let w = world("private", &["pca"]);
+    // The provider host does not resolve and the origin is a local path: visibility is unknown.
+    let text = format!(
+        "[machine]\nname = \"pca\"\n[root]\npath = \"{}\"\n{GROUP}[sync]\nsnapshot_debounce_ms = 100\nfetch_interval_s = 1\n",
+        w.base.join("pca").display()
+    );
+    let cfg = Config::parse(&text).unwrap();
+    assert_eq!(
+        cfg.sync.snapshots,
+        grove_core::config::SnapshotPolicy::PrivateOnly
+    );
+    let st = settings(&w, "pca");
+    let sock = st.socket.clone();
+    let d = Daemon::start(cfg, st).unwrap();
+    let repo = w.base.join("pca/g/repo/main");
+    fs::write(repo.join("secret.txt"), "wip\n").unwrap();
+    wait_until("withheld reported", 15, || {
+        status(&sock)["repos"][0]["snapshots_withheld"]
+            .as_str()
+            .is_some_and(|m| m.contains("treated as public"))
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(git(&repo, &["for-each-ref", "refs/sync/"]).is_empty());
+    assert!(git(&w.remote, &["for-each-ref", "refs/sync/"]).is_empty());
+    let log = ipc::request(&sock, &json!({"v":1,"cmd":"log","limit":100})).unwrap();
+    assert!(log["data"].to_string().contains("snapshots_withheld"));
+    d.shutdown();
+}
+
+#[test]
+fn auto_materialize_is_decided_per_group() {
+    let w = world("nomat", &["pca"]);
+    let text = format!(
+        "[machine]\nname = \"pca\"\n[root]\npath = \"{}\"\n[providers.p]\nkind = \"gitea\"\n[[groups]]\nname = \"g\"\nprimary = \"p\"\n[[groups]]\nname = \"h\"\nprimary = \"p\"\nauto_materialize = false\n[sync]\nsnapshots = \"all\"\nfetch_interval_s = 1\n",
+        w.base.join("pca").display()
+    );
+    let seed = w.base.join("seed");
+    git(&seed, &["checkout", "-q", "-b", "feat/new"]);
+    git(&seed, &["push", "-q", "origin", "feat/new"]);
+    let st = settings(&w, "pca");
+    let d = Daemon::start(Config::parse(&text).unwrap(), st).unwrap();
+    let bare = w.base.join("pca/g/repo/.bare");
+    // Another group turns materializing off; this repo's group keeps the default.
+    wait_until("worktree for the new branch", 15, || {
+        git(&bare, &["branch", "-r"]).contains("origin/feat/new")
+            && w.base.join("pca/g/repo/feat-new").exists()
+    });
+    d.shutdown();
+}
+
+#[test]
+fn snapshots_already_pushed_are_deleted_when_they_become_withheld() {
+    let w = world("purge", &["pca"]);
+    let repo = w.base.join("pca/g/repo/main");
+    // This machine pushed a snapshot earlier; another machine has one too.
+    git(&repo, &["update-ref", "refs/sync/pca/main", "HEAD"]);
+    git(
+        &repo,
+        &[
+            "push",
+            "-q",
+            "origin",
+            "refs/sync/pca/main:refs/sync/pca/main",
+        ],
+    );
+    git(&repo, &["push", "-q", "origin", "HEAD:refs/sync/pcb/main"]);
+    let text = format!(
+        "[machine]\nname = \"pca\"\n[root]\npath = \"{}\"\n{GROUP}[sync]\nfetch_interval_s = 1\n",
+        w.base.join("pca").display()
+    );
+    let d = Daemon::start(Config::parse(&text).unwrap(), settings(&w, "pca")).unwrap();
+    wait_until("own snapshot deleted remotely", 15, || {
+        !git(&w.remote, &["for-each-ref", "refs/sync/pca/"]).contains("refs/sync/pca/main")
+    });
+    d.shutdown();
+    let refs = git(&w.remote, &["for-each-ref", "--format=%(refname)"]);
+    assert!(refs.contains("refs/sync/pcb/main"), "{refs}");
+    assert!(refs.contains("refs/heads/main"), "{refs}");
+    assert!(git(&repo, &["for-each-ref", "refs/sync/pca/"]).is_empty());
+    let log = fs::read_to_string(w.base.join("pca.jsonl")).unwrap();
+    assert!(log.contains("snapshots_purged"), "{log}");
 }

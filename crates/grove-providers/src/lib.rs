@@ -104,6 +104,8 @@ pub trait Provider {
     fn capabilities(&self) -> Capabilities;
     /// Verifies the token and returns the authenticated login.
     fn test_connection(&self) -> Result<String>;
+    /// One repo's metadata (notably its visibility): `GET /repos/{owner}/{repo}`.
+    fn get_repo(&self, owner: &str, name: &str) -> Result<RemoteRepo>;
     fn list_repos(&self) -> Result<Vec<RemoteRepo>>;
     fn create_repo(&self, new: &NewRepo) -> Result<RemoteRepo>;
     fn configure_mirror(&self, owner: &str, repo: &str, spec: &MirrorSpec) -> Result<()>;

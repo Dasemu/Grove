@@ -5,8 +5,9 @@ is `grove_core::sync::sync_repo`, the same code the CLI runs. The daemon only de
 
 ## Behaviour
 
-- **Repos**: every directory `root/<repo>` or `root/<group>/<repo>` that has a `.bare` or `.git`
-  (dot-directories skipped). Rediscovered at every full pass, so new repos are picked up.
+- **Repos**: bare-layout repos (`.bare`) at `root/<group>/<repo>` for configured groups only; see
+  `docs/phase6.md` (Daemon scope and snapshot privacy). Rediscovered at every full pass, so new repos
+  are picked up.
 - **Watching**: inotify (crate `notify`), recursive per repo. Changes under `.git`, `.bare`,
   `.grove-stage` and anything matching `sync.ignore_extra` (exact component name or `*suffix`) are
   ignored. If a watch cannot be set (typically `ENOSPC`, raise `fs.inotify.max_user_watches`) it is
@@ -58,7 +59,7 @@ socket is refused; a stale socket file left by a crash is replaced.
 
 JSON lines in `<state dir>/activity.jsonl` (rotated at 5 MiB to `.jsonl.1`), the last 500 events in
 memory, and live via `subscribe`. Kinds: `start`, `stop`, `snapshot`, `fast_forward`, `applied`,
-`declined`, `state` (worktree state changed), `materialized`, `archived`, `error`, `watch_error`,
+`declined`, `snapshots_withheld`, `snapshots_enabled`, `snapshots_purged`, `state` (worktree state changed), `materialized`, `archived`, `error`, `watch_error`,
 `pause`, `resume`.
 
 ## CLI

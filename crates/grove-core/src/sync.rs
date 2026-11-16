@@ -20,6 +20,10 @@ pub struct Options {
     pub offline: bool,
     /// Create worktrees for new remote branches and archive gone ones (bare layout only).
     pub materialize: bool,
+    /// Take and push WIP snapshots. When false (private-only policy on a public or unknown
+    /// repo, or `snapshots = "none"`) no `refs/sync/<machine>/*` ref is created or pushed;
+    /// fetching, fast-forwarding and applying other machines' snapshots are unaffected.
+    pub push_snapshots: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,7 +114,7 @@ fn sync_worktree(r: &mut WorktreeReport, branch: &str, o: &Options, fetched: boo
         }
     };
     // A clean worktree still refreshes an existing snapshot so a stale WIP never lingers.
-    if dirty || has_ref {
+    if o.push_snapshots && (dirty || has_ref) {
         match take(&path, &o.machine, &o.stamp) {
             Ok(Outcome::Created(s)) => {
                 r.snapshot = Some("created");

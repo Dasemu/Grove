@@ -64,7 +64,8 @@ enum Cmd {
         #[arg(long)]
         backup_dir: Option<PathBuf>,
     },
-    /// Run one full sync pass on the repo at PATH
+    /// Run one full sync pass on the repo at PATH (pushes WIP snapshots whatever the
+    /// `snapshots` policy says; only the daemon enforces it)
     Sync {
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -212,6 +213,15 @@ fn daemon(action: &DaemonCmd) -> Result<()> {
                 if let Some(e) = r["last_error"].as_str() {
                     println!("    error: {e}");
                 }
+                if let Some(why) = r["snapshots_withheld"].as_str() {
+                    println!("    snapshots withheld: {why}");
+                }
+            }
+            for p in d["not_migrated"].as_array().into_iter().flatten() {
+                println!(
+                    "{}  [ignored] not migrated (run grove add)",
+                    p.as_str().unwrap_or("?")
+                );
             }
         }
         DaemonCmd::Pause => {
@@ -305,6 +315,19 @@ fn main() -> Result<()> {
                 r.backup_tar.display(),
                 r.backup_ref
             );
+            for b in &r.linked_backups {
+                println!("backup:   {} (linked worktree)", b.display());
+            }
+            if !r.linked.is_empty() {
+                println!("linked worktrees kept:");
+                for l in &r.linked {
+                    println!(
+                        "  {} ({})",
+                        l.path.display(),
+                        l.branch.as_deref().unwrap_or("detached")
+                    );
+                }
+            }
             println!("note: shells whose cwd was inside the old checkout must `cd` again");
             Ok(())
         }
@@ -318,7 +341,13 @@ fn main() -> Result<()> {
                     stamp: stamp(),
                     remote: "origin".into(),
                     offline: *offline,
-                    materialize: true,
+                    materialize: path
+                        .canonicalize()
+                        .ok()
+                        .and_then(|p| grove_daemon::discover::group_of(&p))
+                        .and_then(|g| cfg.groups.iter().find(|x| x.name == g))
+                        .is_none_or(|g| g.auto_materialize),
+                    push_snapshots: true,
                 },
             )?;
             print_report(&rep)
@@ -532,6 +561,16 @@ fn doctor(cfg_arg: &Option<PathBuf>) -> Result<()> {
                 Ok((_, src)) => line(Some(true), format!("provider {id:?}: token from {src:?}")),
                 Err(e) => line(None, format!("provider {id:?}: {e}")),
             }
+        }
+        let names: Vec<String> = c.groups.iter().map(|g| g.name.clone()).collect();
+        for p in grove_daemon::discover::discover(&root, &names).not_migrated {
+            line(
+                None,
+                format!(
+                    "{}: not migrated (run grove add); the daemon ignores it",
+                    p.display()
+                ),
+            );
         }
         for g in &c.groups {
             let gdir = root.join(&g.name);

@@ -160,6 +160,7 @@ fn handle(req: &Request, ctx: &Ctx) -> Value {
                         "last_sync": r.last_sync,
                         "last_error": r.last_error,
                         "failures": r.failures,
+                        "snapshots_withheld": r.snapshots_withheld,
                         "worktrees": r.worktrees.iter()
                             .map(|w| json!({"branch": w.branch, "state": w.state, "path": w.path}))
                             .collect::<Vec<_>>(),
@@ -167,7 +168,8 @@ fn handle(req: &Request, ctx: &Ctx) -> Value {
                 })
                 .collect();
             ok(
-                json!({"machine": ctx.machine, "paused": s.paused, "now": now_secs(), "repos": repos}),
+                json!({"machine": ctx.machine, "paused": s.paused, "now": now_secs(), "repos": repos,
+                       "not_migrated": s.not_migrated.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()}),
             )
         }
         "pause" | "resume" => {

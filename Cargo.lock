@@ -1178,6 +1178,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "grove-core",
+ "grove-providers",
  "notify",
  "serde",
  "serde_json",
