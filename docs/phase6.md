@@ -110,26 +110,31 @@ private:
    port (http/https; an ssh port is ignored) and the provider URL's path prefix; zero or several
    matching providers mean unknown. The token comes from `token::resolve` (tea/gh fallback) and the
    lookup is `GET /repos/{owner}/{repo}` (`Provider::get_repo`). On GitHub only
-   `visibility = "private"` counts (internal repos do not); on Gitea only `private: true`.
+   `visibility = "private"` counts (internal repos do not; a reply without the field is unknown); on Gitea only `private: true`.
 2. The group's mirror targets for the same repo name: every provider in `mirror_to` of the group's
    private and public routes, under the group's `owners` entry or else the token's login. Gitea
    push/pull mirrors copy `refs/sync/*`. A mirror that exists and is not private, or a failed
    lookup, withholds; a 404 (no mirror) is fine.
 
-Answers are cached in `<state dir>/visibility.json` (mode 0600), keyed by provider id, owner and
-name (lowercase, no `.git`). A "private" answer is trusted for 1 hour (a repo can be made public at
-any time), other answers for 6 hours, a cache timestamp in the future counts as expired, and an
+Answers are cached in `<state dir>/visibility.json` (mode 0600), keyed by provider id, provider URL, owner
+and name (lowercase, no `.git`). A "private" answer is trusted for 1 hour (a repo can be made public at
+any time) and so is an "absent" mirror answer; only "not private" (which merely withholds) is kept 6 hours, a cache timestamp in the future counts as expired, and an
 expired entry is never reused when the refresh fails. A failed lookup is retried at most every 5
 minutes. Unknown counts as **public**: no or several matching providers, no token, network error,
 404 on the repo itself, a reply without the `private` flag, no push URL. Offline (backoff) passes do
 no lookup: they use the last verdict, and take no snapshot when there is none.
 
-When snapshots go from allowed to withheld, the daemon deletes this machine's snapshot refs
-(`refs/sync/<machine>/*` only, never other machines' refs or branches) from the remote and locally,
-and logs `snapshots_purged` as a warning; a failed deletion is logged as `error` and retried on the
-next pass (the local refs are kept until it succeeds).
+When snapshots are withheld, the daemon deletes this machine's snapshot refs
+(`refs/sync/<machine>/*` only, never other machines' refs or branches). It lists them on every
+push URL with `ls-remote` (so refs without a local copy are found too), pushes the deletions per
+URL, and counts a URL as clean only when a fresh `ls-remote` shows none left; only then are the
+local copies removed. It logs `snapshots_purged` as a warning; any failure (also a server saying
+the repository does not exist) is logged as `error` and retried on the next pass. Git runs with
+`LC_ALL=C`, and snapshot pushes use `push.recurseSubmodules=no`.
 
-Residual risk: mirrors made by hand outside grove's config (a push mirror set up in the forge UI,
+Residual risks: when matching a provider, an ssh URL's port is ignored (it says nothing about the
+web port), so two forges on one host that differ only by port cannot be told apart by an ssh remote;
+and mirrors made by hand outside grove's config (a push mirror set up in the forge UI,
 a second remote) are unknown to the daemon. Use `snapshots = "none"` for repos where that matters.
 
 ### auto_materialize
