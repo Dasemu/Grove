@@ -347,11 +347,17 @@ pub fn archive_gone(root: &Path, machine: &str, stamp: &str) -> Result<Vec<Archi
         .map(|(b, _)| b)
         .collect();
     let wts = crate::inspect::worktrees(&bare)?;
+    let canonical_root = root.canonicalize().ok();
     let mut out = Vec::new();
     for branch in gone {
         let Some(wt) = wts.iter().find(|w| w.branch.as_deref() == Some(branch)) else {
             continue;
         };
+        // Only worktrees of the layout (`<root>/<dir>`) are ours to remove; a linked worktree
+        // elsewhere (e.g. a sibling directory) is the user's.
+        if wt.path.parent() != canonical_root.as_deref() {
+            continue;
+        }
         // Ignored files (.env, build output...) count as local work too.
         if !Git::new(&wt.path)
             .run(&["status", "--porcelain", "--ignored"])?

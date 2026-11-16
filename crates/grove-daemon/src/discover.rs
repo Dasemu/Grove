@@ -3,6 +3,16 @@
 
 use std::path::{Path, PathBuf};
 
+/// A linked worktree (`.git` file pointing into `<repo>/.git/worktrees/<id>`) belongs to the repo
+/// it was added from; treating it as a repo of its own would sync the same worktrees twice.
+fn is_linked_worktree(p: &Path) -> bool {
+    std::fs::read_to_string(p.join(".git")).is_ok_and(|s| {
+        s.trim()
+            .strip_prefix("gitdir:")
+            .is_some_and(|g| g.trim().contains("/worktrees/"))
+    })
+}
+
 fn is_repo(p: &Path) -> bool {
     p.join(".bare").is_dir() || p.join(".git").exists()
 }
@@ -23,10 +33,17 @@ fn subdirs(p: &Path) -> Vec<PathBuf> {
 pub fn discover(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for child in subdirs(root) {
+        if is_linked_worktree(&child) {
+            continue;
+        }
         if is_repo(&child) {
             out.push(child);
         } else {
-            out.extend(subdirs(&child).into_iter().filter(|g| is_repo(g)));
+            out.extend(
+                subdirs(&child)
+                    .into_iter()
+                    .filter(|g| is_repo(g) && !is_linked_worktree(g)),
+            );
         }
     }
     out
@@ -46,9 +63,16 @@ mod tests {
             "grp/plain",
             ".hidden/.git",
             "c/inner/.git",
+            "grp/b/main",
         ] {
             std::fs::create_dir_all(base.join(d)).unwrap();
         }
+        // Linked worktrees (siblings of their repo) are not repos of their own.
+        let link = "gitdir: /x/grp/b/.bare/worktrees/b-feature\n";
+        std::fs::create_dir_all(base.join("grp/b-feature")).unwrap();
+        std::fs::write(base.join("grp/b-feature/.git"), link).unwrap();
+        std::fs::create_dir_all(base.join("top-wt/sub/.git")).unwrap();
+        std::fs::write(base.join("top-wt/.git"), link).unwrap();
         let found = discover(&base);
         assert_eq!(
             found,
