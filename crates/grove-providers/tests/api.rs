@@ -348,4 +348,16 @@ fn get_repo_reports_visibility_on_both_forges() {
     let gh = GitHub::new(&url, "t".into());
     assert!(!gh.get_repo("o", "r").unwrap().private);
     assert!(rx.recv().unwrap().starts_with("GET /repos/o/r "));
+
+    // An internal repo reports `private: true` but is not private.
+    let (url, _rx) = mock(vec![(
+        200,
+        r#"{"name":"r","private":true,"visibility":"internal","owner":{"login":"o"}}"#,
+    )]);
+    assert!(
+        !GitHub::new(&url, "t".into())
+            .get_repo("o", "r")
+            .unwrap()
+            .private
+    );
 }

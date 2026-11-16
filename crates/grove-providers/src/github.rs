@@ -62,7 +62,13 @@ impl Provider for GitHub {
         if !v["private"].is_boolean() {
             return Err(Error::Other("response has no `private` flag".into()));
         }
-        Ok(repo(&v))
+        let mut r = repo(&v);
+        // `internal` repos (GitHub Enterprise) have `private: true` but are readable by the
+        // whole enterprise: only an explicit "private" counts as private.
+        if let Some(vis) = v["visibility"].as_str() {
+            r.private = vis == "private";
+        }
+        Ok(r)
     }
 
     fn list_repos(&self) -> Result<Vec<RemoteRepo>> {
