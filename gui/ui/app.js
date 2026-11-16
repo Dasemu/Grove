@@ -225,7 +225,7 @@ views.import = () => {
     list.replaceChildren(h('p', { class: 'muted' }, 'Scanning…'));
     out.replaceChildren();
     const r = await cli(['import', sel.value]);
-    const names = (r.output.match(/^\s+\S+\/(\S+?)(?: \(private\))?$/gm) || []).map((l) => l.trim().split(/\s+/)[0].split('/')[1]);
+    const names = (r.output.match(/^\s+\S+\/(\S+?)(?: on \S+)?(?: \(private\))?$/gm) || []).map((l) => l.trim().split(/\s+/)[0].split('/')[1]);
     if (!r.ok) return list.replaceChildren(h('div', { class: 'term fail' }, r.output));
     if (!names.length) return list.replaceChildren(h('p', { class: 'muted' }, 'Nothing to import: every remote repository is already on this machine.'));
     const boxes = names.map((n) => h('label', { class: 'check' }, h('input', { type: 'checkbox', value: n }), n));
@@ -260,7 +260,7 @@ views.settings = () => {
     h('h2', {}, 'Providers'),
     kv(provs.map(([id, p]) => [id, p.kind + (p.url ? ' · ' + p.url : '')])),
     h('h2', {}, 'Groups'),
-    kv((cfg.groups || []).map((g) => [g.name, 'primary ' + g.primary + (g.mirror_to && g.mirror_to.length ? ' · mirrors: ' + g.mirror_to.join(', ') : '') + ' · ' + (g.layout || 'bare-worktrees')])),
+    kv((cfg.groups || []).map((g) => [g.name, 'primary ' + g.primary + (g.mirror_to && g.mirror_to.length ? ' · mirrors: ' + g.mirror_to.join(', ') : '') + (g.public ? ' · public: ' + g.public.primary + ((g.public.mirror_to || []).length ? ' → ' + g.public.mirror_to.join(', ') : '') : '') + ' · ' + (g.layout || 'bare-worktrees')])),
     h('h2', {}, 'Config repository'),
     kv([['Repository', cfg.config_repo ? cfg.config_repo.name + ' on ' + cfg.config_repo.provider : 'not configured']]),
     h('div', { class: 'actions' },

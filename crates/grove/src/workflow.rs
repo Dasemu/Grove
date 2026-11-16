@@ -6,13 +6,15 @@ use grove_core::config::{
 };
 use grove_core::git::Git;
 use grove_core::registry::{Entry, Registry, clone_bare_layout, init_bare_layout, push_initial};
-use grove_providers::{MirrorSpec, NewRepo, Provider, build, token};
+use grove_providers::{MirrorSpec, NewRepo, Provider, PullMirrorSpec, RemoteRepo, build, token};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 pub struct Forge {
     pub api: Box<dyn Provider>,
     pub login: String,
+    /// API token (also used to authorise mirrors that read from this forge).
+    pub token: String,
     /// Git environment that authenticates HTTPS operations with the stored token.
     pub git_env: Vec<(String, String)>,
 }
@@ -22,7 +24,7 @@ pub fn connect(cfg: &Config, id: &str) -> Result<Forge> {
         .providers
         .get(id)
         .with_context(|| format!("provider {id:?} is not in the config"))?;
-    let tok = token::get(id)?;
+    let (tok, _) = token::resolve(id, pc)?;
     let api = build(pc, tok.clone());
     let login = api.test_connection()?;
     let git_env = match pc.kind {
@@ -35,14 +37,53 @@ pub fn connect(cfg: &Config, id: &str) -> Result<Forge> {
             ),
             ("GIT_TERMINAL_PROMPT".into(), "0".into()),
         ],
-        // GitHub git-over-HTTPS needs Basic auth; leave it to the user's credential helper.
-        ProviderKind::Github => vec![("GIT_TERMINAL_PROMPT".into(), "0".into())],
+        // GitHub git-over-HTTPS takes the token as Basic auth (any user name works).
+        ProviderKind::Github => vec![
+            ("GIT_CONFIG_COUNT".into(), "1".into()),
+            ("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into()),
+            (
+                "GIT_CONFIG_VALUE_0".into(),
+                format!(
+                    "Authorization: Basic {}",
+                    base64(&format!("x-access-token:{tok}"))
+                ),
+            ),
+            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+        ],
     };
     Ok(Forge {
         api,
         login,
+        token: tok,
         git_env,
     })
+}
+
+/// The group's owner on `provider`, or `None` when that is the authenticated user itself
+/// (personal repos use `/user/repos`, not the org endpoint).
+fn org_owner(grp: &Group, provider: &str, login: &str) -> Option<String> {
+    grp.owner(provider)
+        .filter(|o| !o.eq_ignore_ascii_case(login))
+        .map(str::to_string)
+}
+
+/// Standard base64 with padding (enough for an auth header; avoids a dependency).
+fn base64(s: &str) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in s.as_bytes().chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 fn group<'a>(cfg: &'a Config, name: &str) -> Result<&'a Group> {
@@ -91,6 +132,8 @@ pub fn init(path: &Path, a: InitArgs, force: bool) -> Result<Config> {
             mirror_to: vec![],
             layout: Layout::BareWorktrees,
             auto_materialize: true,
+            owners: Default::default(),
+            public: None,
         }],
         sync: Default::default(),
         config_repo: a.config_repo.map(|name| grove_core::config::ConfigRepo {
@@ -123,24 +166,25 @@ pub fn new_repo(cfg: &Config, group_name: &str, name: &str, private: bool) -> Re
     if dir.exists() {
         bail!("{} already exists", dir.display());
     }
-    let primary = connect(cfg, &grp.primary)?;
+    let route = grp.route(private);
+    let primary = connect(cfg, &route.primary)?;
     let remote = primary.api.create_repo(&NewRepo {
         name: name.into(),
-        owner: None,
+        owner: org_owner(grp, &route.primary, &primary.login),
         private,
         description: String::new(),
     })?;
     println!(
         "created {}/{} on {}",
-        remote.owner, remote.name, grp.primary
+        remote.owner, remote.name, route.primary
     );
     let wt = init_bare_layout(&dir, &remote.clone_url)?;
     push_initial(&dir, &primary.git_env)?;
     println!("pushed initial commit; worktree {}", wt.display());
 
-    for mid in &grp.mirror_to {
-        match configure_mirror(cfg, &primary, mid, &remote.owner, name, private) {
-            Ok(()) => println!("push mirror to {mid} configured"),
+    for mid in &route.mirror_to {
+        match configure_mirror(cfg, grp, &primary, &remote, mid) {
+            Ok(()) => println!("mirror to {mid} configured"),
             Err(e) => println!("warning: mirror to {mid} not configured: {e}"),
         }
     }
@@ -155,53 +199,95 @@ pub fn new_repo(cfg: &Config, group_name: &str, name: &str, private: bool) -> Re
     Ok(wt)
 }
 
+/// Mirrors `remote` (on `primary`) to `mirror_id`: a push mirror from the primary when it can
+/// do that (Gitea/Forgejo), otherwise a pull mirror created on the target (e.g. GitHub -> Gitea).
 fn configure_mirror(
     cfg: &Config,
+    grp: &Group,
     primary: &Forge,
+    remote: &RemoteRepo,
     mirror_id: &str,
-    owner: &str,
-    name: &str,
-    private: bool,
 ) -> Result<()> {
     let m = connect(cfg, mirror_id)?;
-    let target = m.api.create_repo(&NewRepo {
-        name: name.into(),
-        owner: None,
-        private,
-        description: "Mirror managed by grove".into(),
-    })?;
-    primary.api.configure_mirror(
-        owner,
-        name,
-        &MirrorSpec {
-            remote_url: target.clone_url,
-            remote_username: m.login,
-            remote_token: token::get(mirror_id)?,
+    let owner = org_owner(grp, mirror_id, &m.login);
+    if primary.api.capabilities().push_mirror {
+        let target = m.api.create_repo(&NewRepo {
+            name: remote.name.clone(),
+            owner,
+            private: remote.private,
+            description: "Mirror managed by grove".into(),
+        })?;
+        primary.api.configure_mirror(
+            &remote.owner,
+            &remote.name,
+            &MirrorSpec {
+                remote_url: target.clone_url,
+                remote_username: m.login.clone(),
+                remote_token: m.token.clone(),
+                interval: "8h0m0s".into(),
+                sync_on_commit: true,
+            },
+        )?;
+    } else {
+        // Credentials are only handed to the mirror when the source is private.
+        let source_auth = remote
+            .private
+            .then(|| (primary.login.clone(), primary.token.clone()));
+        m.api.create_pull_mirror(&PullMirrorSpec {
+            name: remote.name.clone(),
+            owner,
+            private: remote.private,
+            source_url: remote.clone_url.clone(),
+            source_auth,
             interval: "8h0m0s".into(),
-            sync_on_commit: true,
-        },
-    )?;
+        })?;
+    }
     Ok(())
 }
 
-/// Lists remote repos of the group's primary that are not on disk; clones the named ones.
+/// Remote repos of one route that belong to the group: owned by `owner` (case-insensitive, as
+/// forge logins are) and, when the group splits routes by visibility, of that visibility.
+fn select(repos: Vec<RemoteRepo>, owner: &str, private: Option<bool>) -> Vec<RemoteRepo> {
+    repos
+        .into_iter()
+        .filter(|r| r.owner.eq_ignore_ascii_case(owner))
+        .filter(|r| private.is_none_or(|p| r.private == p))
+        .collect()
+}
+
+/// Lists the group's remote repos that are not on disk; clones the named ones.
 pub fn import(cfg: &Config, group_name: &str, wanted: &[String]) -> Result<()> {
     let grp = group(cfg, group_name)?;
-    let primary = connect(cfg, &grp.primary)?;
+    // (provider id, visibility filter): one side per route.
+    let sides = match &grp.public {
+        Some(p) => vec![
+            (grp.primary.clone(), Some(true)),
+            (p.primary.clone(), Some(false)),
+        ],
+        None => vec![(grp.primary.clone(), None)],
+    };
     let gdir = cfg.root_path().join(&grp.name);
-    let missing: Vec<_> = primary
-        .api
-        .list_repos()?
-        .into_iter()
-        .filter(|r| !gdir.join(&r.name).join(".bare").exists())
-        .collect();
+    let mut forges = Vec::new();
+    let mut missing: Vec<(RemoteRepo, usize)> = Vec::new();
+    for (pid, vis) in sides {
+        let f = connect(cfg, &pid)?;
+        let owner = grp.owner(&pid).unwrap_or(&f.login).to_string();
+        for r in select(f.api.list_repos()?, &owner, vis) {
+            let here = gdir.join(&r.name).join(".bare").exists();
+            if !here && !missing.iter().any(|(m, _)| m.name == r.name) {
+                missing.push((r, forges.len()));
+            }
+        }
+        forges.push((pid, f));
+    }
     if wanted.is_empty() {
-        println!("repos on {} not yet in {}:", grp.primary, gdir.display());
-        for r in &missing {
+        println!("repos of group {} not yet in {}:", grp.name, gdir.display());
+        for (r, i) in &missing {
             println!(
-                "  {}/{}{}",
+                "  {}/{} on {}{}",
                 r.owner,
                 r.name,
+                forges[*i].0,
                 if r.private { " (private)" } else { "" }
             );
         }
@@ -209,12 +295,12 @@ pub fn import(cfg: &Config, group_name: &str, wanted: &[String]) -> Result<()> {
         return Ok(());
     }
     for w in wanted {
-        let r = missing
+        let (r, i) = missing
             .iter()
-            .find(|r| &r.name == w)
+            .find(|(r, _)| &r.name == w)
             .with_context(|| format!("{w:?} is not a remote repo missing locally"))?;
         let dir = gdir.join(&r.name);
-        clone_bare_layout(&r.clone_url, &dir, &primary.git_env)?;
+        clone_bare_layout(&r.clone_url, &dir, &forges[*i].1.git_env)?;
         println!("imported {} -> {}", r.name, dir.display());
         register(
             cfg,
@@ -386,4 +472,58 @@ pub fn bootstrap(cfg: &Config) -> Result<(usize, usize)> {
     write_heartbeat(cfg, &dir)?;
     commit_and_push(cfg, &dir, &forge, "machine heartbeat")?;
     Ok((done, skipped))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(owner: &str, name: &str, private: bool) -> RemoteRepo {
+        RemoteRepo {
+            owner: owner.into(),
+            name: name.into(),
+            private,
+            clone_url: format!("u/{name}.git"),
+            default_branch: "main".into(),
+        }
+    }
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        for (i, o) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(i), o);
+        }
+    }
+
+    #[test]
+    fn own_login_is_not_an_org_owner() {
+        let mut g: Group = toml::from_str("name='g'\nprimary='p'").unwrap();
+        assert_eq!(org_owner(&g, "p", "me"), None);
+        g.owners.insert("p".into(), "Me".into());
+        assert_eq!(org_owner(&g, "p", "me"), None);
+        g.owners.insert("p".into(), "Org".into());
+        assert_eq!(org_owner(&g, "p", "me").as_deref(), Some("Org"));
+    }
+
+    #[test]
+    fn select_filters_by_owner_and_visibility() {
+        let all = || {
+            vec![
+                r("dasemu", "priv", true),
+                r("Dasemu", "pub", false),
+                r("Zenvairo", "org", true),
+            ]
+        };
+        let names = |v: Vec<RemoteRepo>| v.into_iter().map(|r| r.name).collect::<Vec<_>>();
+        assert_eq!(names(select(all(), "dasemu", None)), ["priv", "pub"]);
+        assert_eq!(names(select(all(), "dasemu", Some(true))), ["priv"]);
+        assert_eq!(names(select(all(), "DASEMU", Some(false))), ["pub"]);
+        assert_eq!(names(select(all(), "zenvairo", None)), ["org"]);
+    }
 }
