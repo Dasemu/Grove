@@ -1,0 +1,13 @@
+[Unit]
+Description=grove daemon (keeps git repos in sync across machines)
+Documentation=https://git.zenvairo.es/dasemu/Grove
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/groved
+Restart=on-failure
+RestartSec=5
+# Nothing to flush on stop: all durable state lives in git, so a plain SIGTERM is safe.
+
+[Install]
+WantedBy=default.target

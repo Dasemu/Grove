@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Grove
+Comment=Grove tray icon (starts hidden)
+Exec=grove-gui --hidden
+Icon=grove
+Terminal=false
+X-GNOME-Autostart-enabled=true
