@@ -32,6 +32,11 @@ fn repo(v: &Value) -> RemoteRepo {
         clone_url: s("clone_url"),
         ssh_url: s("ssh_url"),
         default_branch: v["default_branch"].as_str().unwrap_or("main").to_string(),
+        mirror_of: v["mirror"]
+            .as_bool()
+            .unwrap_or(false)
+            .then(|| s("original_url"))
+            .filter(|u| !u.is_empty()),
     }
 }
 

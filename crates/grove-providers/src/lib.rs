@@ -57,6 +57,8 @@ pub struct RemoteRepo {
     /// SSH clone URL (empty when the forge did not report one).
     pub ssh_url: String,
     pub default_branch: String,
+    /// Where the repo is mirrored from when it is a read-only pull mirror (pushes are refused).
+    pub mirror_of: Option<String>,
 }
 
 impl RemoteRepo {

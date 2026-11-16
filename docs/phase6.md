@@ -35,6 +35,11 @@ mirror_to = ["gitea"]
   other owners (orgs you belong to) no longer show up in every group: give an org group its
   `owners` entry. If one route's provider is unreachable, the whole group's import fails.
 - An owner equal to the authenticated login means "my account" (`/user/repos`), not an org.
+- Read-only pull mirrors (Gitea `mirror: true` + `original_url`, GitHub `mirror_url`) are never
+  used as `origin`: `grove import` clones the mirror's source instead, and `grove add` (also the
+  GUI's Migrate) repoints an existing `origin` to it and fetches. The source must be on a
+  configured provider and, for import, have the mirror's visibility; otherwise import fails for
+  that repo (it keeps the mirror's name locally) and `add` only warns.
 - Wizard git over HTTPS authenticates with the resolved token on both forge kinds
   (`http.extraHeader`, process env only; GitHub as Basic `x-access-token`).
 

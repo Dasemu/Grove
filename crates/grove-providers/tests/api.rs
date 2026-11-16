@@ -367,6 +367,27 @@ fn get_repo_reports_visibility_on_both_forges() {
     );
 }
 
+#[test]
+fn pull_mirrors_report_their_source() {
+    let (url, _rx) = mock(vec![
+        (
+            200,
+            r#"{"name":"r","private":false,"mirror":true,"original_url":"https://github.com/o/r","owner":{"login":"o"}}"#,
+        ),
+        (
+            200,
+            r#"{"name":"r","private":false,"mirror":false,"original_url":"https://github.com/o/r","owner":{"login":"o"}}"#,
+        ),
+    ]);
+    let g = Gitea::new(ProviderKind::Gitea, &url, "t".into());
+    assert_eq!(
+        g.get_repo("o", "r").unwrap().mirror_of.as_deref(),
+        Some("https://github.com/o/r")
+    );
+    // A migrated (no longer mirroring) repo keeps `original_url` but is writable.
+    assert_eq!(g.get_repo("o", "r").unwrap().mirror_of, None);
+}
+
 const REPO_A: &str = r#"{"name":"a","private":false,"clone_url":"https://h/o/a.git","ssh_url":"git@h:o/a.git","default_branch":"main","owner":{"login":"Org"}}"#;
 const REPO_B: &str = r#"{"name":"b","private":true,"clone_url":"https://h/me/b.git","ssh_url":"ssh://gitea@h:2222/me/b.git","default_branch":"main","owner":{"login":"me"}}"#;
 const REPO_C: &str = r#"{"name":"c","private":true,"clone_url":"https://h/x/c.git","ssh_url":"","default_branch":"main","owner":{"login":"x"}}"#;
