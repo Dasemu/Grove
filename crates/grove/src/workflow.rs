@@ -95,14 +95,8 @@ pub fn connect(cfg: &Config, id: &str) -> Result<Forge> {
 /// Git environment for SSH remotes: the user's keys/agent authenticate and nothing prompts.
 /// `BatchMode` is only forced when the user has no ssh command of their own.
 fn ssh_env() -> Vec<(String, String)> {
-    let mut env = vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
-    let custom = std::env::var_os("GIT_SSH_COMMAND").is_some()
-        || std::env::var_os("GIT_SSH").is_some()
-        || std::process::Command::new("git")
-            .args(["config", "--get", "core.sshCommand"])
-            .output()
-            .is_ok_and(|o| o.status.success() && !o.stdout.is_empty());
-    if !custom {
+    let mut env = grove_core::git::noninteractive_env();
+    if !grove_core::git::has_custom_ssh() {
         env.push(("GIT_SSH_COMMAND".into(), "ssh -o BatchMode=yes".into()));
     }
     env
