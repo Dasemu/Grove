@@ -5,6 +5,7 @@
 use crate::activity::{Activity, now_secs};
 use crate::discover::{discover, group_of, is_ready, subdirs};
 use crate::ipc;
+use crate::purge;
 use crate::visibility::{RealForge, Visibility, snapshot_gate};
 use grove_core::config::Config;
 use grove_core::receive::Received;
@@ -426,6 +427,8 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
     let mut next_full = Instant::now();
     // When a debounced rediscovery is due (set by the first event of a burst, never pushed back).
     let mut rescan_at: Option<Instant> = None;
+    // Repos whose forge first confirmed their deletion at this time (see `purge`).
+    let mut gone_since: HashMap<PathBuf, (u64, u64)> = HashMap::new();
 
     loop {
         let now = Instant::now();
@@ -515,7 +518,15 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
             // While backing off after a failure, still snapshot local work (no network needed);
             // the network is retried at the first pass after the backoff expires.
             let offline = backoff_until.get(&r).is_some_and(|u| *u > now);
-            let failures = pass(&r, &cfg, &st, &mut visibility, offline, &ctx);
+            let failures = pass(
+                &r,
+                &cfg,
+                &st,
+                &mut visibility,
+                offline,
+                &mut gone_since,
+                &ctx,
+            );
             if !is_ready(&r) {
                 // It vanished mid-pass: whatever the pass reported is moot.
                 let (found, _) = rescan(&root, &groups, &mut watch, &ctx);
@@ -559,6 +570,7 @@ fn pass(
     st: &Settings,
     visibility: &mut Visibility,
     offline: bool,
+    gone_since: &mut HashMap<PathBuf, (u64, u64)>,
     ctx: &Ctx,
 ) -> u32 {
     let name = repo.display().to_string();
@@ -600,6 +612,9 @@ fn pass(
         push_snapshots,
     };
     let result = sync_repo(repo, &opts);
+    if !offline && purge_if_gone(repo, cfg, st, &result, gone_since, ctx) {
+        return 0;
+    }
     let mut shared = ctx.shared.lock().unwrap();
     // The repo may have been dropped by a rediscovery while the pass ran.
     let Some(status) = shared.repos.get_mut(repo) else {
@@ -691,6 +706,114 @@ fn pass(
         ctx.activity.log("error", Some(&name), errors.join("; "));
     }
     status.failures
+}
+
+/// Moves `repo` out of the synced tree once its forge has kept confirming its deletion for
+/// `purge::CONFIRM_AFTER_SECS`; returns true when it is gone from its place. A fetch that works,
+/// or the forge seeing the repo, clears it; so does a gap of more than twice that interval
+/// between confirmations.
+fn purge_if_gone(
+    repo: &Path,
+    cfg: &Config,
+    st: &Settings,
+    result: &Result<grove_core::sync::SyncReport, grove_core::git::GitError>,
+    gone_since: &mut HashMap<PathBuf, (u64, u64)>,
+    ctx: &Ctx,
+) -> bool {
+    let name = repo.display().to_string();
+    let hint = match result {
+        Ok(rep) => rep.fetch_error.as_deref().is_some_and(purge::looks_gone),
+        Err(_) => false,
+    };
+    if !hint || cfg.sync.purged_dir.is_empty() {
+        if matches!(result, Ok(rep) if rep.fetch_error.is_none()) {
+            gone_since.remove(repo);
+        }
+        return false;
+    }
+    match purge::confirmed_gone(cfg, repo, &st.remote, &RealForge) {
+        Ok(true) => {}
+        Ok(false) => {
+            gone_since.remove(repo);
+            return false;
+        }
+        // Cannot tell (network, token): keep whatever was confirmed before.
+        Err(_) => return false,
+    }
+    let now = now_secs();
+    let window = purge::CONFIRM_AFTER_SECS;
+    let entry = gone_since.entry(repo.to_path_buf()).or_insert((now, now));
+    if now.saturating_sub(entry.1) > 2 * window {
+        // Stale: start over.
+        *entry = (now, now);
+    }
+    entry.1 = now;
+    let first = entry.0;
+    if first == now {
+        ctx.activity.log(
+            "purge_pending",
+            Some(&name),
+            format!(
+                "the forge reports the remote repo deleted; moving it to {}/ if that still holds in {} min",
+                cfg.sync.purged_dir,
+                window / 60
+            ),
+        );
+    }
+    if now.saturating_sub(first) < window {
+        return false;
+    }
+    let Some(dest) = purge::destination(&cfg.root_path(), &cfg.sync.purged_dir, repo, &stamp())
+    else {
+        return false;
+    };
+    let gone = |ctx: &Ctx, gone_since: &mut HashMap<PathBuf, (u64, u64)>| {
+        gone_since.remove(repo);
+        ctx.shared.lock().unwrap().repos.remove(repo);
+    };
+    match purge::move_repo(repo, &dest) {
+        Ok(moved) => {
+            gone(ctx, gone_since);
+            let mut msg = format!(
+                "remote repo deleted: moved to {} (no longer synced; files untouched)",
+                dest.display()
+            );
+            if !moved.unrepaired.is_empty() {
+                let list: Vec<String> = moved
+                    .unrepaired
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect();
+                msg.push_str(&format!(
+                    "; worktrees not found, run `git worktree repair <path>` from {}/.bare once they are back: {}",
+                    dest.display(),
+                    list.join(", ")
+                ));
+            }
+            ctx.activity.log("purged", Some(&name), msg);
+            true
+        }
+        Err(purge::MoveError::Repair(e)) => {
+            gone(ctx, gone_since);
+            ctx.activity.log(
+                "purged",
+                Some(&name),
+                format!(
+                    "remote repo deleted: moved to {}, but repairing its worktree links failed ({e}); run `git worktree repair` there",
+                    dest.display()
+                ),
+            );
+            true
+        }
+        Err(purge::MoveError::NotMoved(e)) => {
+            ctx.activity.log(
+                "purge_failed",
+                Some(&name),
+                format!("not moved to {}: {e}", dest.display()),
+            );
+            false
+        }
+    }
 }
 
 /// Records why snapshots are withheld (or that they are pushed again), logging only changes.

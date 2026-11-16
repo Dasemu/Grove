@@ -6,6 +6,7 @@ pub mod activity;
 pub mod daemon;
 pub mod discover;
 pub mod ipc;
+pub mod purge;
 #[cfg(test)]
 #[path = "../../../test-support/tmp.rs"]
 mod test_tmp;
