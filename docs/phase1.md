@@ -1,18 +1,18 @@
 # Phase 1: core + CLI
 
-Crates: `gitsync-core` (library) and `gitsync` (CLI). Everything shells out to the system `git`.
+Crates: `grove-core` (library) and `grove` (CLI). Everything shells out to the system `git`.
 
 ## CLI
 
 | Command | What it does |
 |---|---|
-| `gitsync status [path]` | State of every worktree (`Synced`, `Dirty`, `Ahead`, `Behind`, `BehindDirty`, `Diverged`, `Error`) |
-| `gitsync snapshot [path]` | Snapshot the worktree into `refs/sync/<machine>/<branch>` (local only) |
-| `gitsync add <path>` | Migrate a plain clone to `.bare/` + one worktree per branch, in place |
-| `gitsync sync [path] [--offline]` | One full pass (below) |
-| `gitsync doctor` | Checks git, config, root, repo remotes and refspecs, inotify limit |
+| `grove status [path]` | State of every worktree (`Synced`, `Dirty`, `Ahead`, `Behind`, `BehindDirty`, `Diverged`, `Error`) |
+| `grove snapshot [path]` | Snapshot the worktree into `refs/sync/<machine>/<branch>` (local only) |
+| `grove add <path>` | Migrate a plain clone to `.bare/` + one worktree per branch, in place |
+| `grove sync [path] [--offline]` | One full pass (below) |
+| `grove doctor` | Checks git, config, root, repo remotes and refspecs, inotify limit |
 
-Config: `~/.config/gitsync/config.toml` (or `--config`). Machine names are embedded in ref names, so
+Config: `~/.config/grove/config.toml` (or `--config`). Machine names are embedded in ref names, so
 they may only contain letters, digits, `-` and `_`.
 
 ## Sync pass (`sync_repo`)
@@ -50,7 +50,7 @@ they may only contain letters, digits, `-` and `_`.
 ## Known limitations
 
 - Nested untracked git repos are snapshotted only as gitlinks (their content is not synced).
-- No crash-resume: a hard kill in the middle of `add` leaves `.gitsync-stage`; the error says where
+- No crash-resume: a hard kill in the middle of `add` leaves `.grove-stage`; the error says where
   the files are, but recovery is manual (the backup tar and ref exist).
 - Machine-name uniqueness across machines is not enforced.
 - Split-index repos are untested.

@@ -36,7 +36,7 @@ fn temp_index_path() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("gitsync-index-{}-{nanos}", std::process::id()))
+    std::env::temp_dir().join(format!("grove-index-{}-{nanos}", std::process::id()))
 }
 
 /// Take a snapshot of `worktree` for `machine`. `message_stamp` is embedded in the
@@ -58,10 +58,10 @@ pub fn take(worktree: &Path, machine: &str, message_stamp: &str) -> Result<Outco
     let snap = git
         .clone()
         .with_env("GIT_INDEX_FILE", tmp.0.to_string_lossy())
-        .with_env("GIT_AUTHOR_NAME", "gitsync")
-        .with_env("GIT_AUTHOR_EMAIL", "gitsync@localhost")
-        .with_env("GIT_COMMITTER_NAME", "gitsync")
-        .with_env("GIT_COMMITTER_EMAIL", "gitsync@localhost");
+        .with_env("GIT_AUTHOR_NAME", "grove")
+        .with_env("GIT_AUTHOR_EMAIL", "grove@localhost")
+        .with_env("GIT_COMMITTER_NAME", "grove")
+        .with_env("GIT_COMMITTER_EMAIL", "grove@localhost");
 
     snap.run(&["add", "-A"])?;
     let tree = snap.run(&["write-tree"])?;
@@ -75,7 +75,7 @@ pub fn take(worktree: &Path, machine: &str, message_stamp: &str) -> Result<Outco
     }
 
     let head = snap.probe(&["rev-parse", "-q", "--verify", "HEAD"])?;
-    let message = format!("gitsync snapshot {machine} {message_stamp}");
+    let message = format!("grove snapshot {machine} {message_stamp}");
     let mut args: Vec<&str> = vec!["commit-tree", &tree];
     if let Some(h) = &head {
         args.extend(["-p", h]);

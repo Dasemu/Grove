@@ -1,10 +1,10 @@
 mod common;
 use common::*;
-use gitsync_core::git::Git;
-use gitsync_core::migrate::migrate;
-use gitsync_core::receive::*;
-use gitsync_core::snapshot::take;
-use gitsync_core::state::State;
+use grove_core::git::Git;
+use grove_core::migrate::migrate;
+use grove_core::receive::*;
+use grove_core::snapshot::take;
+use grove_core::state::State;
 use std::fs;
 use std::path::PathBuf;
 
@@ -277,7 +277,7 @@ fn gone_branch_with_local_changes_is_kept_and_flagged() {
 }
 
 fn state_of(p: &std::path::Path) -> State {
-    gitsync_core::inspect::state(p)
+    grove_core::inspect::state(p)
 }
 
 // ---- regression tests for the review findings ----
@@ -372,7 +372,7 @@ fn snapshot_apply_declines_instead_of_overwriting_local_ignored_file() {
 
 #[test]
 fn archive_and_receive_in_one_pass_do_not_collide_on_backup_refs() {
-    use gitsync_core::sync::{Options, sync_repo};
+    use grove_core::sync::{Options, sync_repo};
     let w = world();
     migrate(&w.d2, "m2", &w.base.join("bk"), "1").unwrap();
     let root = w.d2.canonicalize().unwrap();

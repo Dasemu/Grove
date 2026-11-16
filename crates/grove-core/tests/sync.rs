@@ -1,9 +1,9 @@
 mod common;
 use common::*;
-use gitsync_core::git::Git;
-use gitsync_core::receive::Applied;
-use gitsync_core::state::State;
-use gitsync_core::sync::{Options, sync_repo};
+use grove_core::git::Git;
+use grove_core::receive::Applied;
+use grove_core::state::State;
+use grove_core::sync::{Options, sync_repo};
 use std::fs;
 use std::path::Path;
 

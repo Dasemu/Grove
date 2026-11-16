@@ -1,7 +1,7 @@
 mod common;
 use common::*;
-use gitsync_core::git::Git;
-use gitsync_core::migrate::{MigrateError, Step, migrate, migrate_failing_after};
+use grove_core::git::Git;
+use grove_core::migrate::{MigrateError, Step, migrate, migrate_failing_after};
 use std::fs;
 
 fn names(dir: &std::path::Path) -> Vec<String> {
@@ -136,7 +136,7 @@ fn every_failure_point_rolls_back_to_the_original_layout() {
     }
 }
 
-fn refused(r: Result<gitsync_core::migrate::Report, MigrateError>) -> String {
+fn refused(r: Result<grove_core::migrate::Report, MigrateError>) -> String {
     match r {
         Err(MigrateError::Refused(m)) => m,
         other => panic!("expected Refused, got {other:?}"),

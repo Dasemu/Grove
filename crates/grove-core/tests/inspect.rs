@@ -1,12 +1,12 @@
-use gitsync_core::git::Git;
-use gitsync_core::inspect::{state, worktrees};
-use gitsync_core::state::State;
+use grove_core::git::Git;
+use grove_core::inspect::{state, worktrees};
+use grove_core::state::State;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 fn tmpdir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
-        "gitsync-test-{tag}-{}-{}",
+        "grove-test-{tag}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -1,6 +1,6 @@
 [package]
-name = "gitsync-core"
-description = "Sync engine for gitsync: snapshots, state classification"
+name = "grove-core"
+description = "Sync engine for grove: snapshots, state classification"
 edition.workspace = true
 version.workspace = true
 

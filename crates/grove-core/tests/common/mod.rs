@@ -1,11 +1,11 @@
 #![allow(dead_code)]
-use gitsync_core::git::Git;
+use grove_core::git::Git;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn tmpdir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
-        "gitsync-test-{tag}-{}-{}",
+        "grove-test-{tag}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

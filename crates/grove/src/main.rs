@@ -1,22 +1,19 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use gitsync_core::config::Config;
-use gitsync_core::git::Git;
-use gitsync_core::inspect::{state, worktrees};
-use gitsync_core::migrate::migrate;
-use gitsync_core::receive::{Applied, Archived, Received};
-use gitsync_core::snapshot::{Outcome, take};
-use gitsync_core::sync::{Options, SyncReport, git_dir_for, sync_repo};
+use grove_core::config::Config;
+use grove_core::git::Git;
+use grove_core::inspect::{state, worktrees};
+use grove_core::migrate::migrate;
+use grove_core::receive::{Applied, Archived, Received};
+use grove_core::snapshot::{Outcome, take};
+use grove_core::sync::{Options, SyncReport, git_dir_for, sync_repo};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
-#[command(
-    name = "gitsync",
-    about = "Keep git workspaces in sync across machines"
-)]
+#[command(name = "grove", about = "Keep git workspaces in sync across machines")]
 struct Cli {
-    /// Path to config.toml (default: $XDG_CONFIG_HOME/gitsync/config.toml)
+    /// Path to config.toml (default: $XDG_CONFIG_HOME/grove/config.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]

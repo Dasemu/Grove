@@ -130,20 +130,20 @@ impl Config {
         Config::parse(&text)
     }
 
-    /// Default location: `$XDG_CONFIG_HOME/gitsync/config.toml` or `~/.config/...`.
+    /// Default location: `$XDG_CONFIG_HOME/grove/config.toml` or `~/.config/...`.
     pub fn default_path() -> Option<PathBuf> {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-        Some(base.join("gitsync/config.toml"))
+        Some(base.join("grove/config.toml"))
     }
 
-    /// Local state directory: `$XDG_STATE_HOME/gitsync` or `~/.local/state/gitsync`.
+    /// Local state directory: `$XDG_STATE_HOME/grove` or `~/.local/state/grove`.
     pub fn state_dir() -> Option<PathBuf> {
         let base = std::env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-        Some(base.join("gitsync"))
+        Some(base.join("grove"))
     }
 
     /// `root.path` with a leading `~` expanded.
@@ -224,7 +224,7 @@ mirror_to = ["github"]
 fetch_interval_s = 30
 [config_repo]
 provider = "gitea-main"
-name = "gitsync-config"
+name = "grove-config"
 "#;
 
     #[test]

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const BARE: &str = ".bare";
-const STAGE: &str = ".gitsync-stage";
+const STAGE: &str = ".grove-stage";
 
 #[derive(Debug)]
 pub enum MigrateError {

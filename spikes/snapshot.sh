@@ -16,6 +16,6 @@ tree=$(git write-tree)
 prev=$(git rev-parse -q --verify "$ref" || true)
 if [ -n "$prev" ] && [ "$(git rev-parse "$prev^{tree}")" = "$tree" ]; then echo "unchanged $prev"; exit 0; fi
 parents=(-p HEAD); [ -n "$prev" ] && parents+=(-p "$prev")
-commit=$(git commit-tree "$tree" "${parents[@]}" -m "gitsync snapshot $machine $(date -u +%FT%TZ)")
+commit=$(git commit-tree "$tree" "${parents[@]}" -m "grove snapshot $machine $(date -u +%FT%TZ)")
 git update-ref "$ref" "$commit"
 echo "$commit"

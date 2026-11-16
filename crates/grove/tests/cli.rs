@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn tmp(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("gitsync-cli-{tag}-{}", std::process::id()));
+    let p = std::env::temp_dir().join(format!("grove-cli-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&p);
     fs::create_dir_all(&p).unwrap();
     p
@@ -24,7 +24,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn gs(cfg: &Path, dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_gitsync"))
+    Command::new(env!("CARGO_BIN_EXE_grove"))
         .current_dir(dir)
         .arg("--config")
         .arg(cfg)

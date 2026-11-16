@@ -70,7 +70,7 @@ mod tests {
     fn invariants_hold_for_random_names() {
         let alphabet: Vec<char> = "ab/._- é\\:*?\"<>|0Z".chars().collect();
         let mut seed = 0x1234_5678_u64;
-        let mut taken: Vec<String> = vec![".bare".into(), ".gitsync-stage".into()];
+        let mut taken: Vec<String> = vec![".bare".into(), ".grove-stage".into()];
         for _ in 0..2000 {
             let len = {
                 seed = seed
