@@ -72,7 +72,10 @@ is the broad-scope `tea`/`gh` token; use `grove login` with a narrower token to 
 ignored: plain clones (never migrated with `grove add`), directories that are not configured
 groups, repos directly under the root. Ignored plain clones inside a configured group are listed as
 "not migrated (run grove add)" by `grove daemon status` and `grove doctor`. Discovery reads one
-directory per configured group, so it stays cheap. Group names must be plain directory names.
+directory per configured group, so it stays cheap.
+
+**Breaking change:** group names must now be plain directory names (non-empty, no `/`, no leading
+`.`); a config with other names no longer loads.
 
 ### Snapshot policy
 
@@ -99,16 +102,35 @@ snapshots = "all"               # optional per-group override
 
 ### How visibility is resolved
 
-For `private-only` the daemon matches the repo's `origin` URL (https, `ssh://` or scp-like) against
-the configured providers by host (port ignored; GitHub without a URL is `github.com`), gets the
-token with `token::resolve` (so the `tea`/`gh` fallback applies) and calls
-`GET /repos/{owner}/{repo}` (`Provider::get_repo`, Gitea/Forgejo and GitHub). The answer is cached in
-`<state dir>/visibility.json` for 6 hours; a failed lookup is retried at most every 5 minutes. A
-cached answer older than 6 hours is never used when the refresh fails.
+Under `private-only` snapshots are pushed only if **every place the push reaches** is known to be
+private:
 
-Unknown visibility counts as **public**: no matching provider, no token, network error, 404 (e.g. a
-token without access to a private GitHub repo), a reply without the `private` flag, or no `origin`.
-No lookup happens during an offline (backoff) pass, since nothing is pushed then.
+1. Every push URL of `origin` (`git remote get-url --push --all origin`, so `pushurl`, several
+   urls and `pushInsteadOf` count). Each is matched to exactly one configured provider by host,
+   port (http/https; an ssh port is ignored) and the provider URL's path prefix; zero or several
+   matching providers mean unknown. The token comes from `token::resolve` (tea/gh fallback) and the
+   lookup is `GET /repos/{owner}/{repo}` (`Provider::get_repo`). On GitHub only
+   `visibility = "private"` counts (internal repos do not); on Gitea only `private: true`.
+2. The group's mirror targets for the same repo name: every provider in `mirror_to` of the group's
+   private and public routes, under the group's `owners` entry or else the token's login. Gitea
+   push/pull mirrors copy `refs/sync/*`. A mirror that exists and is not private, or a failed
+   lookup, withholds; a 404 (no mirror) is fine.
+
+Answers are cached in `<state dir>/visibility.json` (mode 0600), keyed by provider id, owner and
+name (lowercase, no `.git`). A "private" answer is trusted for 1 hour (a repo can be made public at
+any time), other answers for 6 hours, a cache timestamp in the future counts as expired, and an
+expired entry is never reused when the refresh fails. A failed lookup is retried at most every 5
+minutes. Unknown counts as **public**: no or several matching providers, no token, network error,
+404 on the repo itself, a reply without the `private` flag, no push URL. Offline (backoff) passes do
+no lookup: they use the last verdict, and take no snapshot when there is none.
+
+When snapshots go from allowed to withheld, the daemon deletes this machine's snapshot refs
+(`refs/sync/<machine>/*` only, never other machines' refs or branches) from the remote and locally,
+and logs `snapshots_purged` as a warning; a failed deletion is logged as `error` and retried on the
+next pass (the local refs are kept until it succeeds).
+
+Residual risk: mirrors made by hand outside grove's config (a push mirror set up in the forge UI,
+a second remote) are unknown to the daemon. Use `snapshots = "none"` for repos where that matters.
 
 ### auto_materialize
 
