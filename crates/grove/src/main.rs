@@ -12,6 +12,7 @@ use grove_core::sync::{Options, SyncReport, git_dir_for, sync_repo};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod secrets;
 mod workflow;
 
 #[derive(Parser)]
@@ -109,11 +110,28 @@ enum Cmd {
     ConfigRepoInit,
     /// Fresh machine: clone every repo listed in the config repo
     Bootstrap,
+    /// Encrypted sync of files git must not hold (.env, ...), via the config repo
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsCmd,
+    },
     /// Talk to the running daemon (`groved`)
     Daemon {
         #[command(subcommand)]
         action: DaemonCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum SecretsCmd {
+    /// Create this machine's age key and publish the public half
+    Init,
+    /// Encrypt FILE (inside a workspace worktree) to every machine key and store it
+    Push { file: PathBuf },
+    /// Decrypt stored files into the worktrees that lack them (never overwrites)
+    Pull,
+    /// Re-encrypt everything to the current set of machine keys
+    Rekey,
 }
 
 #[derive(Subcommand)]
@@ -374,6 +392,15 @@ fn main() -> Result<()> {
             let n = workflow::config_repo_init(&load_config(&cli.config)?)?;
             println!("config repo up to date ({n} repos registered)");
             Ok(())
+        }
+        Cmd::Secrets { action } => {
+            let cfg = load_config(&cli.config)?;
+            match action {
+                SecretsCmd::Init => secrets::init(&cfg),
+                SecretsCmd::Push { file } => secrets::push(&cfg, file),
+                SecretsCmd::Pull => secrets::pull(&cfg),
+                SecretsCmd::Rekey => secrets::rekey(&cfg),
+            }
         }
         Cmd::Bootstrap => {
             let (done, skipped) = workflow::bootstrap(&load_config(&cli.config)?)?;

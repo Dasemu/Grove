@@ -7,7 +7,7 @@ G=$(realpath "$G")
 W=$(mktemp -d)
 api() { curl -fs -u spike:spike-pass-123 "$@"; }
 cleanup() {
-  for r in alpha beta grove-config; do api -X DELETE "localhost:3300/api/v1/repos/spike/$r" >/dev/null || true; done
+  for r in alpha beta gamma grove-config; do api -X DELETE "localhost:3300/api/v1/repos/spike/$r" >/dev/null || true; done
   rm -rf "$W"
 }
 trap cleanup EXIT
@@ -17,7 +17,7 @@ export GROVE_TOKEN_MAIN=$TOK
 machine() { # name
   export XDG_CONFIG_HOME=$W/$1/cfg XDG_STATE_HOME=$W/$1/state
   "$G" init --machine "$1" --root "$W/$1/ws" --provider main --kind gitea \
-    --url http://localhost:3300 --group work --config-repo grove-config >/dev/null
+    --url http://localhost:3300 --group work --config-repo grove-config --force >/dev/null
 }
 machine pca
 "$G" new work alpha
@@ -27,3 +27,20 @@ machine pcb
 "$G" bootstrap
 test -d "$W/pcb/ws/work/alpha/main" && test -d "$W/pcb/ws/work/beta/main"
 echo "OK: fresh machine pcb has both repos"
+
+# Encrypted .env channel: pca pushes, pcb (own key, after rekey on pca) pulls.
+machine pca
+"$G" new work gamma >/dev/null
+"$G" secrets init
+echo "API_KEY=s3cr3t" > "$W/pca/ws/work/gamma/main/.env"
+machine pcb
+"$G" bootstrap >/dev/null
+"$G" secrets init
+machine pca
+"$G" secrets push "$W/pca/ws/work/gamma/main/.env"
+"$G" secrets rekey
+machine pcb
+"$G" secrets pull
+test "$(cat "$W/pcb/ws/work/gamma/main/.env")" = "API_KEY=s3cr3t"
+test "$(stat -c %a "$W/pcb/ws/work/gamma/main/.env")" = "600"
+echo "OK: .env travelled encrypted and landed with mode 600"

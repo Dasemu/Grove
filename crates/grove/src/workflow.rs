@@ -237,7 +237,7 @@ fn config_repo_dir() -> Result<PathBuf> {
 }
 
 /// Makes sure the local clone of the config repo exists and is current. Returns its path.
-fn config_repo_open(cfg: &Config, create: bool) -> Result<(PathBuf, Forge)> {
+pub(crate) fn config_repo_open(cfg: &Config, create: bool) -> Result<(PathBuf, Forge)> {
     let cr = cfg
         .config_repo
         .as_ref()
@@ -284,7 +284,7 @@ fn read_registry(dir: &Path) -> Result<Registry> {
     }
 }
 
-fn commit_and_push(cfg: &Config, dir: &Path, forge: &Forge, msg: &str) -> Result<()> {
+pub(crate) fn commit_and_push(cfg: &Config, dir: &Path, forge: &Forge, msg: &str) -> Result<()> {
     let g = Git::new(dir)
         .with_env("GIT_AUTHOR_NAME", "grove")
         .with_env("GIT_AUTHOR_EMAIL", "grove@localhost")
