@@ -215,7 +215,7 @@ fn preflight(root: &Path) -> Result<(String, Vec<Linked>), MigrateError> {
     }
     if root.join(STAGE).exists() {
         return refuse(format!(
-            "{STAGE} exists: a previous migration was interrupted. Your files are in {STAGE} and the git dir in .bare; restore from the backup tar or move them back by hand"
+            "{STAGE} exists: a previous migration was interrupted. Your files are in {STAGE} and the git dir in .bare; restore from the backup tar or move them back by hand. Linked worktrees may also need their .git link files restored from the backup tars or `git worktree repair`"
         ));
     }
     if !dotgit.is_dir() {
@@ -251,8 +251,24 @@ fn preflight(root: &Path) -> Result<(String, Vec<Linked>), MigrateError> {
     ) {
         return refuse("sparse checkout / per-worktree config is not supported yet");
     }
-    if root.join(".gitmodules").exists() || dotgit.join("modules").exists() {
+    if root.join(".gitmodules").exists()
+        || dotgit.join("modules").exists()
+        || list_ids(&dotgit)
+            .iter()
+            .any(|id| dotgit.join("worktrees").join(id).join("modules").exists())
+    {
         return refuse("submodules are not supported yet");
+    }
+    for key in ["worktree.useRelativePaths", "extensions.relativeWorktrees"] {
+        if matches!(
+            git.probe(&["config", "--type=bool", "--get", key])?
+                .as_deref(),
+            Some("true")
+        ) {
+            return refuse(format!(
+                "{key} (relative worktree links) is not supported yet"
+            ));
+        }
     }
     let linked = linked_worktrees(root, &git)?;
     Ok((branch, linked))
@@ -344,6 +360,11 @@ fn linked_worktrees(root: &Path, git: &Git) -> Result<Vec<Linked>, MigrateError>
         if let Some(f) = operation_in_progress(&meta) {
             return refuse(format!(
                 "operation in progress ({f}) in linked worktree {shown}: finish or abort it first"
+            ));
+        }
+        if old_path.join(".gitmodules").exists() {
+            return refuse(format!(
+                "linked worktree {shown} has submodules; not supported yet"
             ));
         }
         let orig_gitdir = fs::read_to_string(meta.join("gitdir"))?;
@@ -588,7 +609,7 @@ fn run_steps(
     let meta = pointer
         .trim()
         .strip_prefix("gitdir: ")
-        .map(PathBuf::from)
+        .map(|m| wt.join(m))
         .ok_or("unexpected .git file in new worktree")?;
     p.wt_meta = Some(meta.clone());
     hook(inject, Step::WorktreeAdded)?;

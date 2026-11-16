@@ -204,6 +204,33 @@ fn refuses_unsafe_situations_without_touching_anything() {
         "{m}"
     );
 
+    let subw = base.join("subw");
+    let g = init(&subw);
+    commit(&g, "a", "1");
+    let sw = base.join("subw-wt");
+    g.run(&["worktree", "add", "-q", "-b", "x", sw.to_str().unwrap()])
+        .unwrap();
+    fs::write(sw.join(".gitmodules"), "").unwrap();
+    assert!(refused(migrate(&subw, "m", &bk, "1")).contains("submodules"));
+    let subm2 = base.join("subm2");
+    let g = init(&subm2);
+    commit(&g, "a", "1");
+    let sw2 = base.join("subm2-wt");
+    g.run(&["worktree", "add", "-q", "-b", "x", sw2.to_str().unwrap()])
+        .unwrap();
+    let meta = fs::read_to_string(sw2.join(".git")).unwrap();
+    let meta = meta.trim().strip_prefix("gitdir: ").unwrap();
+    fs::create_dir_all(std::path::Path::new(meta).join("modules/m")).unwrap();
+    assert!(refused(migrate(&subm2, "m", &bk, "1")).contains("submodules"));
+
+    let rel = base.join("rel");
+    let g = init(&rel);
+    commit(&g, "a", "1");
+    g.run(&["config", "worktree.useRelativePaths", "true"])
+        .unwrap();
+    assert!(refused(migrate(&rel, "m", &bk, "1")).contains("relative"));
+    assert!(rel.join(".git").is_dir());
+
     let done = base.join("done");
     let g = init(&done);
     commit(&g, "a", "1");
