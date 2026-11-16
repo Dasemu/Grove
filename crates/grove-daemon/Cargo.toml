@@ -1,0 +1,20 @@
+[package]
+name = "grove-daemon"
+description = "grove user daemon: file watching, scheduler and IPC server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "grove_daemon"
+
+[[bin]]
+name = "groved"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+grove-core = { version = "0.1.0", path = "../grove-core" }
+notify = "8.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

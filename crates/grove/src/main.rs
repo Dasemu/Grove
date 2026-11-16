@@ -49,6 +49,28 @@ enum Cmd {
     },
     /// Check the local setup
     Doctor,
+    /// Talk to the running daemon (`groved`)
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Show every managed repo and its state
+    Status,
+    /// Stop syncing until `resume`
+    Pause,
+    /// Resume syncing (runs a full pass right away)
+    Resume,
+    /// Sync now: one repo (path as shown by `status`) or all
+    Sync { repo: Option<PathBuf> },
+    /// Show recent activity
+    Log {
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
 }
 
 fn load_config(arg: &Option<PathBuf>) -> Result<Config> {
@@ -66,9 +88,87 @@ fn stamp() -> String {
         .to_string()
 }
 
+fn daemon(action: &DaemonCmd) -> Result<()> {
+    use serde_json::json;
+    let socket = grove_daemon::ipc::default_socket_path();
+    let ask = |req: serde_json::Value| -> Result<serde_json::Value> {
+        let resp = grove_daemon::ipc::request(&socket, &req).with_context(|| {
+            format!(
+                "cannot reach the daemon at {} (is groved running?)",
+                socket.display()
+            )
+        })?;
+        if resp["ok"] != true {
+            bail!(
+                "daemon error: {}",
+                resp["error"].as_str().unwrap_or("unknown")
+            );
+        }
+        Ok(resp["data"].clone())
+    };
+    match action {
+        DaemonCmd::Status => {
+            let d = ask(json!({"v": 1, "cmd": "status"}))?;
+            println!(
+                "machine {}  {}",
+                d["machine"].as_str().unwrap_or("?"),
+                if d["paused"] == true {
+                    "PAUSED"
+                } else {
+                    "running"
+                }
+            );
+            for r in d["repos"].as_array().into_iter().flatten() {
+                println!(
+                    "{}  [{}]",
+                    r["path"].as_str().unwrap_or("?"),
+                    r["phase"].as_str().unwrap_or("?")
+                );
+                for w in r["worktrees"].as_array().into_iter().flatten() {
+                    println!(
+                        "    {:<24} {}",
+                        w["branch"].as_str().unwrap_or("(detached)"),
+                        w["state"].as_str().unwrap_or("?")
+                    );
+                }
+                if let Some(e) = r["last_error"].as_str() {
+                    println!("    error: {e}");
+                }
+            }
+        }
+        DaemonCmd::Pause => {
+            ask(json!({"v": 1, "cmd": "pause"}))?;
+            println!("paused");
+        }
+        DaemonCmd::Resume => {
+            ask(json!({"v": 1, "cmd": "resume"}))?;
+            println!("resumed");
+        }
+        DaemonCmd::Sync { repo } => {
+            let repo = repo.as_ref().map(|p| p.display().to_string());
+            ask(json!({"v": 1, "cmd": "sync", "repo": repo}))?;
+            println!("queued");
+        }
+        DaemonCmd::Log { limit } => {
+            let d = ask(json!({"v": 1, "cmd": "log", "limit": limit}))?;
+            for e in d.as_array().into_iter().flatten() {
+                println!(
+                    "{}  {:<12} {}  {}",
+                    e["ts"],
+                    e["kind"].as_str().unwrap_or("?"),
+                    e["repo"].as_str().unwrap_or("-"),
+                    e["msg"].as_str().unwrap_or("")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
+        Cmd::Daemon { action } => daemon(action),
         Cmd::Status { path } => status(path),
         Cmd::Snapshot { path } => {
             let cfg = load_config(&cli.config)?;
