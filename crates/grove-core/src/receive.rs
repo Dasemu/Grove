@@ -98,6 +98,35 @@ pub fn push_snapshot(worktree: &Path, machine: &str, remote: &str) -> Result<(),
     Ok(())
 }
 
+/// Deletes this machine's snapshot refs (`refs/sync/<machine>/*`, never anything else) from
+/// `remote` and then locally; used when snapshots must no longer be published. A ref the remote
+/// does not have counts as deleted. Returns the refs removed; on a failed push the local ref is
+/// kept so the next call retries. Errors carry the first failure.
+pub fn purge_own_snapshots(
+    gitdir: &Path,
+    machine: &str,
+    remote: &str,
+) -> Result<Vec<String>, GitError> {
+    let g = Git::new(gitdir);
+    let prefix = format!("refs/sync/{machine}/");
+    let refs = g.run(&["for-each-ref", "--format=%(refname)", &prefix])?;
+    let mut done = Vec::new();
+    let mut failure = None;
+    for r in refs.lines().filter(|r| r.starts_with(&prefix)) {
+        match g.run(&["push", "-q", remote, &format!(":{r}")]) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("does not exist") => {}
+            Err(e) => {
+                failure.get_or_insert(e);
+                continue;
+            }
+        }
+        g.run(&["update-ref", "-d", r])?;
+        done.push(r.to_string());
+    }
+    failure.map_or(Ok(done), Err)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Received {
     FastForwarded {
