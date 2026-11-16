@@ -138,6 +138,14 @@ impl Config {
         Some(base.join("gitsync/config.toml"))
     }
 
+    /// Local state directory: `$XDG_STATE_HOME/gitsync` or `~/.local/state/gitsync`.
+    pub fn state_dir() -> Option<PathBuf> {
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+        Some(base.join("gitsync"))
+    }
+
     /// `root.path` with a leading `~` expanded.
     pub fn root_path(&self) -> PathBuf {
         expand_home(&self.root.path)
