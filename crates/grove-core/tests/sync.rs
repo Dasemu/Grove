@@ -15,6 +15,7 @@ fn opts(machine: &str, stamp: &str) -> Options {
         remote: "origin".into(),
         offline: false,
         materialize: true,
+        push_snapshots: true,
     }
 }
 
@@ -167,4 +168,188 @@ fn staged_changes_block_adoption_so_the_index_is_never_reset() {
     let r = sync_repo(&db, &opts("B", "t3")).unwrap();
     assert_eq!(r.worktrees[0].state, State::BehindDirty);
     assert_eq!(gb.run(&["show", ":a.txt"]).unwrap(), "1\nstaged");
+}
+
+#[test]
+fn withheld_snapshots_are_neither_taken_nor_pushed_but_fast_forward_still_works() {
+    let base = tmpdir("nosnap");
+    let remote = base.join("r.git");
+    Git::new(&base)
+        .run(&[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ])
+        .unwrap();
+    let seed = init(&base.join("seed"));
+    seed.run(&["remote", "add", "origin", remote.to_str().unwrap()])
+        .unwrap();
+    commit(&seed, "a.txt", "1\n");
+    seed.run(&["push", "-q", "-u", "origin", "main"]).unwrap();
+    let (_g, d) = clone(&base, &remote, "A");
+    fs::write(d.join("a.txt"), "1\nsecret\n").unwrap();
+    let o = Options {
+        push_snapshots: false,
+        ..opts("A", "t1")
+    };
+    let r = sync_repo(&d, &o).unwrap();
+    assert_eq!(r.worktrees[0].snapshot, None);
+    let g = Git::new(&remote);
+    assert!(g.run(&["for-each-ref", "refs/sync/"]).unwrap().is_empty());
+    // Fast-forwarding keeps working.
+    commit(&seed, "b.txt", "2\n");
+    seed.run(&["push", "-q"]).unwrap();
+    fs::write(d.join("a.txt"), "1\n").unwrap();
+    let r = sync_repo(&d, &o).unwrap();
+    assert!(matches!(
+        r.worktrees[0].received,
+        Some(Received::FastForwarded { .. })
+    ));
+    assert!(d.join("b.txt").exists());
+}
+
+#[test]
+fn migrated_repo_with_linked_worktrees_syncs_only_what_it_can() {
+    use grove_core::migrate::migrate;
+    let base = tmpdir("synclinked");
+    let remote = base.join("r.git");
+    Git::new(&base)
+        .run(&[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ])
+        .unwrap();
+    let seed = init(&base.join("seed"));
+    seed.run(&["remote", "add", "origin", remote.to_str().unwrap()])
+        .unwrap();
+    commit(&seed, "a.txt", "1\n");
+    seed.run(&["push", "-q", "-u", "origin", "main"]).unwrap();
+    seed.run(&["push", "-q", "origin", "main:feat/out"])
+        .unwrap();
+    let (ga, da) = clone(&base, &remote, "A");
+    let nested = da.join(".claude/worktrees/wt1");
+    ga.run(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        nested.to_str().unwrap(),
+    ])
+    .unwrap();
+    let outside = base.join("A-feature");
+    ga.run(&[
+        "worktree",
+        "add",
+        "-q",
+        "--track",
+        "-b",
+        "feat/out",
+        outside.to_str().unwrap(),
+        "origin/feat/out",
+    ])
+    .unwrap();
+    migrate(&da, "A", &base.join("bk"), "1").unwrap();
+    let nested = da.join("main/.claude/worktrees/wt1");
+    fs::write(nested.join("a.txt"), "detached edit\n").unwrap();
+    fs::write(outside.join("a.txt"), "outside edit\n").unwrap();
+
+    let rep = sync_repo(&da, &opts("A", "t1")).unwrap();
+    let find = |p: &Path| {
+        rep.worktrees
+            .iter()
+            .find(|w| w.path == p.canonicalize().unwrap())
+            .unwrap_or_else(|| panic!("{} not reported: {:?}", p.display(), rep.worktrees))
+    };
+    // Detached: reported, never snapshotted.
+    let d = find(&nested);
+    assert_eq!((d.branch.clone(), d.snapshot), (None, None));
+    assert!(d.errors.is_empty(), "{:?}", d.errors);
+    assert_eq!(d.state, State::Dirty);
+    // Branch worktree elsewhere: synced under its own branch ref.
+    let o = find(&outside);
+    assert_eq!(o.snapshot, Some("created"));
+    assert!(o.errors.is_empty(), "{:?}", o.errors);
+    let bare = Git::new(da.join(".bare"));
+    assert!(bare.run(&["rev-parse", "refs/sync/A/feat/out"]).is_ok());
+    assert!(
+        bare.probe(&["rev-parse", "-q", "--verify", "refs/sync/A/HEAD"])
+            .unwrap()
+            .is_none()
+    );
+
+    // Gone upstream + clean: a worktree outside the layout is never archived or removed.
+    Git::new(&outside)
+        .run(&["checkout", "-q", "--", "."])
+        .unwrap();
+    seed.run(&["push", "-q", "origin", "--delete", "feat/out"])
+        .unwrap();
+    let rep = sync_repo(&da, &opts("A", "t2")).unwrap();
+    assert!(rep.archived.is_empty(), "{:?}", rep.archived);
+    assert!(outside.join("a.txt").exists());
+}
+
+#[test]
+fn purge_removes_remote_only_own_refs_and_nothing_else() {
+    use grove_core::receive::purge_own_snapshots;
+    let base = tmpdir("purge");
+    let remote = base.join("r.git");
+    Git::new(&base)
+        .run(&[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ])
+        .unwrap();
+    let seed = init(&base.join("seed"));
+    seed.run(&["remote", "add", "origin", remote.to_str().unwrap()])
+        .unwrap();
+    commit(&seed, "a.txt", "1\n");
+    seed.run(&["push", "-q", "-u", "origin", "main"]).unwrap();
+    // Own refs: one with a local copy, one only on the remote. Plus another machine's ref.
+    seed.run(&["push", "-q", "origin", "main:refs/sync/A/main"])
+        .unwrap();
+    seed.run(&["push", "-q", "origin", "main:refs/sync/A/feat/x"])
+        .unwrap();
+    seed.run(&["push", "-q", "origin", "main:refs/sync/B/main"])
+        .unwrap();
+    seed.run(&["update-ref", "refs/sync/A/main", "HEAD"])
+        .unwrap();
+    let done = purge_own_snapshots(seed.dir(), "A", "origin").unwrap();
+    assert_eq!(done, vec!["refs/sync/A/feat/x", "refs/sync/A/main"]);
+    let refs = Git::new(&remote)
+        .run(&["for-each-ref", "--format=%(refname)"])
+        .unwrap();
+    assert_eq!(refs, "refs/heads/main\nrefs/sync/B/main");
+    assert!(
+        seed.run(&["for-each-ref", "refs/sync/A/"])
+            .unwrap()
+            .is_empty()
+    );
+    // A remote that cannot be reached is a failure and keeps the local refs.
+    seed.run(&["update-ref", "refs/sync/A/main", "HEAD"])
+        .unwrap();
+    seed.run(&[
+        "remote",
+        "set-url",
+        "origin",
+        base.join("nope.git").to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(purge_own_snapshots(seed.dir(), "A", "origin").is_err());
+    assert!(
+        !seed
+            .run(&["for-each-ref", "refs/sync/A/"])
+            .unwrap()
+            .is_empty()
+    );
 }

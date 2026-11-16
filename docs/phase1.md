@@ -59,7 +59,7 @@ they may only contain letters, digits, `-` and `_`.
 
 - Real two-PC validation by the author (acceptance criterion of this phase).
 - Daemon, file watching, scheduling, IPC (Phase 2). Locking against concurrent user git commands.
-- Migration of repos with submodules or existing linked worktrees; `new` and provider code (Phase 4).
+- Migration of repos with submodules; `new` and provider code (Phase 4).
 - Resolve actions for `Diverged` (Phase 5): today it is only detected and left intact.
 
 ## Validation on the real Gitea (2026-11-16)
@@ -88,3 +88,32 @@ pass until that machine syncs again.
 `clone_bare_layout` created worktrees without upstream tracking, so `Diverged` and `Behind` were
 reported as `Synced` on repos cloned by grove itself. Fixed: every local branch with an `origin/<br>`
 counterpart gets `--set-upstream-to` before worktrees are materialized (asserted in `tests/registry.rs`).
+
+## Linked worktrees (`git worktree add`)
+
+`grove add` accepts repos that already have linked worktrees:
+
+- Linked worktrees nested inside the repo (e.g. `.claude/worktrees/<name>`, often detached) move with
+  the main checkout into `<repo>/<branch-dir>/...`. Ones outside the repo directory (e.g. a sibling
+  `Repo-feature` dir) stay where they are.
+- The two link files of each (`<wt>/.git` and `.bare/worktrees/<id>/gitdir`) are rewritten to the new
+  absolute paths; the result is verified (`git worktree list` shows every worktree, none prunable, and
+  HEAD/branch/`status --ignored` of each are identical to before).
+- Backup: the repo tar covers nested worktrees; each outside worktree gets its own tar
+  (`<repo>-<stamp>-linked<N>-<name>.tar`, listed in the report). Rollback also restores the link files.
+- Refused up front (nothing touched): a linked worktree that is locked, missing/prunable, has an
+  operation in progress (rebase/merge/cherry-pick/revert/bisect), uses relative `.git` links, or
+  contains the repo itself.
+- `grove add` prints each linked worktree with its branch or `detached`.
+
+Sync behaviour with worktrees that are not at `<repo>/<branch-dir>`:
+
+- Detached worktrees are reported but never snapshotted (a snapshot ref is per branch).
+- Branch worktrees elsewhere are synced like any other, under `refs/sync/<machine>/<branch>`.
+- `materialize` skips branches that already have a worktree anywhere; `archive_gone` only removes
+  worktrees directly under the repo dir, never ones elsewhere.
+- The daemon's discovery ignores linked worktrees (`.git` file pointing into `.../worktrees/<id>`), so
+  a sibling worktree is not synced as a second repo.
+- Known limit: a nested linked worktree is an embedded repo for the main worktree's snapshot, so it is
+  recorded as a gitlink (same limitation as nested untracked repos); its own content is not synced
+  through the main worktree's snapshot.

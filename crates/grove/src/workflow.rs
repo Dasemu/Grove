@@ -132,6 +132,7 @@ pub fn init(path: &Path, a: InitArgs, force: bool) -> Result<Config> {
             mirror_to: vec![],
             layout: Layout::BareWorktrees,
             auto_materialize: true,
+            snapshots: None,
             owners: Default::default(),
             public: None,
         }],

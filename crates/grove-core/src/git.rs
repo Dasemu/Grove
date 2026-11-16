@@ -63,7 +63,8 @@ impl Git {
 
     fn command<S: AsRef<OsStr>>(&self, args: &[S]) -> Command {
         let mut cmd = Command::new("git");
-        cmd.current_dir(&self.dir).args(args);
+        // Fixed locale: callers parse git's output and messages.
+        cmd.current_dir(&self.dir).args(args).env("LC_ALL", "C");
         for (k, v) in &self.envs {
             cmd.env(k, v);
         }

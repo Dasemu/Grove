@@ -25,6 +25,7 @@ user's branch or index.
 - Dependencies: serde+toml, clap+anyhow, notify+serde_json, ureq, keyring, age, slint (GUI, `winit` + software renderer) and ksni (tray), approved. Ask before adding more.
 - Everything in the repo is English. Open questions go to `docs/DECISIONS.md`.
 - Never destroy local work; divergence is surfaced, never auto-merged.
+- The daemon manages only bare-layout repos at `root/<group>/<repo>` and pushes WIP snapshots only to private repos by default (`sync.snapshots`, per-group override); see `docs/phase6.md`.
 
 ## Workflow quirks
 - Remote: Gitea `git.zenvairo.es`, owner `dasemu` (section `Darío`), CLI `tea`. SSH (port 22)
