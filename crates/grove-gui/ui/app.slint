@@ -16,6 +16,7 @@ export struct Repo {
     phase: string,
     last-sync: string,
     error: string,
+    withheld: string,
     wts: [Wt],
 }
 
@@ -24,6 +25,7 @@ export struct LogRow {
     kind: string,
     repo: string,
     msg: string,
+    tone: string,
 }
 
 export struct Kv {
@@ -176,6 +178,7 @@ export component MainWindow inherits Window {
     in property <int> wt-count;
     in property <int> attention-count;
     in property <[Repo]> repos;
+    in property <[string]> not-migrated;
     in property <[LogRow]> log;
     in property <[string]> groups;
     in property <[string]> providers;
@@ -355,6 +358,22 @@ export component MainWindow inherits Window {
                                 text: "Start it with `systemctl --user start groved` (or run `groved` in a terminal).";
                             }
                         }
+                        if !root.offline && root.not-migrated.length > 0: Card {
+                            Text {
+                                text: "Not migrated clones";
+                                font-weight: 700;
+                            }
+
+                            Muted {
+                                text: "These clones are in your workspace but not managed by grove yet: run `grove add` for each one to bring it into a group.";
+                            }
+
+                            for p in root.not-migrated: Muted {
+                                text: p;
+                                font-size: 12px;
+                                overflow: elide;
+                            }
+                        }
                         if !root.offline && root.loading: Muted {
                             text: "Loading…";
                         }
@@ -401,6 +420,13 @@ export component MainWindow inherits Window {
                                         Muted {
                                             text: r.path;
                                             font-size: 11px;
+                                        }
+
+                                        if r.withheld != "": Text {
+                                            text: "snapshots withheld: " + r.withheld;
+                                            color: #d98e1f;
+                                            font-size: 12px;
+                                            overflow: elide;
                                         }
 
                                         if r.error != "": Text {
@@ -496,6 +522,11 @@ export component MainWindow inherits Window {
                                 }
                             }
 
+                            if root.detail.withheld != "": Text {
+                                text: "snapshots withheld: " + root.detail.withheld;
+                                color: #d98e1f;
+                                wrap: word-wrap;
+                            }
                             if root.detail.error != "": Text {
                                 text: root.detail.error;
                                 color: #d9483b;
@@ -646,7 +677,7 @@ export component MainWindow inherits Window {
                                     Text {
                                         width: 90px;
                                         text: e.kind;
-                                        color: Tone.of(e.kind == "error" || e.kind == "watch_error" ? "error" : e.kind == "state" ? "warn" : "ok");
+                                        color: Tone.of(e.tone);
                                         font-size: 12px;
                                         font-weight: 700;
                                     }

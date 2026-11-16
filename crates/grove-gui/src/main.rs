@@ -199,6 +199,17 @@ fn render(ui: &MainWindow) {
         ui.set_wt_count(agg.worktrees as i32);
         ui.set_attention_count(agg.attention as i32);
         ui.set_has_config(snap.config.is_some());
+        let nm: Vec<SharedString> = snap
+            .status
+            .as_ref()
+            .and_then(|s| s["not_migrated"].as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| p.as_str().map(SharedString::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ui.set_not_migrated(ModelRc::from(Rc::new(VecModel::from(nm))));
 
         let empty = Vec::new();
         let repos: Vec<Repo> = snap
@@ -243,6 +254,7 @@ fn render(ui: &MainWindow) {
                     phase: s(r, "phase").into(),
                     last_sync: model::ago(r["last_sync"].as_u64().unwrap_or(0), now).into(),
                     error: r["last_error"].as_str().unwrap_or("").into(),
+                    withheld: r["snapshots_withheld"].as_str().unwrap_or("").into(),
                     path: path.into(),
                     wts: ModelRc::from(Rc::new(VecModel::from(wts))),
                 }
@@ -286,6 +298,7 @@ fn render(ui: &MainWindow) {
                     time: model::clock(e["ts"].as_u64().unwrap_or(0), off).into(),
                     kind: s(e, "kind").into(),
                     repo: e["repo"].as_str().unwrap_or("–").into(),
+                    tone: model::log_tone(&s(e, "kind")).into(),
                     msg: s(e, "msg").lines().next().unwrap_or("").into(),
                 })
                 .collect();
@@ -350,6 +363,11 @@ fn toast(ui: &MainWindow, msg: &str, bad: bool) {
 }
 
 fn show_window(ui: &MainWindow, core: &Core) {
+    // Slint exposes no xdg-activation, so an already visible window is raised by re-mapping it:
+    // a fresh toplevel is what the compositor focuses.
+    if core.visible.load(Ordering::SeqCst) && ui.window().is_visible() {
+        let _ = ui.hide();
+    }
     let _ = ui.show();
     // On Wayland a window shown from an idle (hidden) loop is not mapped until another event
     // arrives; a one-shot redraw request provides it.

@@ -112,6 +112,15 @@ pub fn aggregate(status: Option<&Value>) -> Aggregate {
     }
 }
 
+/// Colour key of an activity event kind.
+pub fn log_tone(kind: &str) -> &'static str {
+    match kind {
+        "error" | "watch_error" => "error",
+        "state" | "snapshots_withheld" | "snapshots_purged" | "declined" => "warn",
+        _ => "ok",
+    }
+}
+
 /// Last two path components, e.g. `work/api`.
 pub fn short(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
@@ -172,7 +181,7 @@ fn names(v: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// One line per group: routes (private + public), owners and layout.
+/// One line per group: routes (private + public), snapshot policy, owners and layout.
 pub fn group_summary(g: &Value) -> String {
     let mut s = format!("primary {}", str_of(g, "primary"));
     let mirrors = names(g.get("mirror_to"));
@@ -185,6 +194,9 @@ pub fn group_summary(g: &Value) -> String {
         if !pm.is_empty() {
             s += &format!(" → {}", pm.join(", "));
         }
+    }
+    if let Some(p) = g.get("snapshots").and_then(Value::as_str) {
+        s += &format!(" · snapshots: {p}");
     }
     if let Some(o) = g
         .get("owners")
@@ -230,6 +242,13 @@ pub fn settings_sections(cfg: &Value) -> Vec<Section> {
         (
             "Largest synced file".into(),
             format!("{} MiB", num("max_file_mb", 50)),
+        ),
+        (
+            "Snapshots (default)".into(),
+            sync.and_then(|s| s.get("snapshots"))
+                .and_then(Value::as_str)
+                .unwrap_or("private-only")
+                .to_string(),
         ),
     ];
     let providers = cfg
@@ -362,6 +381,14 @@ mod tests {
     }
 
     #[test]
+    fn log_tones() {
+        assert_eq!(log_tone("snapshots_withheld"), "warn");
+        assert_eq!(log_tone("snapshots_purged"), "warn");
+        assert_eq!(log_tone("snapshots_enabled"), "ok");
+        assert_eq!(log_tone("watch_error"), "error");
+    }
+
+    #[test]
     fn formatting() {
         assert_eq!(short("/home/u/Workspace/work/api"), "work/api");
         assert_eq!(short("api"), "api");
@@ -383,18 +410,23 @@ mod tests {
             "providers": {"gitea": {"kind": "gitea", "url": "https://g.example"}, "gh": {"kind": "github"}},
             "groups": [{"name": "work", "primary": "gitea", "mirror_to": ["gh"],
                         "owners": {"gitea": "Org", "gh": "org-gh"},
+                        "snapshots": "none",
                         "public": {"primary": "gh", "mirror_to": ["gitea"]}}],
             "config_repo": {"name": "grove-config", "provider": "gitea"}
         });
         let s = settings_sections(&cfg);
         assert_eq!(s[0].1[0], ("Name".into(), "pca".into()));
         assert_eq!(s[0].1[2].1, "60 s");
+        assert_eq!(
+            s[0].1[4],
+            ("Snapshots (default)".into(), "private-only".into())
+        );
         // Providers come out sorted by id.
         assert_eq!(s[1].1[0].1, "github");
         assert_eq!(s[1].1[1].1, "gitea · https://g.example");
         assert_eq!(
             s[2].1[0].1,
-            "primary gitea · mirrors: gh · public: gh → gitea · owners: gh=org-gh, gitea=Org · bare-worktrees"
+            "primary gitea · mirrors: gh · public: gh → gitea · snapshots: none · owners: gh=org-gh, gitea=Org · bare-worktrees"
         );
         assert_eq!(s[3].1[0].1, "grove-config on gitea");
         assert_eq!(group_name("work → gitea"), "work");
