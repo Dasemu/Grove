@@ -11,17 +11,21 @@ is `grove_core::sync::sync_repo`, the same code the CLI runs. The daemon only de
   `.grove-stage` and anything matching `sync.ignore_extra` (exact component name or `*suffix`) are
   ignored. If a watch cannot be set (typically `ENOSPC`, raise `fs.inotify.max_user_watches`) it is
   logged and the periodic pass still covers that repo.
-- **Debounce**: each event pushes the repo's next pass to `now + snapshot_debounce_ms`.
+- **Debounce**: each event pushes the repo's next pass to `now + snapshot_debounce_ms`, but never
+  later than `max(10 x debounce, 5 s)` after the first unsynced event, so a constantly written file
+  cannot starve snapshots.
 - **Periodic pass**: every `fetch_interval_s` all repos get a full pass (fetch, receive, apply
   snapshots, materialize/archive). Also what catches missed events.
 - **One worker thread**: passes never overlap. Events that arrive during a pass queue another pass;
   it finds nothing to do and ends the chain.
 - **Failures** (network, auth, git errors) back off exponentially per repo: 10 s, 20 s, ... capped at
-  5 min, and are logged as `error`. `sync` over IPC clears the backoff.
+  5 min, and are logged as `error`. `sync` over IPC clears the backoff. While backing off, changes
+  are still snapshotted locally (an offline pass); only the network is retried after the backoff.
 - **Locks**: grove never takes the user's index (snapshots use a temp index) so git's own locks are
   not contended; a git command that fails because the user holds a lock is just a failed pass that
   is retried.
-- **Pause**: `pause` stops all passes (events keep accumulating); `resume` runs a full pass.
+- **Pause**: `pause` stops all passes (events keep accumulating, the loop idles at 1 s ticks);
+  `resume` runs a full pass.
 - **Crash safety**: nothing durable lives in the daemon. Killing it at any point leaves the working
   tree and index untouched; the next start rediscovers and resyncs (covered by a kill -9 test).
   There is no signal handler: SIGTERM ends the process, which is safe for the same reason.
@@ -73,15 +77,25 @@ journalctl --user -u groved -f
 
 Socket activation was considered and not done: the daemon must run anyway to watch files.
 
+## Latency
+
+Measured on the real Gitea with default settings (2 s debounce, 60 s fetch): an edit on A showed up on
+B after 58 s, and a commit pushed on A left B clean at the new commit after 60 s. Worst case is
+`debounce + fetch_interval_s + pass time`; lower `fetch_interval_s` for faster convergence.
+
 ## Found by the daemon tests
 
 A worktree that had another machine's snapshot applied stayed `BehindDirty` forever once the author
 committed and pushed that work. `receive` now adopts the upstream commit with a mixed reset when the
 worktree's content is byte-identical to the upstream tree (`receive::adopt_if_identical`); any
-other dirty worktree is still left alone.
+other dirty worktree is still left alone, including one with staged changes (the reset would
+discard the staged version).
 
 ## Not done
 
+- `Daemon::shutdown` finishes the queued passes first, and idle client connections are not joined.
+  `groved` never calls it (no signal handler), so this only matters for tests and embedding.
+- Peer-credential check on the socket: access control is the 0700 directory only.
 - GUI/tray (Phase 3), providers and wizards (Phase 4).
 - Remote-change notifications (webhooks); only polling at `fetch_interval_s`.
 - Config reload: restart the daemon after editing `config.toml`.

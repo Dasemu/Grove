@@ -119,6 +119,10 @@ fn adopt_if_identical(
     stamp: &str,
     st: State,
 ) -> Result<Received, GitError> {
+    // Anything staged (partial `add -p`, intent-to-add) would be lost by the index reset: skip.
+    if g.probe(&["diff", "--cached", "--quiet"])?.is_none() {
+        return Ok(Received::Skipped(st));
+    }
     let worktree_tree = crate::snapshot::worktree_tree(g.dir())?;
     let upstream_tree = g.run(&["rev-parse", "@{upstream}^{tree}"])?;
     if worktree_tree != upstream_tree {

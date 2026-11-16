@@ -233,6 +233,7 @@ impl Watch {
 fn rescan(root: &Path, watch: &mut Watch, ctx: &Ctx) -> Vec<PathBuf> {
     let found = discover(root);
     let mut shared = ctx.shared.lock().unwrap();
+    shared.repos.retain(|p, _| found.contains(p));
     for r in &found {
         shared.repos.entry(r.clone()).or_default();
     }
@@ -254,6 +255,10 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
     // due_at: when a repo should next be synced; backoff_until: earliest retry after failures.
     let mut due_at: HashMap<PathBuf, Instant> = HashMap::new();
     let mut backoff_until: HashMap<PathBuf, Instant> = HashMap::new();
+    // first_at: first unsynced event of a repo, so a constant stream of events cannot postpone
+    // its snapshot beyond `max_wait`.
+    let mut first_at: HashMap<PathBuf, Instant> = HashMap::new();
+    let max_wait = (debounce * 10).max(Duration::from_secs(5));
     let mut next_full = Instant::now();
 
     loop {
@@ -264,12 +269,20 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
             .chain([next_full])
             .min()
             .unwrap_or(next_full);
-        let timeout = wake
+        let mut timeout = wake
             .saturating_duration_since(now)
             .min(Duration::from_secs(1));
+        if ctx.shared.lock().unwrap().paused {
+            // Nothing is due while paused: only wait for commands, never spin on past deadlines.
+            timeout = Duration::from_secs(1);
+        }
         match rx.recv_timeout(timeout) {
             Ok(Msg::Changed(r)) => {
-                let at = Instant::now() + debounce;
+                let now = Instant::now();
+                let first = *first_at.entry(r.clone()).or_insert(now);
+                let at = (now + debounce).min(first + max_wait);
+                // An earlier deadline (e.g. an immediate `sync`) is never pushed back.
+                let at = due_at.get(&r).map_or(at, |old| at.min(*old));
                 due_at.insert(r.clone(), at);
                 if let Some(s) = ctx.shared.lock().unwrap().repos.get_mut(&r)
                     && s.phase == "idle"
@@ -293,7 +306,9 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
         }
         let now = Instant::now();
         if now >= next_full {
-            for r in rescan(&root, &mut watch, &ctx) {
+            let found = rescan(&root, &mut watch, &ctx);
+            due_at.retain(|r, _| found.contains(r));
+            for r in found {
                 due_at.insert(r, now);
             }
             next_full = now + fetch_every;
@@ -305,12 +320,19 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
             .collect();
         due.sort();
         for r in due {
-            if let Some(until) = backoff_until.get(&r).filter(|u| **u > now) {
-                due_at.insert(r, *until);
+            if !ctx.shared.lock().unwrap().repos.contains_key(&r) {
+                due_at.remove(&r);
                 continue;
             }
             due_at.remove(&r);
-            let failures = pass(&r, &cfg, &st, materialize, &ctx);
+            first_at.remove(&r);
+            // While backing off after a failure, still snapshot local work (no network needed);
+            // the network is retried at the first pass after the backoff expires.
+            let offline = backoff_until.get(&r).is_some_and(|u| *u > now);
+            let failures = pass(&r, &cfg, &st, materialize, offline, &ctx);
+            if offline {
+                continue;
+            }
             if failures == 0 {
                 backoff_until.remove(&r);
             } else {
@@ -327,14 +349,21 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
 }
 
 /// One sync pass for `repo`; returns the number of consecutive failures (0 = success).
-fn pass(repo: &Path, cfg: &Config, st: &Settings, materialize: bool, ctx: &Ctx) -> u32 {
+fn pass(
+    repo: &Path,
+    cfg: &Config,
+    st: &Settings,
+    materialize: bool,
+    offline: bool,
+    ctx: &Ctx,
+) -> u32 {
     let name = repo.display().to_string();
     set_phase(ctx, repo, "syncing");
     let opts = Options {
         machine: cfg.machine.name.clone(),
         stamp: stamp(),
         remote: st.remote.clone(),
-        offline: false,
+        offline,
         materialize,
     };
     let result = sync_repo(repo, &opts);
@@ -394,7 +423,13 @@ fn pass(repo: &Path, cfg: &Config, st: &Settings, materialize: bool, ctx: &Ctx) 
             }
         }
     }
-    if errors.is_empty() {
+    if offline {
+        // A snapshot-only pass during backoff changes neither the failure count nor the phase.
+        status.phase = if status.failures > 0 { "error" } else { "idle" };
+        if !errors.is_empty() {
+            ctx.activity.log("error", Some(&name), errors.join("; "));
+        }
+    } else if errors.is_empty() {
         status.phase = "idle";
         status.failures = 0;
         status.last_error = None;

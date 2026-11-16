@@ -307,3 +307,65 @@ fn work_in_progress_then_committed_on_a_leaves_b_clean() {
     a.shutdown();
     b.shutdown();
 }
+
+fn cpu_ticks(pid: u32) -> u64 {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let rest = stat.rsplit_once(')').unwrap().1;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap() // utime + stime
+}
+
+#[test]
+fn paused_daemon_does_not_spin() {
+    let w = world("spin", &["pca"]);
+    let cfg_path = w.base.join("config.toml");
+    fs::write(
+        &cfg_path,
+        format!(
+            "[machine]\nname = \"pca\"\n[root]\npath = \"{}\"\n[sync]\nsnapshot_debounce_ms = 50\nfetch_interval_s = 1\n",
+            w.base.join("pca").display()
+        ),
+    )
+    .unwrap();
+    let runtime = w.base.join("run");
+    fs::create_dir_all(&runtime).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_groved"))
+        .arg("--config")
+        .arg(&cfg_path)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", w.base.join("state"))
+        .spawn()
+        .unwrap();
+    let sock = runtime.join("grove/grove.sock");
+    wait_until("daemon up", 10, || {
+        ipc::request(&sock, &json!({"v":1,"cmd":"ping"})).is_ok()
+    });
+    ipc::request(&sock, &json!({"v":1,"cmd":"pause"})).unwrap();
+    std::thread::sleep(Duration::from_millis(1500)); // let any in-flight pass finish
+    let before = cpu_ticks(child.id());
+    std::thread::sleep(Duration::from_secs(3)); // well past several fetch intervals
+    let used = cpu_ticks(child.id()) - before;
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(used < 30, "paused daemon burned {used} ticks of CPU in 3 s");
+}
+
+#[test]
+fn sync_accepts_a_non_canonical_repo_path_and_unknown_repos_are_rejected() {
+    let w = world("path", &["pca"]);
+    let st = settings(&w, "pca");
+    let sock = st.socket.clone();
+    let d = Daemon::start(config(&w, "pca", 200, 60), st).unwrap();
+    let repo = w.base.join("pca/repo");
+    wait_until("repo listed", 10, || {
+        ipc::request(&sock, &json!({"v":1,"cmd":"status"})).unwrap()["data"]["repos"]
+            .as_array()
+            .is_some_and(|r| r.len() == 1)
+    });
+    let odd = format!("{}/../repo/.", repo.display());
+    let ok = ipc::request(&sock, &json!({"v":1,"cmd":"sync","repo":odd})).unwrap();
+    assert_eq!(ok["ok"], true, "{ok}");
+    let bad = ipc::request(&sock, &json!({"v":1,"cmd":"sync","repo":"/nonexistent"})).unwrap();
+    assert_eq!(bad["ok"], false);
+    d.shutdown();
+}

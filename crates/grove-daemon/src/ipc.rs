@@ -49,6 +49,8 @@ pub fn serve(socket: &Path, ctx: Ctx, stop: Arc<AtomicBool>) -> std::io::Result<
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
+        // The mode above only applies to a directory we create: enforce it on an existing one.
+        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
     }
     if socket.exists() {
         if UnixStream::connect(socket).is_ok() {
@@ -187,11 +189,21 @@ fn handle(req: &Request, ctx: &Ctx) -> Value {
         }
         "sync" => {
             let target = req.repo.as_ref().map(PathBuf::from);
-            if let Some(t) = &target
-                && !ctx.shared.lock().unwrap().repos.contains_key(t)
-            {
-                return err("unknown repo");
-            }
+            // Match by canonical path so `.`, relative and symlinked paths work.
+            let target = match target {
+                None => None,
+                Some(t) => {
+                    let want = std::fs::canonicalize(&t).unwrap_or(t);
+                    let shared = ctx.shared.lock().unwrap();
+                    let found = shared.repos.keys().find(|k| {
+                        std::fs::canonicalize(k).unwrap_or_else(|_| (*k).clone()) == want
+                    });
+                    match found {
+                        Some(k) => Some(k.clone()),
+                        None => return err("unknown repo"),
+                    }
+                }
+            };
             let _ = ctx.tx.send(Msg::SyncNow(target));
             ok(json!("queued"))
         }

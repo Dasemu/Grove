@@ -131,3 +131,40 @@ fn unreachable_remote_is_reported_but_local_snapshot_still_taken() {
     assert!(!r.worktrees[0].errors.is_empty(), "push failure surfaced");
     assert_eq!(r.worktrees[0].state, State::Dirty);
 }
+
+#[test]
+fn staged_changes_block_adoption_so_the_index_is_never_reset() {
+    let base = tmpdir("staged");
+    let remote = base.join("r.git");
+    Git::new(&base)
+        .run(&[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ])
+        .unwrap();
+    let seed = init(&base.join("seed"));
+    seed.run(&["remote", "add", "origin", remote.to_str().unwrap()])
+        .unwrap();
+    commit(&seed, "a.txt", "1\n");
+    seed.run(&["push", "-q", "-u", "origin", "main"]).unwrap();
+    let (ga, da) = clone(&base, &remote, "A");
+    let (_gb, db) = clone(&base, &remote, "B");
+    fs::write(da.join("a.txt"), "1\nwork\n").unwrap();
+    sync_repo(&da, &opts("A", "t1")).unwrap();
+    sync_repo(&db, &opts("B", "t2")).unwrap();
+    // B stages an intermediate version, then its worktree matches what A will commit.
+    let gb = Git::new(&db);
+    fs::write(db.join("a.txt"), "1\nstaged\n").unwrap();
+    gb.run(&["add", "a.txt"]).unwrap();
+    fs::write(db.join("a.txt"), "1\nwork\n").unwrap();
+    ga.run(&["add", "-A"]).unwrap();
+    ga.run(&["commit", "-qm", "work"]).unwrap();
+    ga.run(&["push", "-q"]).unwrap();
+    let r = sync_repo(&db, &opts("B", "t3")).unwrap();
+    assert_eq!(r.worktrees[0].state, State::BehindDirty);
+    assert_eq!(gb.run(&["show", ":a.txt"]).unwrap(), "1\nstaged");
+}
