@@ -212,6 +212,15 @@ fn daemon(action: &DaemonCmd) -> Result<()> {
                 if let Some(e) = r["last_error"].as_str() {
                     println!("    error: {e}");
                 }
+                if let Some(why) = r["snapshots_withheld"].as_str() {
+                    println!("    snapshots withheld: {why}");
+                }
+            }
+            for p in d["not_migrated"].as_array().into_iter().flatten() {
+                println!(
+                    "{}  [ignored] not migrated (run grove add)",
+                    p.as_str().unwrap_or("?")
+                );
             }
         }
         DaemonCmd::Pause => {
@@ -319,6 +328,7 @@ fn main() -> Result<()> {
                     remote: "origin".into(),
                     offline: *offline,
                     materialize: true,
+                    push_snapshots: true,
                 },
             )?;
             print_report(&rep)
@@ -532,6 +542,16 @@ fn doctor(cfg_arg: &Option<PathBuf>) -> Result<()> {
                 Ok((_, src)) => line(Some(true), format!("provider {id:?}: token from {src:?}")),
                 Err(e) => line(None, format!("provider {id:?}: {e}")),
             }
+        }
+        let names: Vec<String> = c.groups.iter().map(|g| g.name.clone()).collect();
+        for p in grove_daemon::discover::discover(&root, &names).not_migrated {
+            line(
+                None,
+                format!(
+                    "{}: not migrated (run grove add); the daemon ignores it",
+                    p.display()
+                ),
+            );
         }
         for g in &c.groups {
             let gdir = root.join(&g.name);

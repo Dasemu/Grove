@@ -6,6 +6,7 @@ pub mod activity;
 pub mod daemon;
 pub mod discover;
 pub mod ipc;
+pub mod visibility;
 
 pub use activity::{Activity, Event};
 pub use daemon::{Daemon, Settings};

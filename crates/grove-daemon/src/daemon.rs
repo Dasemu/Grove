@@ -3,8 +3,9 @@
 //! so passes never overlap.
 
 use crate::activity::{Activity, now_secs};
-use crate::discover::discover;
+use crate::discover::{discover, group_of};
 use crate::ipc;
+use crate::visibility::{Visibility, forge_fetch, snapshot_gate};
 use grove_core::config::Config;
 use grove_core::receive::Received;
 use grove_core::sync::{Options, sync_repo};
@@ -24,6 +25,8 @@ pub struct Settings {
     pub socket: PathBuf,
     pub activity_log: Option<PathBuf>,
     pub remote: String,
+    /// Where forge visibility answers are cached (`None` = in memory only).
+    pub visibility_cache: Option<PathBuf>,
 }
 
 impl Settings {
@@ -34,6 +37,7 @@ impl Settings {
             socket: ipc::default_socket_path(),
             activity_log: Some(state.join("activity.jsonl")),
             remote: "origin".into(),
+            visibility_cache: Some(state.join("visibility.json")),
         }
     }
 }
@@ -53,6 +57,8 @@ pub struct RepoStatus {
     pub last_error: Option<String>,
     pub worktrees: Vec<WtStatus>,
     pub failures: u32,
+    /// Why WIP snapshots are not pushed for this repo (`None` = they are).
+    pub snapshots_withheld: Option<String>,
 }
 
 impl Default for RepoStatus {
@@ -63,6 +69,7 @@ impl Default for RepoStatus {
             last_error: None,
             worktrees: Vec::new(),
             failures: 0,
+            snapshots_withheld: None,
         }
     }
 }
@@ -71,6 +78,8 @@ impl Default for RepoStatus {
 pub struct Shared {
     pub paused: bool,
     pub repos: BTreeMap<PathBuf, RepoStatus>,
+    /// Plain clones in configured groups: ignored until migrated with `grove add`.
+    pub not_migrated: Vec<PathBuf>,
 }
 
 pub enum Msg {
@@ -231,9 +240,11 @@ impl Watch {
     }
 }
 
-fn rescan(root: &Path, watch: &mut Watch, ctx: &Ctx) -> Vec<PathBuf> {
-    let found = discover(root);
+fn rescan(root: &Path, groups: &[String], watch: &mut Watch, ctx: &Ctx) -> Vec<PathBuf> {
+    let d = discover(root, groups);
+    let found = d.managed;
     let mut shared = ctx.shared.lock().unwrap();
+    shared.not_migrated = d.not_migrated;
     shared.repos.retain(|p, _| found.contains(p));
     for r in &found {
         shared.repos.entry(r.clone()).or_default();
@@ -249,9 +260,10 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
     let debounce = Duration::from_millis(cfg.sync.snapshot_debounce_ms);
     let fetch_every = Duration::from_secs(cfg.sync.fetch_interval_s.max(1));
     let root = cfg.root_path();
+    let groups: Vec<String> = cfg.groups.iter().map(|g| g.name.clone()).collect();
+    let mut visibility = Visibility::load(st.visibility_cache.clone());
     let mut watch = make_watch(ctx.tx.clone(), cfg.sync.ignore_extra.clone(), &ctx);
-    rescan(&root, &mut watch, &ctx);
-    let materialize = cfg.groups.iter().all(|g| g.auto_materialize);
+    rescan(&root, &groups, &mut watch, &ctx);
 
     // due_at: when a repo should next be synced; backoff_until: earliest retry after failures.
     let mut due_at: HashMap<PathBuf, Instant> = HashMap::new();
@@ -307,7 +319,7 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
         }
         let now = Instant::now();
         if now >= next_full {
-            let found = rescan(&root, &mut watch, &ctx);
+            let found = rescan(&root, &groups, &mut watch, &ctx);
             due_at.retain(|r, _| found.contains(r));
             for r in found {
                 due_at.insert(r, now);
@@ -330,7 +342,7 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
             // While backing off after a failure, still snapshot local work (no network needed);
             // the network is retried at the first pass after the backoff expires.
             let offline = backoff_until.get(&r).is_some_and(|u| *u > now);
-            let failures = pass(&r, &cfg, &st, materialize, offline, &ctx);
+            let failures = pass(&r, &cfg, &st, &mut visibility, offline, &ctx);
             if offline {
                 continue;
             }
@@ -354,18 +366,36 @@ fn pass(
     repo: &Path,
     cfg: &Config,
     st: &Settings,
-    materialize: bool,
+    visibility: &mut Visibility,
     offline: bool,
     ctx: &Ctx,
 ) -> u32 {
     let name = repo.display().to_string();
     set_phase(ctx, repo, "syncing");
+    let group = group_of(repo).unwrap_or_default();
+    // `auto_materialize` is per group; a repo whose group is gone from the config keeps the default.
+    let materialize = cfg
+        .groups
+        .iter()
+        .find(|g| g.name == group)
+        .is_none_or(|g| g.auto_materialize);
+    // No lookup needed offline: nothing is pushed in such a pass anyway.
+    let gate = if offline {
+        Ok(())
+    } else {
+        snapshot_gate(cfg, repo, &st.remote, visibility, now_secs(), &forge_fetch)
+    };
+    let push_snapshots = gate.is_ok();
+    if !offline {
+        note_snapshot_gate(ctx, repo, &name, gate.err());
+    }
     let opts = Options {
         machine: cfg.machine.name.clone(),
         stamp: stamp(),
         remote: st.remote.clone(),
         offline,
         materialize,
+        push_snapshots,
     };
     let result = sync_repo(repo, &opts);
     let mut shared = ctx.shared.lock().unwrap();
@@ -449,6 +479,26 @@ fn pass(
         ctx.activity.log("error", Some(&name), errors.join("; "));
     }
     status.failures
+}
+
+/// Records why snapshots are withheld (or that they are pushed again), logging only changes.
+fn note_snapshot_gate(ctx: &Ctx, repo: &Path, name: &str, withheld: Option<String>) {
+    let mut shared = ctx.shared.lock().unwrap();
+    let status = shared.repos.entry(repo.to_path_buf()).or_default();
+    if status.snapshots_withheld == withheld {
+        return;
+    }
+    match &withheld {
+        Some(why) => ctx.activity.log(
+            "snapshots_withheld",
+            Some(name),
+            format!("WIP snapshots not pushed: {why}"),
+        ),
+        None => ctx
+            .activity
+            .log("snapshots_enabled", Some(name), "WIP snapshots are pushed"),
+    }
+    status.snapshots_withheld = withheld;
 }
 
 fn set_phase(ctx: &Ctx, repo: &Path, phase: &'static str) {
