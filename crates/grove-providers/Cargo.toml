@@ -1,0 +1,13 @@
+[package]
+name = "grove-providers"
+description = "Forge providers (Gitea/Forgejo, GitHub) and token storage for grove"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+grove-core = { version = "0.1.0", path = "../grove-core" }
+keyring = "4.2.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = { version = "3", features = ["json"] }
