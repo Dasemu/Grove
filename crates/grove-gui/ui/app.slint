@@ -1,4 +1,4 @@
-import { Button, CheckBox, ComboBox, LineEdit, Palette, ScrollView } from "std-widgets.slint";
+import { AboutSlint, Button, CheckBox, ComboBox, LineEdit, Palette, ScrollView } from "std-widgets.slint";
 
 export struct Wt {
     branch: string,
@@ -183,6 +183,7 @@ export component MainWindow inherits Window {
     in property <string> pill-text: "Connecting…";
     in property <string> pill-key: "muted";
     in property <string> machine;
+    in property <string> version;
     in property <int> repo-count;
     in property <int> wt-count;
     in property <int> attention-count;
@@ -301,6 +302,14 @@ export component MainWindow inherits Window {
                     active: root.view == "settings";
                     clicked => {
                         root.go("settings");
+                    }
+                }
+
+                NavItem {
+                    text: "About";
+                    active: root.view == "about";
+                    clicked => {
+                        root.go("about");
                     }
                 }
 
@@ -904,6 +913,43 @@ export component MainWindow inherits Window {
                             }
                             Term {
                                 out: root.import-out;
+                            }
+                        }
+                    }
+
+                    // ---------- about ----------
+                    // Showing AboutSlint here is the attribution required by the Slint
+                    // Royalty-free licence (see README, "Licence").
+                    if root.view == "about": VerticalLayout {
+                        spacing: 12px;
+                        alignment: start;
+                        H1 {
+                            title: "About Grove";
+                            sub: "Keeps your git repositories in sync across machines, including work in progress.";
+                        }
+
+                        Card {
+                            Text {
+                                text: "Grove " + root.version;
+                                font-size: 16px;
+                                font-weight: 700;
+                            }
+
+                            Muted {
+                                text: "Grove is released under the MIT licence.";
+                                wrap: word-wrap;
+                            }
+
+                            Muted {
+                                text: "Its user interface is built with Slint, used under the Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0.";
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            alignment: start;
+                            AboutSlint {
+                                max-width: 420px;
                             }
                         }
                     }

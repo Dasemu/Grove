@@ -60,8 +60,10 @@ X11 loaded at runtime) and the software renderer.
 ## Dependencies
 
 - `slint` / `slint-build` 1.18.1 (`std`, `backend-winit`, `renderer-software`, `compat-1-2`; no Qt,
-  no femtovg, no system-tray feature). Style `fluent` (pure Slint). Slint is licensed GPL-3.0 or its
-  royalty-free license (attribution required) or a commercial one; pick one before distributing.
+  no femtovg, no system-tray feature). Style `fluent` (pure Slint). Slint is used under its
+  Royalty-free Desktop, Mobile, and Web Applications License 2.0, so Grove stays MIT. Its attribution
+  requirement is met by the `AboutSlint` widget on the About view (reachable from the sidebar); keep
+  that view if the UI is reorganised.
 - `ksni` 0.3.7 (`async-io` + `blocking`, no tokio).
 
 ## Memory (release build, KDE Plasma 6 / Wayland, `ps -o rss`)
