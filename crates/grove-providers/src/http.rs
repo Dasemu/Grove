@@ -85,9 +85,15 @@ impl Http {
     /// Every item of a paginated list endpoint (`path` may already carry a query string).
     ///
     /// A short page is not the end (a server may cap the page size below what was asked). It
-    /// ends on `X-Total-Count` being reached, on a `Link` header without `rel="next"`, or on an
-    /// empty or repeated page.
-    pub fn pages(&self, path: &str, per_page: usize, size_param: &str) -> Result<Vec<Value>> {
+    /// ends on `X-Total-Count` being reached, on a `Link` header without `rel="next"` (also when
+    /// absent, for `link_style` servers such as GitHub), or on an empty or repeated page.
+    pub fn pages(
+        &self,
+        path: &str,
+        per_page: usize,
+        size_param: &str,
+        link_style: bool,
+    ) -> Result<Vec<Value>> {
         let sep = if path.contains('?') { '&' } else { '?' };
         let mut out: Vec<Value> = Vec::new();
         let mut prev: Option<Vec<Value>> = None;
@@ -103,12 +109,12 @@ impl Http {
                 break;
             }
             out.extend(items.iter().cloned());
-            if hints.total.is_some_and(|t| out.len() >= t)
-                || hints
-                    .link
-                    .as_deref()
-                    .is_some_and(|l| !l.contains("rel=\"next\""))
-            {
+            // GitHub style: no `Link: rel="next"` means this was the last page.
+            let no_next = hints
+                .link
+                .as_deref()
+                .map_or(link_style, |l| !l.contains("rel=\"next\""));
+            if hints.total.is_some_and(|t| out.len() >= t) || no_next {
                 break;
             }
             prev = Some(items);

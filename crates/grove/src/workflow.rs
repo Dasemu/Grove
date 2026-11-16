@@ -6,7 +6,9 @@ use grove_core::config::{
 };
 use grove_core::git::Git;
 use grove_core::registry::{Entry, Registry, clone_bare_layout, init_bare_layout, push_initial};
-use grove_providers::{MirrorSpec, NewRepo, Provider, PullMirrorSpec, RemoteRepo, build, token};
+use grove_providers::{
+    MirrorSpec, NewRepo, Provider, PullMirrorSpec, RemoteRepo, build, token, url,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +20,29 @@ pub struct Forge {
     /// Git environment that authenticates HTTPS operations with the stored token.
     pub git_env: Vec<(String, String)>,
     pub protocol: Protocol,
+    pub cfg: ProviderCfg,
+}
+
+impl Forge {
+    /// The URL local git uses for `r` with this provider's protocol. The repo name must be a
+    /// plain directory name and both URLs the forge reports must be https/ssh URLs on the
+    /// provider's own host: credentials never go anywhere else.
+    pub fn clone_url(&self, r: &RemoteRepo) -> Result<String> {
+        let host = url::provider_host(&self.cfg);
+        url::check_repo_name(&r.name)?;
+        for u in [&r.clone_url, &r.ssh_url] {
+            if !u.is_empty() {
+                url::check_git_url(u, &host)?;
+            }
+        }
+        Ok(r.git_url(self.protocol)?.to_string())
+    }
+
+    /// The canonical https URL stored in the registry for `r`.
+    pub fn registry_url(&self, r: &RemoteRepo) -> Result<String> {
+        url::canonical_https(&self.cfg, &r.clone_url)
+            .with_context(|| format!("no canonical URL for {}/{}", r.owner, r.name))
+    }
 }
 
 pub fn connect(cfg: &Config, id: &str) -> Result<Forge> {
@@ -63,6 +88,7 @@ pub fn connect(cfg: &Config, id: &str) -> Result<Forge> {
         token: tok,
         git_env,
         protocol: pc.protocol,
+        cfg: pc.clone(),
     })
 }
 
@@ -204,7 +230,8 @@ pub fn new_repo(cfg: &Config, group_name: &str, name: &str, private: bool) -> Re
         "created {}/{} on {}",
         remote.owner, remote.name, route.primary
     );
-    let local_url = remote.git_url(primary.protocol)?.to_string();
+    let local_url = primary.clone_url(&remote)?;
+    let registry_url = primary.registry_url(&remote)?;
     let wt = init_bare_layout(&dir, &local_url)?;
     push_initial(&dir, &primary.git_env)?;
     println!("pushed initial commit; worktree {}", wt.display());
@@ -220,7 +247,7 @@ pub fn new_repo(cfg: &Config, group_name: &str, name: &str, private: bool) -> Re
         &Entry {
             group: grp.name.clone(),
             name: name.into(),
-            url: local_url,
+            url: registry_url,
         },
     )?;
     Ok(wt)
@@ -300,10 +327,12 @@ fn remote_key(url: &str) -> Option<String> {
     Some(format!("{host}/{owner}/{name}").to_lowercase())
 }
 
-/// What is already in a group directory: bare-layout repos by lowercase directory name and by
-/// the owner/name their `origin` points to.
+/// What is already in a group directory: anything non-empty by lowercase directory name, plain
+/// (not yet migrated) clones among them, and the owner/name the `origin` of bare-layout repos
+/// points to.
 struct Local {
     names: std::collections::HashSet<String>,
+    plain: std::collections::HashSet<String>,
     origins: std::collections::HashSet<String>,
 }
 
@@ -311,16 +340,26 @@ impl Local {
     fn scan(gdir: &Path) -> Local {
         let mut l = Local {
             names: Default::default(),
+            plain: Default::default(),
             origins: Default::default(),
         };
         let Ok(rd) = fs::read_dir(gdir) else { return l };
         for e in rd.filter_map(Result::ok) {
-            let bare = e.path().join(".bare");
-            if !bare.exists() {
+            let p = e.path();
+            // An empty directory is free to import into; anything else is somebody's files.
+            let non_empty = fs::read_dir(&p).is_ok_and(|mut d| d.next().is_some());
+            if !non_empty {
                 continue;
             }
-            l.names
-                .insert(e.file_name().to_string_lossy().to_lowercase());
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            l.names.insert(name.clone());
+            let bare = p.join(".bare");
+            if !bare.exists() {
+                if p.join(".git").exists() {
+                    l.plain.insert(name);
+                }
+                continue;
+            }
             if let Ok(Some(url)) = Git::new(&bare).probe(&["config", "--get", "remote.origin.url"])
                 && let Some(k) = remote_key(&url)
             {
@@ -330,14 +369,19 @@ impl Local {
         l
     }
 
-    /// Present when a repo of that name exists (case-insensitively: forge names are, and so are
-    /// many file systems) or an existing repo's origin is this very remote.
+    /// Present when a non-empty directory of that name exists (case-insensitively: forge names
+    /// are, and so are many file systems) or an existing repo's origin is this very remote.
     fn has(&self, r: &RemoteRepo) -> bool {
         self.names.contains(&r.name.to_lowercase())
             || [&r.clone_url, &r.ssh_url]
                 .iter()
                 .filter_map(|u| remote_key(u))
                 .any(|k| self.origins.contains(&k))
+    }
+
+    /// A plain, not yet migrated clone of that name.
+    fn is_plain(&self, r: &RemoteRepo) -> bool {
+        self.plain.contains(&r.name.to_lowercase())
     }
 }
 
@@ -362,7 +406,17 @@ pub fn import(cfg: &Config, group_name: &str, wanted: &[String]) -> Result<()> {
                 sc.spawn(move || {
                     let f = connect(cfg, pid)?;
                     let owner = grp.owner(pid).unwrap_or(&f.login).to_string();
-                    let repos = select(f.api.list_owner_repos(&owner, &f.login)?, &owner, *vis);
+                    let mut repos = select(f.api.list_owner_repos(&owner, &f.login)?, &owner, *vis);
+                    repos.retain(|r| {
+                        let ok = url::valid_repo_name(&r.name);
+                        if !ok {
+                            eprintln!(
+                                "grove: skipping {}/{}: not a plain directory name",
+                                r.owner, r.name
+                            );
+                        }
+                        ok
+                    });
                     Ok((pid.clone(), f, repos))
                 })
             })
@@ -376,11 +430,14 @@ pub fn import(cfg: &Config, group_name: &str, wanted: &[String]) -> Result<()> {
     });
     let mut forges = Vec::new();
     let mut missing: Vec<(RemoteRepo, usize)> = Vec::new();
+    let mut plain: Vec<RemoteRepo> = Vec::new();
     let local = Local::scan(&gdir);
     for res in scanned {
         let (pid, f, repos) = res?;
         for r in repos {
-            if !local.has(&r) && !missing.iter().any(|(m, _)| m.name == r.name) {
+            if local.is_plain(&r) {
+                plain.push(r);
+            } else if !local.has(&r) && !missing.iter().any(|(m, _)| m.name == r.name) {
                 missing.push((r, forges.len()));
             }
         }
@@ -397,6 +454,12 @@ pub fn import(cfg: &Config, group_name: &str, wanted: &[String]) -> Result<()> {
                 if r.private { " (private)" } else { "" }
             );
         }
+        if !plain.is_empty() {
+            println!("already here as plain clones (not migrated: use `grove add <path>`):");
+            for r in &plain {
+                println!("- {}/{}", r.owner, r.name);
+            }
+        }
         println!("run `grove import {group_name} <name>...` to clone them");
         return Ok(());
     }
@@ -404,30 +467,27 @@ pub fn import(cfg: &Config, group_name: &str, wanted: &[String]) -> Result<()> {
     let mut failed: Vec<String> = Vec::new();
     for w in wanted {
         let Some((r, i)) = missing.iter().find(|(r, _)| &r.name == w) else {
-            println!("FAILED {w}: not a remote repo missing locally");
+            if plain.iter().any(|r| &r.name == w) {
+                println!("FAILED {w}: local clone, not migrated; use `grove add`");
+            } else {
+                println!("FAILED {w}: not a remote repo missing locally");
+            }
             failed.push(w.clone());
             continue;
         };
         let forge = &forges[*i].1;
         let res = (|| -> Result<()> {
-            let url = r.git_url(forge.protocol)?.to_string();
+            let url = forge.clone_url(r)?;
             let dir = gdir.join(&r.name);
-            let existed = dir.exists();
-            if let Err(e) = clone_bare_layout(&url, &dir, &forge.git_env) {
-                // The busy marker is released by now. Remove only a directory this import
-                // created, and only while it is empty (`remove_dir` refuses anything else).
-                if !existed {
-                    let _ = fs::remove_dir(&dir);
-                }
-                return Err(e.into());
-            }
+            // Refuses a non-empty directory and cleans up after itself on failure.
+            clone_bare_layout(&url, &dir, &forge.git_env)?;
             println!("imported {} -> {}", r.name, dir.display());
             register(
                 cfg,
                 &Entry {
                     group: grp.name.clone(),
                     name: r.name.clone(),
-                    url,
+                    url: forge.registry_url(r)?,
                 },
             )
         })();
@@ -470,7 +530,7 @@ pub(crate) fn config_repo_open(cfg: &Config, create: bool) -> Result<(PathBuf, F
             .into_iter()
             .find(|r| r.name == cr.name);
         let url = match exists {
-            Some(r) => r.git_url(forge.protocol)?.to_string(),
+            Some(r) => forge.clone_url(&r)?,
             None if create => {
                 let r = forge.api.create_repo(&NewRepo {
                     name: cr.name.clone(),
@@ -478,7 +538,7 @@ pub(crate) fn config_repo_open(cfg: &Config, create: bool) -> Result<(PathBuf, F
                     private: true,
                     description: "grove configuration (managed repos, machines)".into(),
                 })?;
-                r.git_url(forge.protocol)?.to_string()
+                forge.clone_url(&r)?
             }
             None => bail!(
                 "config repo {:?} does not exist on {}",
@@ -552,7 +612,17 @@ pub fn register(cfg: &Config, e: &Entry) -> Result<()> {
     )
 }
 
+/// The configured provider whose host `url` is on (first by id when several share a host).
+fn provider_for_url<'a>(cfg: &'a Config, url: &str) -> Option<(&'a String, &'a ProviderCfg)> {
+    let host = url::url_host(url)?;
+    cfg.providers
+        .iter()
+        .find(|(_, p)| url::provider_host(p).eq_ignore_ascii_case(&host))
+}
+
 /// First machine: creates the config repo (if needed) and registers every repo already on disk.
+/// Entries hold the canonical https URL; a repo whose origin is on no configured provider is
+/// skipped with a warning.
 pub fn config_repo_init(cfg: &Config) -> Result<usize> {
     let (dir, forge) = config_repo_open(cfg, true)?;
     let mut reg = read_registry(&dir)?;
@@ -566,14 +636,24 @@ pub fn config_repo_init(cfg: &Config) -> Result<usize> {
             if !bare.is_dir() {
                 continue;
             }
-            let Some(url) = Git::new(&bare).probe(&["config", "--get", "remote.origin.url"])?
+            let Some(origin) = Git::new(&bare).probe(&["config", "--get", "remote.origin.url"])?
             else {
+                continue;
+            };
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(canon) =
+                provider_for_url(cfg, &origin).and_then(|(_, p)| url::canonical_https(p, &origin))
+            else {
+                println!(
+                    "warning: {}/{name}: origin {origin:?} is on no configured provider; not registered",
+                    grp.name
+                );
                 continue;
             };
             reg.upsert(Entry {
                 group: grp.name.clone(),
-                name: e.file_name().to_string_lossy().into_owned(),
-                url,
+                name,
+                url: canon,
             });
         }
     }
@@ -583,23 +663,69 @@ pub fn config_repo_init(cfg: &Config) -> Result<usize> {
     Ok(reg.repos.len())
 }
 
+/// Where and how to clone a registry entry on this machine: the provider is chosen by the
+/// entry's host, the transport by that provider's local `protocol`, the credentials are that
+/// provider's. An entry on a host no provider serves is refused (a token never leaves its host).
+/// Entries written with ssh or https URLs are both understood.
+fn plan_clone(
+    cfg: &Config,
+    forges: &mut std::collections::HashMap<String, Forge>,
+    e: &Entry,
+) -> Result<(String, String)> {
+    if !url::valid_repo_name(&e.name) || !url::valid_repo_name(&e.group) {
+        bail!(
+            "refusing entry {}/{}: not plain directory names",
+            e.group,
+            e.name
+        );
+    }
+    let (pid, pc) = provider_for_url(cfg, &e.url)
+        .with_context(|| format!("no configured provider serves the host of {:?}", e.url))?;
+    let canon = url::canonical_https(pc, &e.url)
+        .with_context(|| format!("cannot read owner/name from {:?}", e.url))?;
+    if !forges.contains_key(pid) {
+        forges.insert(pid.clone(), connect(cfg, pid)?);
+    }
+    let forge = &forges[pid];
+    let target = match forge.protocol {
+        Protocol::Https => {
+            url::check_git_url(&canon, &url::provider_host(pc))?;
+            canon
+        }
+        Protocol::Ssh => {
+            let (owner, name) = url::owner_and_name(&canon).context("bad registry URL")?;
+            forge.clone_url(&forge.api.get_repo(&owner, &name)?)?
+        }
+    };
+    Ok((pid.clone(), target))
+}
+
 /// Fresh machine: materializes every repo of the config repo under the root.
 pub fn bootstrap(cfg: &Config) -> Result<(usize, usize)> {
     let (dir, forge) = config_repo_open(cfg, false)?;
     let reg = read_registry(&dir)?;
     let (mut done, mut skipped) = (0, 0);
+    let mut forges = std::collections::HashMap::new();
     for e in &reg.repos {
+        // Names are checked before they are joined to a path.
+        if !url::valid_repo_name(&e.name) || !url::valid_repo_name(&e.group) {
+            println!("FAILED {}/{}: not plain directory names", e.group, e.name);
+            continue;
+        }
         let target = cfg.root_path().join(&e.group).join(&e.name);
         if target.join(".bare").exists() {
             skipped += 1;
             continue;
         }
-        match clone_bare_layout(&e.url, &target, &forge.git_env) {
+        let res = plan_clone(cfg, &mut forges, e).and_then(|(pid, u)| {
+            clone_bare_layout(&u, &target, &forges[&pid].git_env).map_err(Into::into)
+        });
+        match res {
             Ok(_) => {
                 println!("cloned {}/{}", e.group, e.name);
                 done += 1;
             }
-            Err(err) => println!("FAILED {}/{}: {err}", e.group, e.name),
+            Err(err) => println!("FAILED {}/{}: {err:#}", e.group, e.name),
         }
     }
     write_heartbeat(cfg, &dir)?;
@@ -650,7 +776,15 @@ mod tests {
             g.run(&["init", "-q", "--bare"]).unwrap();
             g.run(&["remote", "add", "origin", origin]).unwrap();
         }
+        // A plain clone and an unrelated non-empty dir count as present; an empty dir does not.
+        fs::create_dir_all(d.join("plainrepo/.git")).unwrap();
+        fs::create_dir_all(d.join("notes")).unwrap();
+        fs::write(d.join("notes/x.txt"), "x").unwrap();
+        fs::create_dir_all(d.join("emptydir")).unwrap();
         let l = Local::scan(&d);
+        assert!(l.has(&r("me", "PlainRepo", false)) && l.is_plain(&r("me", "plainrepo", false)));
+        assert!(l.has(&r("me", "notes", false)) && !l.is_plain(&r("me", "notes", false)));
+        assert!(!l.has(&r("me", "emptydir", false)));
         let mut syn = r("Dasemu", "Synapse", false);
         syn.clone_url = "https://github.com/Dasemu/Synapse.git".into();
         assert!(l.has(&syn));
@@ -660,6 +794,54 @@ mod tests {
         assert!(l.has(&moved));
         assert!(!l.has(&r("me", "absent", false)));
         let _ = fs::remove_dir_all(&d);
+    }
+
+    fn two_provider_cfg() -> Config {
+        Config::parse(
+            "[machine]\nname=\"m\"\n[root]\npath=\"/x\"\n\
+             [providers.gitea]\nkind=\"gitea\"\nurl=\"https://git.example.es\"\nprotocol=\"ssh\"\n\
+             [providers.gh]\nkind=\"github\"\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn registry_entries_pick_their_provider_by_host_in_any_url_form() {
+        let cfg = two_provider_cfg();
+        let id = |u: &str| provider_for_url(&cfg, u).map(|(i, _)| i.as_str());
+        assert_eq!(id("https://git.example.es/dasemu/x.git"), Some("gitea"));
+        assert_eq!(
+            id("ssh://gitea@git.example.es:2222/dasemu/x.git"),
+            Some("gitea")
+        );
+        assert_eq!(id("git@github.com:Dasemu/Synapse.git"), Some("gh"));
+        assert_eq!(id("https://evil.example/dasemu/x.git"), None);
+    }
+
+    #[test]
+    fn bootstrap_refuses_entries_on_hosts_no_provider_serves() {
+        let cfg = two_provider_cfg();
+        let mut forges = std::collections::HashMap::new();
+        let entry = |u: &str, n: &str| Entry {
+            group: "g".into(),
+            name: n.into(),
+            url: u.into(),
+        };
+        let e = plan_clone(
+            &cfg,
+            &mut forges,
+            &entry("https://evil.example/o/r.git", "r"),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("no configured provider"), "{e}");
+        assert!(forges.is_empty(), "no token lookup for a foreign host");
+        let e = plan_clone(
+            &cfg,
+            &mut forges,
+            &entry("https://git.example.es/o/r.git", "../x"),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("plain directory names"), "{e}");
     }
 
     #[test]

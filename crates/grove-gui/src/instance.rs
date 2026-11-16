@@ -124,6 +124,7 @@ mod tests {
 
     fn tmp_sock(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("gg-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d); // leftovers of an earlier run with the same pid
         std::fs::create_dir_all(&d).unwrap();
         std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
         d.join("gui.sock")

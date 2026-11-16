@@ -70,7 +70,7 @@ impl Provider for Gitea {
     fn list_repos(&self) -> Result<Vec<RemoteRepo>> {
         Ok(self
             .http
-            .pages("/user/repos", 50, "limit")?
+            .pages("/user/repos", 50, "limit", false)?
             .iter()
             .map(repo)
             .collect())
@@ -82,7 +82,7 @@ impl Provider for Gitea {
         } else {
             format!("/orgs/{owner}/repos")
         };
-        let items = match self.http.pages(&path, 50, "limit") {
+        let items = match self.http.pages(&path, 50, "limit", false) {
             Ok(v) => v,
             // Not an organisation (a user, or an org the token cannot see): say so, and take
             // what the token can see under that name, private repos it collaborates on included.
@@ -90,7 +90,7 @@ impl Provider for Gitea {
                 eprintln!(
                     "grove: /orgs/{owner} not found; listing the repositories you can see owned by {owner}"
                 );
-                self.http.pages("/user/repos", 50, "limit")?
+                self.http.pages("/user/repos", 50, "limit", false)?
             }
             Err(e) => return Err(e),
         };

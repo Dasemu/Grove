@@ -45,11 +45,15 @@ impl Bridge {
         if let Err(e) = validate(args) {
             return json!({"ok": false, "output": format!("rejected: {e}")});
         }
-        if sub == "add"
-            && let Err(e) = self.check_migrate_args(args)
-        {
-            return json!({"ok": false, "output": format!("rejected: {e}")});
+        // `add` gets the canonical path the check validated, not the string it was given.
+        let mut checked: Vec<String> = args.to_vec();
+        if sub == "add" {
+            match self.check_migrate_args(args) {
+                Ok(canon) => checked[1] = canon.to_string_lossy().into_owned(),
+                Err(e) => return json!({"ok": false, "output": format!("rejected: {e}")}),
+            }
         }
+        let args = &checked[..];
         let mut cmd = Command::new(&self.grove_bin);
         if let Some(c) = &self.config {
             cmd.arg("--config").arg(c);
@@ -94,12 +98,12 @@ impl Bridge {
     }
 
     /// `add <path>` only for an existing directory directly under `<root>/<group>/`.
-    fn check_migrate_args(&self, args: &[String]) -> Result<(), String> {
+    fn check_migrate_args(&self, args: &[String]) -> Result<PathBuf, String> {
         let [_, path] = args else {
             return Err("add takes exactly one path".into());
         };
         let cfg = self.loaded_config().ok_or("no readable configuration")?;
-        check_migrate_path(&cfg, Path::new(path)).map(|_| ())
+        check_migrate_path(&cfg, Path::new(path))
     }
 
     /// Where `grove add` writes its safety backup.
@@ -255,7 +259,7 @@ mod tests {
         )).unwrap();
         // A stand-in `grove` that reports what it was asked to do.
         let fake = base.join("grove");
-        std::fs::write(&fake, "#!/bin/sh\necho \"migrated: $3/wt\"\n").unwrap();
+        std::fs::write(&fake, "#!/bin/sh\necho \"migrated: $4/wt\"\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let b = Bridge {
             grove_bin: fake,
@@ -268,6 +272,11 @@ mod tests {
         );
         assert_eq!(ok["ok"], true, "{ok}");
         assert!(ok["output"].as_str().unwrap().starts_with("migrated:"));
+        // A path with `..`/symlink parts reaches `grove add` in canonical form.
+        let sneaky = format!("{}/work/../work/proj", base.display());
+        let canon = base.join("work/proj").canonicalize().unwrap();
+        let r = b.cli(&["add".into(), sneaky], "");
+        assert_eq!(r["output"], format!("migrated: {}/wt", canon.display()));
         let bad = b.cli(
             &["add".into(), base.join("elsewhere").display().to_string()],
             "",

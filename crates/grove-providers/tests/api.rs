@@ -410,29 +410,24 @@ fn github_owner_listing_scopes_the_query_and_sees_collaborator_repos_of_users() 
     let collab = format!("[{REPO_C},{REPO_B}]");
     let (url, rx) = mock(vec![
         (200, Box::leak(org.into_boxed_str())),
-        (200, "[]"),
         (200, Box::leak(mine.into_boxed_str())),
-        (200, "[]"),
         (404, r#"{"message":"Not Found"}"#),
         (200, Box::leak(collab.into_boxed_str())),
-        (200, "[]"),
     ]);
     let g = GitHub::new(&url, "t".into());
     assert_eq!(g.list_owner_repos("Org", "me").unwrap().len(), 1);
     assert!(
         lines(&rx.recv().unwrap()).starts_with("GET /orgs/Org/repos?type=all&per_page=100&page=1 ")
     );
-    rx.recv().unwrap();
     assert_eq!(g.list_owner_repos("me", "me").unwrap().len(), 1);
     assert!(
         lines(&rx.recv().unwrap())
             .starts_with("GET /user/repos?affiliation=owner&per_page=100&page=1 ")
     );
-    rx.recv().unwrap();
     // Not an organisation (404): what the token sees under that name, private ones included.
     let r = g.list_owner_repos("x", "me").unwrap();
     assert_eq!(r.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["c"]);
-    rx.recv().unwrap();
+    rx.recv().unwrap(); // the 404 on /orgs/x
     assert!(lines(&rx.recv().unwrap()).starts_with(
         "GET /user/repos?affiliation=owner,collaborator,organization_member&per_page=100&page=1 "
     ));
@@ -448,7 +443,7 @@ fn a_short_page_is_not_the_end_of_a_listing() {
         (200, Box::leak(p2.into_boxed_str())),
         (200, "[]"),
     ]);
-    let g = GitHub::new(&url, "t".into());
+    let g = Gitea::new(ProviderKind::Gitea, &url, "t".into());
     assert_eq!(g.list_repos().unwrap().len(), 3);
 }
 

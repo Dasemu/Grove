@@ -133,3 +133,23 @@ Activity.
 
 `<state dir>/grove-gui.log` (rotated at 256 KiB) records start-up, daemon subscribe/disconnect,
 tray errors and restarts, panics with a backtrace (from any thread) and why the event loop ended.
+
+## Hardening of import, clone and bootstrap
+
+- Any non-empty directory in the group counts as "already here". A plain clone is listed
+  separately ("use `grove add`") and `import` refuses it; `clone_bare_layout` refuses a non-empty
+  target itself.
+- A clone that fails after `git clone` removes what it created (`.bare`, worktree directories,
+  and the directory when it created it). If that fails, `.grove-stage` is left so the daemon
+  reports the repo as stalled.
+- The registry stores canonical https URLs (`https://host/owner/name.git`). `bootstrap` picks the
+  provider by the entry's host, the transport from that provider's `protocol`, and uses only that
+  provider's credentials; an entry on a host no provider serves is refused. Old entries with ssh
+  or https URLs are normalised when read.
+- Repo names must be plain directory names (no `/`, `\`, leading `.` or `-`, control chars);
+  clone URLs must be `https://`, `ssh://` or `user@host:path` on the provider's host; `git clone`
+  gets `--`.
+- Pagination stops on `X-Total-Count`, on a `Link` without `rel="next"` (GitHub), or an empty or
+  repeated page, not on a short page. For a user that is not the login, GitHub/Gitea listing uses
+  `/user/repos` (collaborator repos included) and says when `/orgs/{owner}` is a 404.
+- The GUI hands `grove add` the canonical path it validated.

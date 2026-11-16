@@ -77,7 +77,7 @@ impl Provider for GitHub {
     fn list_repos(&self) -> Result<Vec<RemoteRepo>> {
         Ok(self
             .http
-            .pages("/user/repos", 100, "per_page")?
+            .pages("/user/repos", 100, "per_page", true)?
             .iter()
             .map(repo)
             .collect())
@@ -89,7 +89,7 @@ impl Provider for GitHub {
         } else {
             format!("/orgs/{owner}/repos?type=all")
         };
-        let items = match self.http.pages(&path, 100, "per_page") {
+        let items = match self.http.pages(&path, 100, "per_page", true) {
             Ok(v) => v,
             // Not an organisation (a user, or an org the token cannot see): say so, and take
             // what the token can see under that name, private repos it collaborates on included.
@@ -101,6 +101,7 @@ impl Provider for GitHub {
                     "/user/repos?affiliation=owner,collaborator,organization_member",
                     100,
                     "per_page",
+                    true,
                 )?
             }
             Err(e) => return Err(e),
