@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gitsync-core"]
+members = ["crates/gitsync-core", "crates/gitsync"]
 
 [workspace.package]
 edition = "2024"

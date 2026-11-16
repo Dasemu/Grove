@@ -1,0 +1,10 @@
+[package]
+name = "gitsync"
+description = "gitsync command line client"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+gitsync-core = { version = "0.1.0", path = "../gitsync-core" }
