@@ -6,6 +6,7 @@ mod gitea;
 mod github;
 mod http;
 pub mod token;
+pub mod url;
 
 pub use gitea::Gitea;
 pub use github::GitHub;

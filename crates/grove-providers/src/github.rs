@@ -91,10 +91,18 @@ impl Provider for GitHub {
         };
         let items = match self.http.pages(&path, 100, "per_page") {
             Ok(v) => v,
-            // Not an organisation: another user's public repos.
-            Err(Error::Api { status: 404, .. }) if !owner.eq_ignore_ascii_case(login) => self
-                .http
-                .pages(&format!("/users/{owner}/repos"), 100, "per_page")?,
+            // Not an organisation (a user, or an org the token cannot see): say so, and take
+            // what the token can see under that name, private repos it collaborates on included.
+            Err(Error::Api { status: 404, .. }) if !owner.eq_ignore_ascii_case(login) => {
+                eprintln!(
+                    "grove: /orgs/{owner} not found; listing the repositories you can see owned by {owner}"
+                );
+                self.http.pages(
+                    "/user/repos?affiliation=owner,collaborator,organization_member",
+                    100,
+                    "per_page",
+                )?
+            }
             Err(e) => return Err(e),
         };
         Ok(items
