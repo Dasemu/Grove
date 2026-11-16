@@ -318,3 +318,34 @@ fn falls_back_to_tea_and_gh_logins() {
     assert!(token::resolve(&id, &github).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn get_repo_reports_visibility_on_both_forges() {
+    let (url, rx) = mock(vec![
+        (
+            200,
+            r#"{"name":"r","private":true,"clone_url":"u","default_branch":"main","owner":{"login":"o"}}"#,
+        ),
+        (404, r#"{"message":"not found"}"#),
+        (200, r#"{"name":"r","owner":{"login":"o"}}"#),
+    ]);
+    let g = Gitea::new(ProviderKind::Gitea, &url, "t".into());
+    let r = g.get_repo("o", "r").unwrap();
+    assert!(r.private);
+    assert!(rx.recv().unwrap().starts_with("GET /api/v1/repos/o/r "));
+    assert!(matches!(
+        g.get_repo("o", "gone").unwrap_err(),
+        Error::Api { status: 404, .. }
+    ));
+    rx.recv().unwrap();
+    // A reply without the flag is an error, never "public by default".
+    assert!(g.get_repo("o", "r").is_err());
+
+    let (url, rx) = mock(vec![(
+        200,
+        r#"{"name":"r","private":false,"clone_url":"u","default_branch":"main","owner":{"login":"o"}}"#,
+    )]);
+    let gh = GitHub::new(&url, "t".into());
+    assert!(!gh.get_repo("o", "r").unwrap().private);
+    assert!(rx.recv().unwrap().starts_with("GET /repos/o/r "));
+}

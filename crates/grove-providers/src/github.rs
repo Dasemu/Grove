@@ -54,6 +54,17 @@ impl Provider for GitHub {
             .ok_or_else(|| Error::Other("response has no login".into()))
     }
 
+    fn get_repo(&self, owner: &str, name: &str) -> Result<RemoteRepo> {
+        let v = self
+            .http
+            .ok("GET", &format!("/repos/{owner}/{name}"), None)?;
+        // `repo` defaults a missing flag to public; for a visibility check that must be an error.
+        if !v["private"].is_boolean() {
+            return Err(Error::Other("response has no `private` flag".into()));
+        }
+        Ok(repo(&v))
+    }
+
     fn list_repos(&self) -> Result<Vec<RemoteRepo>> {
         let mut out = Vec::new();
         for page in 1..=200 {
