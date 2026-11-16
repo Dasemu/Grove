@@ -1,14 +1,19 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use grove_core::config::Config;
+use grove_core::config::{Config, ProviderKind};
 use grove_core::git::Git;
 use grove_core::inspect::{state, worktrees};
 use grove_core::migrate::migrate;
 use grove_core::receive::{Applied, Archived, Received};
+use grove_core::resolve::{Choice, resolve};
 use grove_core::snapshot::{Outcome, take};
+use grove_core::state::State;
 use grove_core::sync::{Options, SyncReport, git_dir_for, sync_repo};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod secrets;
+mod workflow;
 
 #[derive(Parser)]
 #[command(name = "grove", about = "Keep git workspaces in sync across machines")]
@@ -26,6 +31,26 @@ enum Cmd {
     Status {
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Also say what the next sync pass would do (no network, nothing changed)
+        #[arg(long)]
+        plan: bool,
+    },
+    /// Resolve a diverged worktree (an explicit choice; backups are always written)
+    Resolve {
+        /// The worktree directory
+        path: PathBuf,
+        /// Discard local commits, move to the remote tip
+        #[arg(long, group = "how")]
+        take_remote: bool,
+        /// Overwrite the remote branch with the local one
+        #[arg(long, group = "how")]
+        keep_local: bool,
+        /// Keep local commits on a new branch (own worktree), then take the remote tip
+        #[arg(long, value_name = "BRANCH", group = "how")]
+        save_as: Option<String>,
+        /// Open both sides in your difftool and change nothing
+        #[arg(long, group = "how")]
+        compare: bool,
     },
     /// Take a snapshot of the worktree at PATH into refs/sync/<machine>/<branch>
     Snapshot {
@@ -49,11 +74,64 @@ enum Cmd {
     },
     /// Check the local setup
     Doctor,
+    /// Write a first config file for this machine
+    Init {
+        #[arg(long)]
+        machine: Option<String>,
+        #[arg(long, default_value = "~/Workspace")]
+        root: String,
+        /// Provider id (name used in the config and for the token)
+        #[arg(long, default_value = "main")]
+        provider: String,
+        #[arg(long, default_value = "gitea")]
+        kind: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long, default_value = "default")]
+        group: String,
+        /// Name of the private config repo to keep the repo registry in
+        #[arg(long)]
+        config_repo: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Store the API token for a provider (read from stdin, never from argv)
+    Login { provider: String },
+    /// Create a repo on the group's primary forge and set it up locally
+    New {
+        group: String,
+        name: String,
+        #[arg(long)]
+        public: bool,
+    },
+    /// List (or, with names, clone) remote repos that are not on this machine
+    Import { group: String, names: Vec<String> },
+    /// Create the config repo and register every repo already on disk
+    ConfigRepoInit,
+    /// Fresh machine: clone every repo listed in the config repo
+    Bootstrap,
+    /// Encrypted sync of files git must not hold (.env, ...), via the config repo
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsCmd,
+    },
     /// Talk to the running daemon (`groved`)
     Daemon {
         #[command(subcommand)]
         action: DaemonCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum SecretsCmd {
+    /// Create this machine's age key and publish the public half
+    Init,
+    /// Encrypt FILE (inside a workspace worktree) to every machine key and store it
+    Push { file: PathBuf },
+    /// Decrypt stored files into the worktrees that lack them (never overwrites)
+    Pull,
+    /// Re-encrypt everything to the current set of machine keys
+    Rekey,
 }
 
 #[derive(Subcommand)]
@@ -169,11 +247,47 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
         Cmd::Daemon { action } => daemon(action),
-        Cmd::Status { path } => status(path),
+        Cmd::Status { path, plan } => status(path, *plan),
+        Cmd::Resolve {
+            path,
+            take_remote,
+            keep_local,
+            save_as,
+            compare,
+        } => {
+            let cfg = load_config(&cli.config)?;
+            let choice = match (take_remote, keep_local, save_as, compare) {
+                (true, ..) => Choice::TakeRemote,
+                (_, true, ..) => Choice::KeepLocal,
+                (_, _, Some(b), _) => Choice::SaveAsBranch(b.clone()),
+                (.., true) => {
+                    let ok = std::process::Command::new("git")
+                        .current_dir(path)
+                        .args(["difftool", "-d", "HEAD", "@{upstream}"])
+                        .status()?
+                        .success();
+                    if !ok {
+                        bail!("git difftool failed (is a difftool configured?)");
+                    }
+                    return Ok(());
+                }
+                _ => bail!(
+                    "choose one of --take-remote, --keep-local, --save-as <branch>, --compare"
+                ),
+            };
+            println!("{}", resolve(path, &cfg.machine.name, &stamp(), &choice)?);
+            Ok(())
+        }
         Cmd::Snapshot { path } => {
             let cfg = load_config(&cli.config)?;
+            grove_core::snapshot::set_max_file_bytes(cfg.sync.max_file_mb * 1024 * 1024);
             match take(path, &cfg.machine.name, &stamp())? {
-                Outcome::Created(s) => println!("created {} {}", s.refname, s.commit),
+                Outcome::Created(s) => {
+                    println!("created {} {}", s.refname, s.commit);
+                    for f in &s.skipped {
+                        println!("left out (over the size limit): {f}");
+                    }
+                }
                 Outcome::Unchanged(c) => println!("unchanged {c}"),
             }
             Ok(())
@@ -196,6 +310,7 @@ fn main() -> Result<()> {
         }
         Cmd::Sync { path, offline } => {
             let cfg = load_config(&cli.config)?;
+            grove_core::snapshot::set_max_file_bytes(cfg.sync.max_file_mb * 1024 * 1024);
             let rep = sync_repo(
                 path,
                 &Options {
@@ -209,18 +324,115 @@ fn main() -> Result<()> {
             print_report(&rep)
         }
         Cmd::Doctor => doctor(&cli.config),
+        Cmd::Init {
+            machine,
+            root,
+            provider,
+            kind,
+            url,
+            group,
+            config_repo,
+            force,
+        } => {
+            let path = cli
+                .config
+                .clone()
+                .or_else(Config::default_path)
+                .context("cannot determine config path (set --config)")?;
+            let kind = match kind.as_str() {
+                "gitea" => ProviderKind::Gitea,
+                "forgejo" => ProviderKind::Forgejo,
+                "github" => ProviderKind::Github,
+                k => bail!("unknown provider kind {k:?} (gitea, forgejo, github)"),
+            };
+            let machine = machine
+                .clone()
+                .or_else(|| {
+                    std::fs::read_to_string("/etc/hostname")
+                        .ok()
+                        .map(|h| h.trim().to_string())
+                })
+                .context("cannot determine the machine name (set --machine)")?;
+            workflow::init(
+                &path,
+                workflow::InitArgs {
+                    machine,
+                    root: root.clone(),
+                    provider: provider.clone(),
+                    kind,
+                    url: url.clone(),
+                    group: group.clone(),
+                    config_repo: config_repo.clone(),
+                },
+                *force,
+            )?;
+            println!("wrote {}", path.display());
+            println!("next: `grove login {provider}` to store the API token");
+            Ok(())
+        }
+        Cmd::Login { provider } => {
+            let cfg = load_config(&cli.config)?;
+            let mut tok = String::new();
+            std::io::stdin().read_line(&mut tok)?;
+            let who = workflow::login(&cfg, provider, tok.trim())?;
+            println!("logged in to {provider} as {who}; token stored in the Secret Service");
+            Ok(())
+        }
+        Cmd::New {
+            group,
+            name,
+            public,
+        } => {
+            let wt = workflow::new_repo(&load_config(&cli.config)?, group, name, !public)?;
+            println!("ready: {}", wt.display());
+            Ok(())
+        }
+        Cmd::Import { group, names } => workflow::import(&load_config(&cli.config)?, group, names),
+        Cmd::ConfigRepoInit => {
+            let n = workflow::config_repo_init(&load_config(&cli.config)?)?;
+            println!("config repo up to date ({n} repos registered)");
+            Ok(())
+        }
+        Cmd::Secrets { action } => {
+            let cfg = load_config(&cli.config)?;
+            match action {
+                SecretsCmd::Init => secrets::init(&cfg),
+                SecretsCmd::Push { file } => secrets::push(&cfg, file),
+                SecretsCmd::Pull => secrets::pull(&cfg),
+                SecretsCmd::Rekey => secrets::rekey(&cfg),
+            }
+        }
+        Cmd::Bootstrap => {
+            let (done, skipped) = workflow::bootstrap(&load_config(&cli.config)?)?;
+            println!("bootstrap finished: {done} cloned, {skipped} already present");
+            Ok(())
+        }
     }
 }
 
-fn status(path: &Path) -> Result<()> {
+fn plan_for(s: &State) -> &'static str {
+    match s {
+        State::Synced => "nothing to do",
+        State::Dirty => "snapshot the working changes and push the snapshot ref",
+        State::Ahead => "nothing automatic: push your commits yourself",
+        State::Behind => "fast-forward to the remote tip",
+        State::BehindDirty => {
+            "keep your edits; adopt the remote tip only if the content is identical"
+        }
+        State::Diverged => "nothing automatic: run `grove resolve` to choose",
+        State::Error(_) => "retry; see the error",
+    }
+}
+
+fn status(path: &Path, plan: bool) -> Result<()> {
     for wt in worktrees(&git_dir_for(path))? {
         let branch = wt.branch.as_deref().unwrap_or("(detached)");
-        println!(
-            "{:<24} {:?}  {}",
-            branch,
-            state(&wt.path),
-            wt.path.display()
-        );
+        let st = state(&wt.path);
+        print!("{:<24} {:?}  {}", branch, st, wt.path.display());
+        if plan {
+            print!("\n    next: {}", plan_for(&st));
+        }
+        println!();
     }
     Ok(())
 }
@@ -249,6 +461,9 @@ fn print_report(rep: &SyncReport) -> Result<()> {
         let mut notes = Vec::new();
         if let Some(s) = w.snapshot {
             notes.push(format!("snapshot {s}"));
+        }
+        if !w.skipped.is_empty() {
+            notes.push(format!("left out (too large): {}", w.skipped.join(", ")));
         }
         match &w.received {
             Some(Received::FastForwarded { .. }) => notes.push("fast-forwarded".into()),

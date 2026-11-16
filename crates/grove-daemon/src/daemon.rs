@@ -42,6 +42,7 @@ impl Settings {
 pub struct WtStatus {
     pub branch: Option<String>,
     pub state: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -379,8 +380,14 @@ fn pass(
                 let branch = w.branch.clone().unwrap_or_else(|| "(detached)".into());
                 let state = format!("{:?}", w.state).to_lowercase();
                 if let Some(kind) = w.snapshot {
-                    ctx.activity
-                        .log("snapshot", Some(&name), format!("{branch}: {kind}"));
+                    let mut msg = format!("{branch}: {kind}");
+                    if !w.skipped.is_empty() {
+                        msg.push_str(&format!(
+                            " (left out, over the size limit: {})",
+                            w.skipped.join(", ")
+                        ));
+                    }
+                    ctx.activity.log("snapshot", Some(&name), msg);
                 }
                 match &w.received {
                     Some(Received::FastForwarded { .. }) => {
@@ -411,6 +418,7 @@ fn pass(
                 now_wts.push(WtStatus {
                     branch: w.branch.clone(),
                     state,
+                    path: w.path.display().to_string(),
                 });
             }
             status.worktrees = now_wts;

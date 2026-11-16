@@ -22,6 +22,7 @@ fn main() -> Result<()> {
         .or_else(Config::default_path)
         .context("cannot determine config path")?;
     let cfg = Config::load(&path)?;
+    grove_core::snapshot::set_max_file_bytes(cfg.sync.max_file_mb * 1024 * 1024);
     let st = Settings::standard();
     eprintln!(
         "groved: machine {:?}, root {}, socket {}",

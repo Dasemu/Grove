@@ -1,11 +1,11 @@
 //! `config.toml` model, loading and validation (section 6 of the plan).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Config {
     pub machine: Machine,
     pub root: Root,
@@ -15,20 +15,21 @@ pub struct Config {
     pub groups: Vec<Group>,
     #[serde(default)]
     pub sync: Sync,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub config_repo: Option<ConfigRepo>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Machine {
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Root {
     pub path: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     Gitea,
@@ -36,13 +37,14 @@ pub enum ProviderKind {
     Github,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Provider {
     pub kind: ProviderKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Layout {
     #[default]
@@ -50,7 +52,7 @@ pub enum Layout {
     Plain,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Group {
     pub name: String,
     pub primary: String,
@@ -62,7 +64,7 @@ pub struct Group {
     pub auto_materialize: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Sync {
     #[serde(default = "default_debounce")]
     pub snapshot_debounce_ms: u64,
@@ -70,6 +72,9 @@ pub struct Sync {
     pub fetch_interval_s: u64,
     #[serde(default)]
     pub ignore_extra: Vec<String>,
+    /// Changed files larger than this many MiB are not snapshotted (0 = no limit).
+    #[serde(default = "default_max_file_mb")]
+    pub max_file_mb: u64,
 }
 
 impl Default for Sync {
@@ -78,11 +83,12 @@ impl Default for Sync {
             snapshot_debounce_ms: default_debounce(),
             fetch_interval_s: default_fetch(),
             ignore_extra: Vec::new(),
+            max_file_mb: default_max_file_mb(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ConfigRepo {
     pub provider: String,
     pub name: String,
@@ -93,6 +99,9 @@ fn yes() -> bool {
 }
 fn default_debounce() -> u64 {
     2000
+}
+fn default_max_file_mb() -> u64 {
+    50
 }
 fn default_fetch() -> u64 {
     60
@@ -122,6 +131,18 @@ impl Config {
         let cfg: Config = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Writes the config atomically (temp file + rename).
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        let text = toml::to_string_pretty(self).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let io = |e| ConfigError::Io(path.to_path_buf(), e);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(io)?;
+        }
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, text).map_err(io)?;
+        std::fs::rename(&tmp, path).map_err(io)
     }
 
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
