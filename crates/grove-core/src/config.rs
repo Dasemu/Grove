@@ -37,9 +37,35 @@ pub enum ProviderKind {
     Github,
 }
 
+/// How local git talks to a forge: HTTPS with the API token, or SSH with the user's keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[default]
+    Https,
+    Ssh,
+}
+
+fn is_https(p: &Protocol) -> bool {
+    *p == Protocol::Https
+}
+
+impl Protocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::Https => "https",
+            Protocol::Ssh => "ssh",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Provider {
     pub kind: ProviderKind,
+    /// Transport for clone/fetch/push (`https` by default). Mirrors are server-side and always
+    /// use HTTPS.
+    #[serde(default, skip_serializing_if = "is_https")]
+    pub protocol: Protocol,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
@@ -484,5 +510,22 @@ mirror_to = ["gitea"]
         assert!(matches!(Config::parse("["), Err(ConfigError::Parse(_))));
         let t = "[machine]\nname=\"a\"\n[root]\npath=\"/x\"\n[providers.p]\nkind=\"gitlab\"\n";
         assert!(matches!(Config::parse(t), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn provider_protocol_defaults_to_https_and_is_validated() {
+        let t = |p: &str| {
+            format!(
+                "[machine]\nname=\"a\"\n[root]\npath=\"/x\"\n[providers.p]\nkind=\"gitea\"\n{p}"
+            )
+        };
+        assert_eq!(
+            Config::parse(&t("")).unwrap().providers["p"].protocol,
+            Protocol::Https
+        );
+        let c = Config::parse(&t("protocol=\"ssh\"\n")).unwrap();
+        assert_eq!(c.providers["p"].protocol, Protocol::Ssh);
+        assert!(toml::to_string(&c).unwrap().contains("protocol = \"ssh\""));
+        assert!(Config::parse(&t("protocol=\"git\"\n")).is_err());
     }
 }

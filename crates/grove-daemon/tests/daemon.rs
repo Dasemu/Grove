@@ -610,7 +610,11 @@ fn managed_repo_removed_after_start_disappears_without_crash() {
 
     // Keep the first repo busy so a pass may be running when the other one vanishes.
     fs::write(root.join("g/repo/main/busy.txt"), "x\n").unwrap();
-    fs::remove_dir_all(root.join("g/second")).unwrap();
+    // The daemon may create files in the repo while it is being deleted (ENOTEMPTY): retry.
+    wait_until("repo directory removed", 5, || {
+        let _ = fs::remove_dir_all(root.join("g/second"));
+        !root.join("g/second").exists()
+    });
     wait_until("removed repo dropped", 10, || {
         repo_paths(&sock) == vec![root.join("g/repo").display().to_string()]
     });
@@ -712,6 +716,10 @@ fn stale_busy_marker_keeps_the_repo_out_and_warns_once() {
     assert_eq!(events(&sock, "repo_stalled").len(), 1);
     assert_eq!(repo_paths(&sock).len(), 1);
     assert!(stale.join(".grove-busy").exists());
+    assert_eq!(
+        status(&sock)["stalled"],
+        json!([stale.display().to_string()])
+    );
     d.shutdown();
 }
 

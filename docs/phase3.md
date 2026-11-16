@@ -1,4 +1,8 @@
-# Phase 3: GUI
+# Phase 3: GUI (superseded)
+
+> **Superseded by [Phase 7](phase7.md).** The HTML/JS frontend, the localhost bridge and the Tauri
+> shell described below were removed; the native `grove-gui` replaces them. Kept for history.
+
 
 ## Layout
 

@@ -5,6 +5,7 @@ use crate::git::{Git, GitError};
 use crate::layout::dir_name;
 use crate::receive::{ensure_fetch_refspec, materialize};
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -47,19 +48,104 @@ impl Registry {
 
 /// Creates `<dir>/.bare` as a clone of `url` and a worktree per remote branch.
 /// `envs` are extra git environment variables (credentials).
+///
+/// `dir` must not exist or be empty. If anything fails, what this call created is removed again
+/// (the `.bare`, the worktree directories, `dir` itself when it created it); if that is not
+/// possible a `.grove-stage` marker is left so the daemon reports the repo as stalled instead of
+/// adopting a half-built one.
 pub fn clone_bare_layout(
     url: &str,
     dir: &Path,
     envs: &[(String, String)],
 ) -> Result<Vec<PathBuf>, GitError> {
+    clone_bare_layout_impl(url, dir, envs, false)
+}
+
+#[doc(hidden)]
+pub fn clone_bare_layout_failing_after_clone(
+    url: &str,
+    dir: &Path,
+    envs: &[(String, String)],
+) -> Result<Vec<PathBuf>, GitError> {
+    clone_bare_layout_impl(url, dir, envs, true)
+}
+
+fn clone_bare_layout_impl(
+    url: &str,
+    dir: &Path,
+    envs: &[(String, String)],
+    fail_after_clone: bool,
+) -> Result<Vec<PathBuf>, GitError> {
+    let created_dir = !dir.exists();
+    let non_empty = !created_dir
+        && fs::read_dir(dir)
+            .map_err(|e| GitError::Other(format!("{}: {e}", dir.display())))?
+            .next()
+            .is_some();
+    if non_empty {
+        return Err(GitError::Other(format!(
+            "{} already exists and is not empty",
+            dir.display()
+        )));
+    }
     // Released last: until then the daemon ignores the half-built repo.
-    let _busy = crate::busy::BusyGuard::acquire(dir)?;
+    let busy = crate::busy::BusyGuard::acquire(dir)
+        .map_err(|e| GitError::Other(format!("{}: {e}", dir.display())))?;
+    let res = clone_steps(url, dir, envs, fail_after_clone);
+    if res.is_err() {
+        rollback_clone(dir);
+    }
+    drop(busy);
+    if res.is_err() && created_dir {
+        // Only while empty: `remove_dir` refuses anything else.
+        let _ = fs::remove_dir(dir);
+    }
+    res
+}
+
+/// Removes everything in `dir` except the busy marker (the caller guarantees `dir` was empty
+/// before the clone started). On failure, leaves `.grove-stage` behind.
+fn rollback_clone(dir: &Path) {
+    let mut failed = false;
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.filter_map(Result::ok) {
+            if e.file_name() == crate::busy::BUSY {
+                continue;
+            }
+            let p = e.path();
+            let r = if e.file_type().is_ok_and(|t| t.is_dir()) {
+                fs::remove_dir_all(&p)
+            } else {
+                fs::remove_file(&p)
+            };
+            failed |= r.is_err();
+        }
+    } else {
+        failed = true;
+    }
+    if failed {
+        let _ = fs::write(
+            dir.join(".grove-stage"),
+            "a failed clone could not be cleaned up; remove this directory's contents by hand\n",
+        );
+    }
+}
+
+fn clone_steps(
+    url: &str,
+    dir: &Path,
+    envs: &[(String, String)],
+    fail_after_clone: bool,
+) -> Result<Vec<PathBuf>, GitError> {
     let bare = dir.join(".bare");
     let mut g = Git::new(dir);
     for (k, v) in envs {
         g = g.with_env(k, v);
     }
-    g.run(&["clone", "-q", "--bare", url, &bare.to_string_lossy()])?;
+    g.run(&["clone", "-q", "--bare", "--", url, &bare.to_string_lossy()])?;
+    if fail_after_clone {
+        return Err(GitError::Other("injected failure".into()));
+    }
     Git::new(&bare).run(&["config", "core.bare", "true"])?;
     ensure_fetch_refspec(&bare, "origin")?;
     let mut f = Git::new(&bare);
@@ -123,4 +209,37 @@ pub fn push_initial(dir: &Path, envs: &[(String, String)]) -> Result<(), GitErro
     }
     g.run(&["push", "-q", "-u", "origin", "main"])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn rollback_that_cannot_remove_everything_leaves_a_stage_marker() {
+        let d = std::env::temp_dir().join(format!("grove-rb-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let locked = d.join(".bare/locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("f"), "x").unwrap();
+        fs::write(d.join(crate::busy::BUSY), "1 1\n").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        rollback_clone(&d);
+        assert!(d.join(".grove-stage").exists());
+        assert!(
+            d.join(crate::busy::BUSY).exists(),
+            "the marker is the guard's to remove"
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(&d);
+
+        // Everything removable: nothing left but the busy marker, no stage marker.
+        fs::create_dir_all(d.join(".bare")).unwrap();
+        fs::create_dir_all(d.join("main")).unwrap();
+        fs::write(d.join(crate::busy::BUSY), "1 1\n").unwrap();
+        rollback_clone(&d);
+        assert!(!d.join(".grove-stage").exists() && !d.join(".bare").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
 }

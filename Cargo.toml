@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/grove-core", "crates/grove", "crates/grove-daemon", "crates/grove-providers", "crates/grove-bridge"]
+members = ["crates/grove-core", "crates/grove", "crates/grove-daemon", "crates/grove-providers", "crates/grove-gui"]
 
 [workspace.package]
 edition = "2024"

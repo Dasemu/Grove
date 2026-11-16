@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Grove
+GenericName=Git sync
+Comment=Keep your git repositories in sync across machines
+Exec=grove-gui
+Icon=grove
+Terminal=false
+Categories=Development;Utility;
+StartupWMClass=grove

@@ -14,14 +14,19 @@ grove-providers = { version = "0.1.0", path = "../grove-providers" }
 serde_json = "1.0.154"
 toml = "1.2.1"
 
-# `cargo build --release --workspace && cargo deb -p grove --no-build` packages CLI + daemon + user unit.
+# `cargo build --release --workspace && cargo deb -p grove --no-build` packages CLI + daemon + GUI + desktop files + user unit.
 [package.metadata.deb]
 name = "grove"
 section = "devel"
 depends = "$auto, git"
+recommends = "libnotify-bin"
 extended-description = "Keeps chosen git repos continuously in sync across machines, including uncommitted work."
 assets = [
   ["../../target/release/grove", "usr/bin/", "755"],
   ["../../target/release/groved", "usr/bin/", "755"],
+  ["../../target/release/grove-gui", "usr/bin/", "755"],
+  ["../../contrib/grove.desktop", "usr/share/applications/", "644"],
+  ["../../contrib/grove-autostart.desktop", "usr/share/grove/grove-autostart.desktop", "644"],
+  ["../../assets/grove.png", "usr/share/icons/hicolor/64x64/apps/grove.png", "644"],
   ["../../contrib/groved.deb.service", "usr/lib/systemd/user/groved.service", "644"],
 ]

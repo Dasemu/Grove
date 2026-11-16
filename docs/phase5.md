@@ -20,7 +20,7 @@
 ## Not done
 
 - AppImage (no `appimagetool`) and Flatpak: not attempted. The Tauri bundle config requests `deb` and
-  `appimage`, untested.
+  `appimage`, untested (Tauri was removed in [Phase 7](phase7.md); the `.deb` now ships `grove-gui`).
 - Daemon-side mirroring fallback for GitHub (GitHub has no push mirrors; `configure_mirror` returns `Unsupported`).
 - Syncing agent sessions (optional item in the plan): not implemented.
 - A real two-PC run, a real cross-forge mirror, Secret Service on a desktop, github.com: unverified.
