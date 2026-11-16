@@ -494,3 +494,36 @@ fn auto_materialize_is_decided_per_group() {
     });
     d.shutdown();
 }
+
+#[test]
+fn snapshots_already_pushed_are_deleted_when_they_become_withheld() {
+    let w = world("purge", &["pca"]);
+    let repo = w.base.join("pca/g/repo/main");
+    // This machine pushed a snapshot earlier; another machine has one too.
+    git(&repo, &["update-ref", "refs/sync/pca/main", "HEAD"]);
+    git(
+        &repo,
+        &[
+            "push",
+            "-q",
+            "origin",
+            "refs/sync/pca/main:refs/sync/pca/main",
+        ],
+    );
+    git(&repo, &["push", "-q", "origin", "HEAD:refs/sync/pcb/main"]);
+    let text = format!(
+        "[machine]\nname = \"pca\"\n[root]\npath = \"{}\"\n{GROUP}[sync]\nfetch_interval_s = 1\n",
+        w.base.join("pca").display()
+    );
+    let d = Daemon::start(Config::parse(&text).unwrap(), settings(&w, "pca")).unwrap();
+    wait_until("own snapshot deleted remotely", 15, || {
+        !git(&w.remote, &["for-each-ref", "refs/sync/pca/"]).contains("refs/sync/pca/main")
+    });
+    d.shutdown();
+    let refs = git(&w.remote, &["for-each-ref", "--format=%(refname)"]);
+    assert!(refs.contains("refs/sync/pcb/main"), "{refs}");
+    assert!(refs.contains("refs/heads/main"), "{refs}");
+    assert!(git(&repo, &["for-each-ref", "refs/sync/pca/"]).is_empty());
+    let log = fs::read_to_string(w.base.join("pca.jsonl")).unwrap();
+    assert!(log.contains("snapshots_purged"), "{log}");
+}

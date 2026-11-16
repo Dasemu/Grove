@@ -5,7 +5,7 @@
 use crate::activity::{Activity, now_secs};
 use crate::discover::{discover, group_of};
 use crate::ipc;
-use crate::visibility::{Visibility, forge_fetch, snapshot_gate};
+use crate::visibility::{RealForge, Visibility, snapshot_gate};
 use grove_core::config::Config;
 use grove_core::receive::Received;
 use grove_core::sync::{Options, sync_repo};
@@ -59,6 +59,8 @@ pub struct RepoStatus {
     pub failures: u32,
     /// Why WIP snapshots are not pushed for this repo (`None` = they are).
     pub snapshots_withheld: Option<String>,
+    /// Last verdict of the snapshot gate (`None` = not evaluated yet).
+    pub gate_allowed: Option<bool>,
 }
 
 impl Default for RepoStatus {
@@ -70,6 +72,7 @@ impl Default for RepoStatus {
             worktrees: Vec::new(),
             failures: 0,
             snapshots_withheld: None,
+            gate_allowed: None,
         }
     }
 }
@@ -379,16 +382,23 @@ fn pass(
         .iter()
         .find(|g| g.name == group)
         .is_none_or(|g| g.auto_materialize);
-    // No lookup needed offline: nothing is pushed in such a pass anyway.
-    let gate = if offline {
-        Ok(())
+    // Offline there is no lookup: use the last verdict, and take no snapshot if there is none.
+    let push_snapshots = if offline {
+        ctx.shared
+            .lock()
+            .unwrap()
+            .repos
+            .get(repo)
+            .is_some_and(|s| s.gate_allowed == Some(true))
     } else {
-        snapshot_gate(cfg, repo, &st.remote, visibility, now_secs(), &forge_fetch)
-    };
-    let push_snapshots = gate.is_ok();
-    if !offline {
+        let gate = snapshot_gate(cfg, repo, &st.remote, visibility, now_secs(), &RealForge);
+        let allowed = gate.is_ok();
         note_snapshot_gate(ctx, repo, &name, gate.err());
-    }
+        if !allowed {
+            purge_snapshots(ctx, repo, &name, cfg, st);
+        }
+        allowed
+    };
     let opts = Options {
         machine: cfg.machine.name.clone(),
         stamp: stamp(),
@@ -485,6 +495,7 @@ fn pass(
 fn note_snapshot_gate(ctx: &Ctx, repo: &Path, name: &str, withheld: Option<String>) {
     let mut shared = ctx.shared.lock().unwrap();
     let status = shared.repos.entry(repo.to_path_buf()).or_default();
+    status.gate_allowed = Some(withheld.is_none());
     if status.snapshots_withheld == withheld {
         return;
     }
@@ -499,6 +510,31 @@ fn note_snapshot_gate(ctx: &Ctx, repo: &Path, name: &str, withheld: Option<Strin
             .log("snapshots_enabled", Some(name), "WIP snapshots are pushed"),
     }
     status.snapshots_withheld = withheld;
+}
+
+/// Snapshots are withheld: remove this machine's snapshot refs from the remote (they may have
+/// been pushed while the repo was still private) and locally. Only `refs/sync/<machine>/*`;
+/// never other machines' refs or branches. Does nothing when there are no local refs, and a
+/// failed deletion keeps them so the next pass retries.
+fn purge_snapshots(ctx: &Ctx, repo: &Path, name: &str, cfg: &Config, st: &Settings) {
+    let gitdir = grove_core::sync::git_dir_for(repo);
+    match grove_core::receive::purge_own_snapshots(&gitdir, &cfg.machine.name, &st.remote) {
+        Ok(done) if done.is_empty() => {}
+        Ok(done) => ctx.activity.log(
+            "snapshots_purged",
+            Some(name),
+            format!(
+                "WARNING: snapshots are no longer allowed; deleted {} snapshot ref(s) of this machine from the remote: {}",
+                done.len(),
+                done.join(", ")
+            ),
+        ),
+        Err(e) => ctx.activity.log(
+            "error",
+            Some(name),
+            format!("could not delete this machine's snapshot refs from the remote: {e}"),
+        ),
+    }
 }
 
 fn set_phase(ctx: &Ctx, repo: &Path, phase: &'static str) {
