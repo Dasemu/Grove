@@ -8,3 +8,5 @@
 - Bare-layout clones must set upstream tracking per branch, or `status` silently reports Synced for Behind/Diverged. Assert tracking in tests of any clone path.
 - Unix socket paths are limited to ~100 bytes: use a short `XDG_RUNTIME_DIR` (e.g. `/tmp/gd`) when running a daemon from deep scratch dirs.
 - Mock-server tests must parse the JSON request body; pretty-printed JSON breaks string asserts.
+- Slint (winit/Wayland): `show()` from an idle event loop leaves the window unmapped until another event arrives; follow it with a one-shot `request_redraw` timer.
+- Slint has no top-level `function`; use a `global`. A wrapped `Text` under-reports its preferred height inside layouts, so elide long log/error text instead of wrapping it.

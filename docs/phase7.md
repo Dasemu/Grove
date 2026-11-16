@@ -1,0 +1,77 @@
+# Phase 7: native GUI
+
+`grove-gui` (crate `crates/grove-gui`) replaces the web UI of Phase 3. It is a native desktop app
+(Slint UI, StatusNotifierItem tray) that lives in the system tray. It contains no sync logic: state
+comes from the daemon over its Unix socket and every action runs an allow-listed `grove` subcommand,
+exactly as before.
+
+## Architecture
+
+| Part | Where |
+|---|---|
+| Daemon IPC + allow-listed CLI calls + config (formerly `grove-bridge`) | `src/bridge.rs` |
+| Pure logic: status -> aggregate/tray state, formatting, `grove import` listing parser, settings summary | `src/model.rs` |
+| Tray (ksni), icons drawn in code per state | `src/tray.rs` |
+| Single instance (Unix socket) | `src/instance.rs` |
+| Window, callbacks, worker threads | `src/main.rs`, `ui/app.slint` |
+
+Threads: the Slint event loop; a worker that fetches `status` (and `log`/config only while the window
+is visible); a subscriber that holds a `subscribe` connection to the daemon and wakes the worker on
+every event (reconnects every 5 s while the daemon is down); the tray service; the single-instance
+listener; short-lived threads for CLI calls so the UI never blocks. Fallback poll: 5 s with the
+window open, 30 s hidden. No Slint timers run while idle.
+
+Tray states: ok, syncing, attention (also sets the item to `NeedsAttention`), paused, daemon offline.
+Menu: Open, Sync now, Pause/Resume, Quit; left click opens the window. Closing the window hides it;
+Quit exits. If no StatusNotifier host exists, closing the window quits. A transition into
+`Diverged`/`Error` shows a toast when the window is open and calls `notify-send` (best effort) when hidden.
+
+Single instance: `$XDG_RUNTIME_DIR/grove/gui.sock`. A second `grove-gui` asks the first to show
+its window and exits; `grove-gui --hidden` (autostart) only checks and never raises the window.
+
+Screens (parity with Phase 3): repositories with per-worktree state, repository detail with the
+resolve panel (confirmation first), activity with filter, new repository, import (scan, pick,
+import), settings (machine, providers, groups incl. public route and `owners`, config repo, token
+login, secrets), onboarding when there is no config, offline state with a hint.
+
+## Run
+
+```bash
+cargo run --release -p grove-gui            # window + tray
+grove-gui --hidden                          # tray only
+grove-gui --config PATH --socket PATH --grove-bin PATH   # test against another daemon/config
+grove-gui --view settings                   # start on a view (activity, new, import, repo:<path>)
+```
+
+`grove` is looked up next to the `grove-gui` binary, then in `PATH`. Packaging: `.deb` installs
+`grove-gui`, `contrib/grove.desktop`, `contrib/grove-autostart.desktop` (`/etc/xdg/autostart`) and
+`assets/grove.png`. Dev builds need no system Qt: Slint is built with the `winit` backend (Wayland and
+X11 loaded at runtime) and the software renderer.
+
+## Dependencies
+
+- `slint` / `slint-build` 1.18.1 (`std`, `backend-winit`, `renderer-software`, `compat-1-2`; no Qt,
+  no femtovg, no system-tray feature). Style `fluent` (pure Slint). Slint is licensed GPL-3.0 or its
+  royalty-free license (attribution required) or a commercial one; pick one before distributing.
+- `ksni` 0.3.7 (`async-io` + `blocking`, no tokio).
+
+## Memory (release build, KDE Plasma 6 / Wayland, `ps -o rss`)
+
+| State | Software renderer (used) | femtovg (GL) |
+|---|---|---|
+| Started with `--hidden` | 24-25 MB | 94 MB |
+| Window open | 33.5 MB | 105 MB |
+| After closing the window (hidden again) | 28 MB | not measured |
+
+Idle CPU hidden: 0 ticks in 20 s. 9 threads.
+
+## Limits
+
+- Showing an already visible window does not raise it (no xdg-activation token is passed).
+- Activity timestamps use the local UTC offset read via `date +%z` (no timezone crate).
+- The activity list shows the first line of each message, repository errors are cut at 160 characters
+  in the list (full text in the detail view).
+- Slint's wrapped text under-reports its height in layouts, so long text is elided, not wrapped.
+- Side-by-side compare for `Diverged` stays in the CLI (`grove resolve --compare`).
+- Only the layout and read-only views were checked visually; forms and CLI-driven flows were not
+  clicked through (no input injection available), only their parsing and logic are unit-tested.
