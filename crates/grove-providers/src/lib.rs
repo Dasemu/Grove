@@ -119,6 +119,25 @@ pub struct PullMirrorSpec {
     pub interval: String,
 }
 
+/// A pull request merged on the forge whose head branch is in the same repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedPull {
+    pub number: u64,
+    pub head_ref: String,
+    pub head_sha: String,
+}
+
+/// Head repo of a pull request equals its base repo (fork PRs reuse branch names freely).
+/// A head repo that was deleted reports `null`: not the same repo.
+pub(crate) fn same_repo(pr: &serde_json::Value) -> bool {
+    let name = |side: &str| {
+        pr[side]["repo"]["full_name"]
+            .as_str()
+            .map(str::to_ascii_lowercase)
+    };
+    matches!((name("head"), name("base")), (Some(h), Some(b)) if h == b)
+}
+
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     fn capabilities(&self) -> Capabilities;
@@ -134,6 +153,9 @@ pub trait Provider: Send + Sync {
     fn configure_mirror(&self, owner: &str, repo: &str, spec: &MirrorSpec) -> Result<()>;
     /// Creates a pull mirror (see [`Capabilities::pull_mirror`]).
     fn create_pull_mirror(&self, spec: &PullMirrorSpec) -> Result<RemoteRepo>;
+    /// The most recently updated closed pull requests (one page) that were merged, newest
+    /// first, leaving out those whose head is in a fork.
+    fn merged_pulls(&self, owner: &str, name: &str) -> Result<Vec<MergedPull>>;
 }
 
 /// Builds the provider described by `cfg`, using `token`.

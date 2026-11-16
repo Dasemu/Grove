@@ -1,11 +1,13 @@
-//! One full sync pass over a repo: snapshot, push, fetch, receive, apply, materialize, archive.
+//! One full sync pass over a repo: snapshot, push, fetch, receive, apply, materialize, archive,
+//! prune merged.
 //! Failures of individual steps are reported per worktree and never abort the whole pass.
 
 use crate::git::{Git, GitError};
 use crate::inspect::{facts, state, worktrees};
+use crate::prune::{MergedHead, Pruned, prune_merged, settled_branches};
 use crate::receive::{
     Applied, Archived, Received, apply_snapshot, archive_gone, fetch, foreign_snapshots,
-    materialize, push_snapshot, receive,
+    materialize_except, push_snapshot, receive,
 };
 use crate::snapshot::{Outcome, ref_name, take};
 use crate::state::State;
@@ -24,6 +26,12 @@ pub struct Options {
     /// repo, or `snapshots = "none"`) no `refs/sync/<machine>/*` ref is created or pushed;
     /// fetching, fast-forwarding and applying other machines' snapshots are unaffected.
     pub push_snapshots: bool,
+    /// Heads of pull requests merged on the forge (empty: unknown or pruning disabled).
+    /// Worktrees of those branches without local work are removed (bare layout only), and
+    /// `materialize` does not bring them back.
+    pub merged: Vec<MergedHead>,
+    /// Names of ignored files/directories that do not count as local work when pruning.
+    pub disposable: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +52,7 @@ pub struct SyncReport {
     pub fetch_error: Option<String>,
     pub materialized: Vec<PathBuf>,
     pub archived: Vec<Archived>,
+    pub pruned: Vec<Pruned>,
     pub worktrees: Vec<WorktreeReport>,
 }
 
@@ -72,7 +81,16 @@ pub fn sync_repo(path: &Path, o: &Options) -> Result<SyncReport, GitError> {
             Ok(a) => rep.archived = a,
             Err(e) => rep.fetch_error = Some(format!("archive: {e}")),
         }
-        match materialize(path, &o.remote) {
+    }
+    if bare_layout && rep.fetch_error.is_none() && !o.offline {
+        match prune_merged(path, &o.merged, &o.disposable, &o.machine, &o.stamp) {
+            Ok(p) => rep.pruned = p,
+            Err(e) => rep.fetch_error = Some(format!("prune merged: {e}")),
+        }
+    }
+    if bare_layout && o.materialize && rep.fetch_error.is_none() {
+        let skip = settled_branches(&gitdir, &o.remote, &o.merged, &o.machine);
+        match skip.and_then(|skip| materialize_except(path, &o.remote, &skip)) {
             Ok(m) => rep.materialized = m,
             Err(e) => rep.fetch_error = Some(format!("materialize: {e}")),
         }

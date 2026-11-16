@@ -4,6 +4,7 @@ use grove_core::config::{Config, ProviderKind};
 use grove_core::git::Git;
 use grove_core::inspect::{state, worktrees};
 use grove_core::migrate::migrate;
+use grove_core::prune::Pruned;
 use grove_core::receive::{Applied, Archived, Received};
 use grove_core::resolve::{Choice, resolve};
 use grove_core::snapshot::{Outcome, take};
@@ -345,6 +346,21 @@ fn main() -> Result<()> {
         Cmd::Sync { path, offline } => {
             let cfg = load_config(&cli.config)?;
             grove_core::snapshot::set_max_file_bytes(cfg.sync.max_file_mb * 1024 * 1024);
+            // Merged pull requests, for pruning (bare layout only; best effort).
+            let merged = if *offline || !cfg.sync.prune_merged || !path.join(".bare").is_dir() {
+                Vec::new()
+            } else {
+                grove_daemon::merged::lookup(
+                    &cfg,
+                    path,
+                    "origin",
+                    &grove_daemon::visibility::RealForge,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("grove: cannot list merged pull requests: {e}");
+                    Vec::new()
+                })
+            };
             let rep = sync_repo(
                 path,
                 &Options {
@@ -359,6 +375,8 @@ fn main() -> Result<()> {
                         .and_then(|g| cfg.groups.iter().find(|x| x.name == g))
                         .is_none_or(|g| g.auto_materialize),
                     push_snapshots: true,
+                    merged,
+                    disposable: cfg.sync.prune_disposable.clone(),
                 },
             )?;
             print_report(&rep)
@@ -502,6 +520,22 @@ fn print_report(rep: &SyncReport) -> Result<()> {
             }
             Archived::KeptDirty { branch } => {
                 println!("kept {branch}: gone upstream but has local changes")
+            }
+        }
+    }
+    for p in &rep.pruned {
+        match p {
+            Pruned::Removed {
+                branch,
+                pr,
+                path,
+                backup_ref,
+            } => println!(
+                "pruned {branch}: merged in PR #{pr}, removed {} (backup {backup_ref})",
+                path.display()
+            ),
+            Pruned::Kept { branch, pr, why } => {
+                println!("kept {branch}: merged in PR #{pr} but {why}")
             }
         }
     }
