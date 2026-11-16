@@ -1,0 +1,41 @@
+name: version
+on:
+  push:
+    branches: [development, main]
+permissions:
+  contents: write
+jobs:
+  bump:
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') && github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Bump version
+        id: bump
+        run: |
+          set -euo pipefail
+          IFS=. read -r MA MI PA < VERSION
+          branch="${GITHUB_REF_NAME}"
+          if [ "$branch" = main ] && [ "$(git rev-list --parents -n1 HEAD | wc -w)" = 3 ] \
+             && git merge-base --is-ancestor HEAD^2 origin/development; then
+            MI=$((MI+1)); PA=0
+          else
+            PA=$((PA+1))
+          fi
+          echo "$MA.$MI.$PA" > VERSION
+          echo "v=$MA.$MI.$PA" >> "$GITHUB_OUTPUT"
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore(release): v${{ steps.bump.outputs.v }} [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_NAME}" = main ]; then
+            git fetch origin development
+            git checkout -B development origin/development
+            git merge --no-edit origin/main
+            git push origin development
+          fi

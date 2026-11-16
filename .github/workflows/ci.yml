@@ -1,0 +1,19 @@
+name: ci
+on:
+  pull_request:
+    branches: [development]
+  push:
+    branches: [development, main]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: for f in spikes/*.sh; do bash -n "$f"; done
+      - name: Rust (once a Cargo workspace exists)
+        if: hashFiles('Cargo.toml') != ''
+        run: |
+          cargo fmt --check
+          cargo clippy -- -D warnings
+          cargo test

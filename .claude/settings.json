@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.sh) bash -n \"$f\" || exit 2;; *.rs) rustfmt --edition 2021 \"$f\" >/dev/null 2>&1 || true;; esac"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && for f in spikes/*.sh; do [ -e \"$f\" ] && { bash -n \"$f\" || { echo \"syntax error in $f\" >&2; exit 2; }; }; done; if [ -f Cargo.toml ]; then cargo fmt --check && cargo clippy -- -D warnings && cargo test || exit 2; fi"
+          }
+        ]
+      }
+    ]
+  }
+}
