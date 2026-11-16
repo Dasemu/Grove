@@ -61,4 +61,58 @@ is the broad-scope `tea`/`gh` token; use `grove login` with a narrower token to 
 ## Not verified
 
 - Pull mirror creation on the real Gitea and push to a real GitHub org (mock-tested only).
-- The daemon still syncs every repo under `root.path`, whether or not its directory is a group.
+- Daemon scope and snapshot privacy (below) are verified with local bare remotes and mocks only, not against a real forge.
+
+## Daemon scope and snapshot privacy
+
+### Scope
+
+`groved` manages only repos in the bare + worktrees layout (a `.bare` directory) at
+`<root>/<group>/<repo>` for groups present in the config. Everything else under the root is
+ignored: plain clones (never migrated with `grove add`), directories that are not configured
+groups, repos directly under the root. Ignored plain clones inside a configured group are listed as
+"not migrated (run grove add)" by `grove daemon status` and `grove doctor`. Discovery reads one
+directory per configured group, so it stays cheap. Group names must be plain directory names.
+
+### Snapshot policy
+
+WIP snapshots (`refs/sync/<machine>/<branch>`) contain uncommitted work, so on a public repo anyone
+could read them. New key, global default under `[sync]` and optional override per group:
+
+```toml
+[sync]
+snapshots = "private-only"      # default: "private-only" | "all" | "none"
+
+[[groups]]
+name = "Zenvairo"
+primary = "gitea"
+snapshots = "all"               # optional per-group override
+```
+
+- `private-only`: push snapshots only when the forge says the repo is private.
+- `all`: always push. `none`: never push.
+- When snapshots are withheld the daemon neither takes nor pushes them for that repo. Fetching, fast
+  forwarding and applying other machines' snapshots are unaffected. The reason shows in
+  `grove daemon status` ("snapshots withheld: ...") and once per change in the daemon log
+  (`snapshots_withheld` / `snapshots_enabled`).
+- `grove sync` (manual) still pushes snapshots regardless of this setting.
+
+### How visibility is resolved
+
+For `private-only` the daemon matches the repo's `origin` URL (https, `ssh://` or scp-like) against
+the configured providers by host (port ignored; GitHub without a URL is `github.com`), gets the
+token with `token::resolve` (so the `tea`/`gh` fallback applies) and calls
+`GET /repos/{owner}/{repo}` (`Provider::get_repo`, Gitea/Forgejo and GitHub). The answer is cached in
+`<state dir>/visibility.json` for 6 hours; a failed lookup is retried at most every 5 minutes. A
+cached answer older than 6 hours is never used when the refresh fails.
+
+Unknown visibility counts as **public**: no matching provider, no token, network error, 404 (e.g. a
+token without access to a private GitHub repo), a reply without the `private` flag, or no `origin`.
+No lookup happens during an offline (backoff) pass, since nothing is pushed then.
+
+### auto_materialize
+
+`auto_materialize` (default `true`) makes the daemon create a worktree directory for every remote
+branch of a repo, including long-merged ones, and archive worktrees whose branch is gone. It is
+decided **per group** (it used to apply only when every group enabled it): set
+`auto_materialize = false` in a group to stop that for its repos. The default is unchanged.
