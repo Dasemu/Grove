@@ -294,3 +294,62 @@ fn migrated_repo_with_linked_worktrees_syncs_only_what_it_can() {
     assert!(rep.archived.is_empty(), "{:?}", rep.archived);
     assert!(outside.join("a.txt").exists());
 }
+
+#[test]
+fn purge_removes_remote_only_own_refs_and_nothing_else() {
+    use grove_core::receive::purge_own_snapshots;
+    let base = tmpdir("purge");
+    let remote = base.join("r.git");
+    Git::new(&base)
+        .run(&[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ])
+        .unwrap();
+    let seed = init(&base.join("seed"));
+    seed.run(&["remote", "add", "origin", remote.to_str().unwrap()])
+        .unwrap();
+    commit(&seed, "a.txt", "1\n");
+    seed.run(&["push", "-q", "-u", "origin", "main"]).unwrap();
+    // Own refs: one with a local copy, one only on the remote. Plus another machine's ref.
+    seed.run(&["push", "-q", "origin", "main:refs/sync/A/main"])
+        .unwrap();
+    seed.run(&["push", "-q", "origin", "main:refs/sync/A/feat/x"])
+        .unwrap();
+    seed.run(&["push", "-q", "origin", "main:refs/sync/B/main"])
+        .unwrap();
+    seed.run(&["update-ref", "refs/sync/A/main", "HEAD"])
+        .unwrap();
+    let done = purge_own_snapshots(seed.dir(), "A", "origin").unwrap();
+    assert_eq!(done, vec!["refs/sync/A/feat/x", "refs/sync/A/main"]);
+    let refs = Git::new(&remote)
+        .run(&["for-each-ref", "--format=%(refname)"])
+        .unwrap();
+    assert_eq!(refs, "refs/heads/main\nrefs/sync/B/main");
+    assert!(
+        seed.run(&["for-each-ref", "refs/sync/A/"])
+            .unwrap()
+            .is_empty()
+    );
+    // A remote that cannot be reached is a failure and keeps the local refs.
+    seed.run(&["update-ref", "refs/sync/A/main", "HEAD"])
+        .unwrap();
+    seed.run(&[
+        "remote",
+        "set-url",
+        "origin",
+        base.join("nope.git").to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(purge_own_snapshots(seed.dir(), "A", "origin").is_err());
+    assert!(
+        !seed
+            .run(&["for-each-ref", "refs/sync/A/"])
+            .unwrap()
+            .is_empty()
+    );
+}

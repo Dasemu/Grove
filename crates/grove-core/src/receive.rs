@@ -6,6 +6,7 @@ use crate::inspect::{facts, state};
 use crate::layout::dir_name;
 use crate::snapshot::ref_name;
 use crate::state::State;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -94,14 +95,24 @@ pub fn push_snapshot(worktree: &Path, machine: &str, remote: &str) -> Result<(),
         .probe(&["symbolic-ref", "--short", "-q", "HEAD"])?
         .ok_or_else(|| GitError::Other("detached HEAD".into()))?;
     let r = ref_name(machine, &branch);
-    g.run(&["push", "-q", "--force", remote, &format!("{r}:{r}")])?;
+    g.run(&[
+        "-c",
+        "push.recurseSubmodules=no",
+        "push",
+        "-q",
+        "--force",
+        remote,
+        &format!("{r}:{r}"),
+    ])?;
     Ok(())
 }
 
-/// Deletes this machine's snapshot refs (`refs/sync/<machine>/*`, never anything else) from
-/// `remote` and then locally; used when snapshots must no longer be published. A ref the remote
-/// does not have counts as deleted. Returns the refs removed; on a failed push the local ref is
-/// kept so the next call retries. Errors carry the first failure.
+/// Deletes this machine's snapshot refs (`refs/sync/<machine>/*`, never anything else) from every
+/// push URL of `remote` and then locally; used when snapshots must no longer be published.
+/// Refs that exist only on the remote side are removed too. Each URL is pushed separately and
+/// counts as clean only when a fresh `ls-remote` shows none of this machine's refs; any other
+/// outcome (including "repository does not exist") is a failure that keeps the local refs so
+/// the next call retries. Returns the refs removed.
 pub fn purge_own_snapshots(
     gitdir: &Path,
     machine: &str,
@@ -109,22 +120,62 @@ pub fn purge_own_snapshots(
 ) -> Result<Vec<String>, GitError> {
     let g = Git::new(gitdir);
     let prefix = format!("refs/sync/{machine}/");
-    let refs = g.run(&["for-each-ref", "--format=%(refname)", &prefix])?;
-    let mut done = Vec::new();
+    let pattern = format!("{prefix}*");
+    let own = |text: &str, refs: &mut BTreeSet<String>| {
+        for l in text.lines() {
+            if let Some(r) = l.split_whitespace().last()
+                && r.starts_with(&prefix)
+            {
+                refs.insert(r.to_string());
+            }
+        }
+    };
+    let mut all = BTreeSet::new();
+    own(
+        &g.run(&["for-each-ref", "--format=%(refname)", &prefix])?,
+        &mut all,
+    );
+    let urls = g.run(&["remote", "get-url", "--push", "--all", remote])?;
     let mut failure = None;
-    for r in refs.lines().filter(|r| r.starts_with(&prefix)) {
-        match g.run(&["push", "-q", remote, &format!(":{r}")]) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("does not exist") => {}
+    for url in urls.lines().map(str::trim).filter(|u| !u.is_empty()) {
+        let mut there = BTreeSet::new();
+        match g.run(&["ls-remote", url, &pattern]) {
+            Ok(t) => own(&t, &mut there),
             Err(e) => {
                 failure.get_or_insert(e);
                 continue;
             }
         }
-        g.run(&["update-ref", "-d", r])?;
-        done.push(r.to_string());
+        all.extend(there.iter().cloned());
+        if there.is_empty() {
+            continue;
+        }
+        let mut args = vec!["-c", "push.recurseSubmodules=no", "push", "-q", url];
+        let specs: Vec<String> = there.iter().map(|r| format!(":{r}")).collect();
+        args.extend(specs.iter().map(String::as_str));
+        let pushed = g.run(&args);
+        let mut left = BTreeSet::new();
+        match g.run(&["ls-remote", url, &pattern]) {
+            Ok(t) => own(&t, &mut left),
+            Err(e) => {
+                failure.get_or_insert(e);
+                continue;
+            }
+        }
+        if !left.is_empty() {
+            failure.get_or_insert(pushed.err().unwrap_or_else(|| {
+                GitError::Other(format!("{url}: snapshot refs still present after delete"))
+            }));
+        }
     }
-    failure.map_or(Ok(done), Err)
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    let local = g.run(&["for-each-ref", "--format=%(refname)", &prefix])?;
+    for r in local.lines().filter(|r| r.starts_with(&prefix)) {
+        g.run(&["update-ref", "-d", r])?;
+    }
+    Ok(all.into_iter().collect())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
