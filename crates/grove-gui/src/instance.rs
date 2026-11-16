@@ -64,14 +64,17 @@ pub fn acquire_with(path: &Path, show: bool, timeout: Duration) -> std::io::Resu
     for _ in 0..3 {
         match notify(path, if show { "show" } else { "ping" }, timeout) {
             Ok(()) => return Ok(Role::Secondary),
-            // Nobody listens: a stale socket file from a crash is replaced.
+            // Nobody listens: a stale socket file from a crash is replaced. A reset
+            // (seen under load on a socket whose listener is gone) means the same.
             Err(e)
                 if matches!(
                     e.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotFound
                 ) =>
             {
-                if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                if e.kind() != std::io::ErrorKind::NotFound {
                     let _ = std::fs::remove_file(path);
                 }
             }
