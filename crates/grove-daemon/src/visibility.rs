@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 /// How long a "private" answer is trusted (a repo can be made public at any time).
 pub const PRIVATE_TTL: u64 = 3600;
-/// How long a "not private" or "absent" answer is trusted.
+/// How long a "not private" answer (which only withholds) is trusted.
 pub const OTHER_TTL: u64 = 6 * 3600;
 /// Minimum wait before asking the forge again after a failed lookup.
 pub const RETRY: u64 = 300;
@@ -214,9 +214,10 @@ struct Entry {
 impl Entry {
     /// A timestamp in the future (clock change, hand-edited file) counts as expired.
     fn fresh(&self, now: u64) -> bool {
+        // Only a restrictive answer may live long; "private" and "absent" both permit pushes.
         let ttl = match self.seen {
-            Seen::Private => PRIVATE_TTL,
-            _ => OTHER_TTL,
+            Seen::NotPrivate => OTHER_TTL,
+            Seen::Private | Seen::Absent => PRIVATE_TTL,
         };
         self.checked <= now && now - self.checked < ttl
     }
@@ -279,7 +280,8 @@ impl Visibility {
         now: u64,
         forge: &dyn Forge,
     ) -> Result<Seen, String> {
-        let key = format!("{pid}/{owner}/{name}").to_ascii_lowercase();
+        let url = pc.url.as_deref().unwrap_or_default().trim_end_matches('/');
+        let key = format!("{pid}|{url}|{owner}/{name}").to_ascii_lowercase();
         if let Some(e) = self.entries.get(&key)
             && e.fresh(now)
         {
@@ -628,6 +630,11 @@ owners = { github = "gh-org" }
         v.check_url(&c, "https://github.com/o/p", 0, &f2);
         v.check_url(&c, "https://github.com/o/p", OTHER_TTL - 1, &f2);
         assert_eq!(f2.calls.get(), 1);
+        // An "absent" mirror answer permits pushing, so it gets the short TTL.
+        let f3 = Fake::default().with("o/a", Ok(Seen::Absent));
+        v.check_url(&c, "https://github.com/o/a", 0, &f3);
+        v.check_url(&c, "https://github.com/o/a", PRIVATE_TTL, &f3);
+        assert_eq!(f3.calls.get(), 2);
         // After the TTL a failing refresh does not fall back to the stale answer.
         let bad = Fake::default().with("o/r", Err("down"));
         let t = 100 + 10 * PRIVATE_TTL;
