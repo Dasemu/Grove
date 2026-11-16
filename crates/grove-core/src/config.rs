@@ -62,6 +62,40 @@ pub struct Group {
     pub layout: Layout,
     #[serde(default = "yes")]
     pub auto_materialize: bool,
+    /// Account or organisation that owns the group's repos, per provider id. A provider not
+    /// listed here uses the authenticated user.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub owners: BTreeMap<String, String>,
+    /// Where public repos go when that differs from `primary`/`mirror_to` (which then apply to
+    /// private repos only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public: Option<Route>,
+}
+
+/// A primary forge plus the forges it is mirrored to.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct Route {
+    pub primary: String,
+    #[serde(default)]
+    pub mirror_to: Vec<String>,
+}
+
+impl Group {
+    /// The route a repo of this visibility takes.
+    pub fn route(&self, private: bool) -> Route {
+        match (&self.public, private) {
+            (Some(r), false) => r.clone(),
+            _ => Route {
+                primary: self.primary.clone(),
+                mirror_to: self.mirror_to.clone(),
+            },
+        }
+    }
+
+    /// The owner configured for `provider`, if any (otherwise: the authenticated user).
+    pub fn owner(&self, provider: &str) -> Option<&str> {
+        self.owners.get(provider).map(String::as_str)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -186,24 +220,44 @@ impl Config {
             ));
         }
         for g in &self.groups {
-            if !self.providers.contains_key(&g.primary) {
-                return bad(format!(
-                    "group {:?}: unknown primary provider {:?}",
-                    g.name, g.primary
-                ));
+            let mut routes = vec![("", g.route(true))];
+            if let Some(p) = &g.public {
+                routes.push(("public.", p.clone()));
             }
-            if let Some(m) = g
-                .mirror_to
-                .iter()
-                .find(|m| !self.providers.contains_key(*m))
-            {
-                return bad(format!("group {:?}: unknown mirror provider {m:?}", g.name));
+            for (pfx, r) in routes {
+                if !self.providers.contains_key(&r.primary) {
+                    return bad(format!(
+                        "group {:?}: unknown {pfx}primary provider {:?}",
+                        g.name, r.primary
+                    ));
+                }
+                if let Some(m) = r
+                    .mirror_to
+                    .iter()
+                    .find(|m| !self.providers.contains_key(*m))
+                {
+                    return bad(format!(
+                        "group {:?}: unknown {pfx}mirror provider {m:?}",
+                        g.name
+                    ));
+                }
+                if r.mirror_to.contains(&r.primary) {
+                    return bad(format!(
+                        "group {:?}: {pfx}primary cannot also be a mirror target",
+                        g.name
+                    ));
+                }
             }
-            if g.mirror_to.contains(&g.primary) {
-                return bad(format!(
-                    "group {:?}: primary cannot also be a mirror target",
-                    g.name
-                ));
+            for (p, o) in &g.owners {
+                if !self.providers.contains_key(p) {
+                    return bad(format!(
+                        "group {:?}: owner for unknown provider {p:?}",
+                        g.name
+                    ));
+                }
+                if o.trim().is_empty() {
+                    return bad(format!("group {:?}: empty owner for {p:?}", g.name));
+                }
             }
         }
         if let Some(c) = &self.config_repo
@@ -290,6 +344,67 @@ name = "grove-config"
             Config::parse(&selfm),
             Err(ConfigError::Invalid(_))
         ));
+    }
+
+    const ROUTED: &str = r#"
+[machine]
+name = "a"
+[root]
+path = "/x"
+[providers.gitea]
+kind = "gitea"
+[providers.github]
+kind = "github"
+[[groups]]
+name = "g"
+primary = "gitea"
+owners = { gitea = "Org", github = "org-gh" }
+[groups.public]
+primary = "github"
+mirror_to = ["gitea"]
+"#;
+
+    #[test]
+    fn routes_by_visibility_and_resolves_owners() {
+        let c = Config::parse(ROUTED).unwrap();
+        let g = &c.groups[0];
+        let private = g.route(true);
+        assert_eq!(
+            (private.primary.as_str(), private.mirror_to.len()),
+            ("gitea", 0)
+        );
+        let public = g.route(false);
+        assert_eq!(public.primary, "github");
+        assert_eq!(public.mirror_to, vec!["gitea".to_string()]);
+        assert_eq!(g.owner("gitea"), Some("Org"));
+        assert_eq!(g.owner("nope"), None);
+        // Without a public route both visibilities use the base route.
+        let plain = Config::parse(FULL).unwrap();
+        assert_eq!(plain.groups[0].route(false), plain.groups[0].route(true));
+        // Round-trips through save's serializer.
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert_eq!(Config::parse(&text).unwrap(), c);
+    }
+
+    #[test]
+    fn rejects_bad_public_routes_and_owners() {
+        for (from, to) in [
+            (
+                "primary = \"github\"\nmirror_to",
+                "primary = \"nope\"\nmirror_to",
+            ),
+            ("mirror_to = [\"gitea\"]", "mirror_to = [\"github\"]"),
+            ("mirror_to = [\"gitea\"]", "mirror_to = [\"nope\"]"),
+            ("github = \"org-gh\"", "nope = \"x\""),
+            ("github = \"org-gh\"", "github = \" \""),
+        ] {
+            let t = ROUTED.replace(from, to);
+            assert_ne!(t, ROUTED, "{from:?} not found");
+            assert!(
+                matches!(Config::parse(&t), Err(ConfigError::Invalid(_))),
+                "{to:?}"
+            );
+        }
     }
 
     #[test]

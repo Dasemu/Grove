@@ -367,7 +367,9 @@ fn main() -> Result<()> {
                 *force,
             )?;
             println!("wrote {}", path.display());
-            println!("next: `grove login {provider}` to store the API token");
+            println!(
+                "next: `grove doctor` (tokens from `tea`/`gh` are used if present; else `grove login {provider}`)"
+            );
             Ok(())
         }
         Cmd::Login { provider } => {
@@ -524,6 +526,13 @@ fn doctor(cfg_arg: &Option<PathBuf>) -> Result<()> {
     if let Some(c) = &cfg {
         let root = c.root_path();
         line(Some(root.is_dir()), format!("root {}", root.display()));
+        // Local lookup only (env, Secret Service, tea/gh): no request reaches the forge.
+        for (id, pc) in &c.providers {
+            match grove_providers::token::resolve(id, pc) {
+                Ok((_, src)) => line(Some(true), format!("provider {id:?}: token from {src:?}")),
+                Err(e) => line(None, format!("provider {id:?}: {e}")),
+            }
+        }
         for g in &c.groups {
             let gdir = root.join(&g.name);
             let Ok(rd) = std::fs::read_dir(&gdir) else {
