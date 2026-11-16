@@ -7,6 +7,7 @@
 mod autostart;
 mod bridge;
 mod instance;
+mod log;
 mod model;
 mod tray;
 
@@ -125,6 +126,10 @@ struct UiState {
     detail_fp: String,
     filter: String,
     pending: Option<Vec<String>>,
+    /// Clones waiting for the migration confirmation, and what happened to each so far.
+    mig_pending: Option<Vec<String>>,
+    mig: HashMap<String, (String, String)>,
+    migrating: bool,
     picks: Rc<VecModel<Pick>>,
     /// Last successful scan per import group, for the session (names still to import).
     import_cache: HashMap<String, Vec<String>>,
@@ -145,6 +150,9 @@ thread_local! {
         detail_fp: String::new(),
         filter: String::new(),
         pending: None,
+        mig_pending: None,
+        mig: HashMap::new(),
+        migrating: false,
         picks: Rc::new(VecModel::default()),
         import_cache: HashMap::new(),
         import_current: String::new(),
@@ -224,16 +232,25 @@ fn render(ui: &MainWindow) {
         ui.set_attention_count(agg.attention as i32);
         ui.set_has_config(snap.config.is_some());
         ui.set_autostart(autostart::config_home().is_some_and(|d| autostart::is_enabled(&d)));
-        let nm: Vec<SharedString> = snap
+        let nm: Vec<MigRow> = snap
             .status
             .as_ref()
             .and_then(|s| s["not_migrated"].as_array())
             .map(|a| {
                 a.iter()
-                    .filter_map(|p| p.as_str().map(SharedString::from))
+                    .filter_map(|p| p.as_str())
+                    .map(|p| {
+                        let (state, msg) = st.mig.get(p).cloned().unwrap_or_default();
+                        MigRow {
+                            path: p.into(),
+                            state: state.into(),
+                            msg: msg.into(),
+                        }
+                    })
                     .collect()
             })
             .unwrap_or_default();
+        ui.set_migrating(st.migrating);
         ui.set_not_migrated(ModelRc::from(Rc::new(VecModel::from(nm))));
 
         let empty = Vec::new();
@@ -568,6 +585,91 @@ fn scan(ctx: &Ctx, ui: &MainWindow, group: String, force: bool, note: Option<Str
     });
 }
 
+/// Opens the confirmation dialog for migrating `paths` (nothing runs before the user accepts).
+fn ask_migrate(ui: &MainWindow, paths: Vec<String>) {
+    if paths.is_empty() || ST.with(|st| st.borrow().migrating) {
+        return;
+    }
+    let backup = Bridge::backup_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|| "grove's state directory".into());
+    let what = match paths.as_slice() {
+        [one] => one.clone(),
+        many => format!("{} clones", many.len()),
+    };
+    ST.with(|st| st.borrow_mut().mig_pending = Some(paths));
+    ui.set_migrate_confirm_text(
+        format!(
+            "Migrate {what} to grove's bare + worktrees layout?\n\nA full backup of each clone (a tar archive and a git ref) is taken first, in {backup}. A clone grove cannot migrate safely (linked worktrees, submodules, detached HEAD...) is refused and left untouched."
+        )
+        .into(),
+    );
+}
+
+/// Migrates the clones one after the other on a worker thread, reporting each result as it comes.
+fn run_migrations(ctx: &Ctx, ui: &MainWindow, paths: Vec<String>) {
+    ST.with(|st| {
+        let mut st = st.borrow_mut();
+        st.migrating = true;
+        for p in &paths {
+            st.mig.remove(p);
+        }
+    });
+    render(ui);
+    let (core, weak) = (ctx.core.clone(), ctx.weak.clone());
+    std::thread::spawn(move || {
+        let total = paths.len();
+        let (mut done, mut failed) = (0, 0);
+        for p in paths {
+            let (w, p1) = (weak.clone(), p.clone());
+            let _ = slint::invoke_from_event_loop(move || {
+                ST.with(|st| {
+                    st.borrow_mut()
+                        .mig
+                        .insert(p1, ("running".into(), String::new()))
+                });
+                if let Some(ui) = w.upgrade() {
+                    render(&ui);
+                }
+            });
+            let r = core.bridge.cli(&["add".to_string(), p.clone()], "");
+            let ok = r["ok"] == true;
+            let text = r["output"].as_str().unwrap_or("").to_string();
+            let msg = if ok {
+                done += 1;
+                text.lines()
+                    .find_map(|l| l.strip_prefix("migrated:"))
+                    .map(|m| format!("Migrated to {}", m.trim()))
+                    .unwrap_or_else(|| "Migrated".into())
+            } else {
+                failed += 1;
+                text.lines().next().unwrap_or("failed").to_string()
+            };
+            let (w, p2) = (weak.clone(), p);
+            let _ = slint::invoke_from_event_loop(move || {
+                let state = if ok { "ok" } else { "failed" };
+                ST.with(|st| st.borrow_mut().mig.insert(p2, (state.into(), msg)));
+                if let Some(ui) = w.upgrade() {
+                    render(&ui);
+                }
+            });
+        }
+        let w = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            ST.with(|st| st.borrow_mut().migrating = false);
+            if let Some(ui) = w.upgrade() {
+                render(&ui);
+                toast(
+                    &ui,
+                    &format!("Migration finished: {done} of {total} migrated, {failed} failed"),
+                    failed > 0,
+                );
+            }
+        });
+        core.wake(); // refresh the status
+    });
+}
+
 fn first_or(v: &str, list: &ModelRc<SharedString>) -> String {
     if v.is_empty() {
         list.row_data(0).map(|x| x.to_string()).unwrap_or_default()
@@ -734,6 +836,47 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
                 toast(&ui, &format!("Cannot change autostart: {e}"), true);
             }
             ui.set_autostart(autostart::config_home().is_some_and(|d| autostart::is_enabled(&d)));
+        }
+    });
+    ui.on_migrate_one({
+        let w = ui.as_weak();
+        move |path| {
+            if let Some(ui) = w.upgrade() {
+                ask_migrate(&ui, vec![path.to_string()]);
+            }
+        }
+    });
+    ui.on_migrate_all({
+        let w = ui.as_weak();
+        move || {
+            let Some(ui) = w.upgrade() else { return };
+            let todo: Vec<String> = ui
+                .get_not_migrated()
+                .iter()
+                .filter(|r| r.state != "ok" && r.state != "running")
+                .map(|r| r.path.to_string())
+                .collect();
+            ask_migrate(&ui, todo);
+        }
+    });
+    ui.on_migrate_confirm_cancel({
+        let w = ui.as_weak();
+        move || {
+            ST.with(|st| st.borrow_mut().mig_pending = None);
+            if let Some(ui) = w.upgrade() {
+                ui.set_migrate_confirm_text("".into());
+            }
+        }
+    });
+    ui.on_migrate_confirm_accept({
+        let c = ctx.clone();
+        move || {
+            let Some(ui) = c.weak.upgrade() else { return };
+            ui.set_migrate_confirm_text("".into());
+            let Some(paths) = ST.with(|st| st.borrow_mut().mig_pending.take()) else {
+                return;
+            };
+            run_migrations(&c, &ui, paths);
         }
     });
     ui.on_confirm_cancel({
@@ -918,9 +1061,11 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
 fn worker(
     core: Arc<Core>,
     rx: Receiver<()>,
-    tray: Option<tray::TrayHandle>,
+    mut tray: Option<tray::TrayHandle>,
+    respawn_tray: impl Fn() -> Option<tray::TrayHandle>,
     weak: Weak<MainWindow>,
 ) {
+    let mut tray_lost = false;
     let mut last_states: HashMap<String, String> = HashMap::new();
     let mut last_agg: Option<Aggregate> = None;
     let mut last_run = Instant::now() - MIN_GAP_HIDDEN;
@@ -996,10 +1141,25 @@ fn worker(
             }
         }
 
+        // The tray service ends when its D-Bus connection is lost (e.g. the session bus or the
+        // desktop shell restarted): bring it back instead of leaving a running app with no icon.
+        if core.tray_ok.load(Ordering::SeqCst) && tray.as_ref().is_none_or(|t| t.is_closed()) {
+            if !tray_lost {
+                log::line("tray service ended; trying to restart it");
+                tray_lost = true;
+            }
+            if let Some(h) = respawn_tray() {
+                log::line("tray service restarted");
+                tray = Some(h);
+                tray_lost = false;
+                last_agg = None;
+            }
+        }
         if let Some(t) = &tray
             && last_agg.as_ref() != Some(&agg)
+            && !tray::set_state(t, &agg)
         {
-            tray::set_state(t, &agg);
+            log::line("tray update failed: service closed");
         }
         last_agg = Some(agg);
 
@@ -1034,17 +1194,27 @@ fn worker(
 
 /// Wakes the worker whenever the daemon emits an activity event.
 fn subscriber(core: Arc<Core>) {
+    let mut connected = false;
     loop {
         if let Ok(mut c) = UnixStream::connect(&core.bridge.socket) {
+            if !connected {
+                log::line("daemon: subscribed");
+                connected = true;
+            }
             if writeln!(c, r#"{{"v":1,"cmd":"subscribe"}}"#).is_ok() {
                 for line in BufReader::new(c).lines() {
-                    if line.is_err() {
+                    if let Err(e) = line {
+                        log::line(&format!("daemon: event stream error: {e}"));
                         break;
                     }
                     core.wake();
                 }
             }
             core.wake(); // connection ended: the daemon went away
+            if connected {
+                log::line("daemon: event stream ended");
+                connected = false;
+            }
         }
         std::thread::sleep(RECONNECT);
     }
@@ -1061,6 +1231,20 @@ fn default_grove_bin() -> PathBuf {
 }
 
 fn main() -> Result<()> {
+    log::init();
+    log::line(&format!(
+        "start {}",
+        std::env::args().skip(1).collect::<Vec<_>>().join(" ")
+    ));
+    let r = run();
+    match &r {
+        Ok(()) => log::line("exit: ok"),
+        Err(e) => log::line(&format!("exit: error: {e:#}")),
+    }
+    r
+}
+
+fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |name: &str| {
         args.iter()
@@ -1154,18 +1338,21 @@ fn main() -> Result<()> {
             Action::SyncNow => ctx.core.sync(None, ctx.weak.clone()),
             Action::TogglePause => ctx.core.toggle_pause(),
             Action::Quit => {
+                log::line("quit requested from the tray menu");
+                log::expected_exit();
                 let _ = slint::invoke_from_event_loop(|| {
                     let _ = slint::quit_event_loop();
                 });
             }
         })
     };
-    let tray = match tray::spawn(on_action) {
+    let tray = match tray::spawn(on_action.clone()) {
         Ok(h) => {
             core.tray_ok.store(true, Ordering::SeqCst);
             Some(h)
         }
         Err(e) => {
+            log::line(&format!("no system tray: {e}"));
             eprintln!("grove-gui: no system tray ({e}); closing the window will quit");
             None
         }
@@ -1176,6 +1363,8 @@ fn main() -> Result<()> {
         move || {
             c.core.set_visible(false);
             if !c.core.tray_ok.load(Ordering::SeqCst) {
+                log::line("window closed and no tray: quitting");
+                log::expected_exit();
                 let _ = slint::quit_event_loop();
             }
             slint::CloseRequestResponse::HideWindow
@@ -1184,7 +1373,10 @@ fn main() -> Result<()> {
 
     {
         let (c, w) = (core.clone(), ui.as_weak());
-        std::thread::spawn(move || worker(c, rx, tray, w));
+        let respawn = on_action.clone();
+        std::thread::spawn(move || {
+            worker(c, rx, tray, move || tray::spawn(respawn.clone()).ok(), w)
+        });
     }
     {
         let c = core.clone();
@@ -1197,7 +1389,12 @@ fn main() -> Result<()> {
     } else {
         core.wake();
     }
-    slint::run_event_loop_until_quit().context("event loop")?;
+    let r = slint::run_event_loop_until_quit();
+    log::line(&format!(
+        "event loop ended: {r:?} (expected: {})",
+        log::EXPECTED_EXIT.load(Ordering::SeqCst)
+    ));
+    r.context("event loop")?;
     let _ = std::fs::remove_file(&inst_path);
     Ok(())
 }

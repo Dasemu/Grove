@@ -45,6 +45,13 @@ export struct Pick {
     checked: bool,
 }
 
+export struct MigRow {
+    path: string,
+    // "" (not started), "running", "ok", "failed"
+    state: string,
+    msg: string,
+}
+
 export struct Out {
     text: string,
     ok: bool,
@@ -180,7 +187,9 @@ export component MainWindow inherits Window {
     in property <int> wt-count;
     in property <int> attention-count;
     in property <[Repo]> repos;
-    in property <[string]> not-migrated;
+    in property <[MigRow]> not-migrated;
+    in property <bool> migrating;
+    in property <string> migrate-confirm-text;
     in property <[LogRow]> log;
     in property <[string]> groups;
     in property <[string]> providers;
@@ -214,6 +223,10 @@ export component MainWindow inherits Window {
     callback import-selected(string);
     callback pick-toggled(int, bool);
     callback resolve(string, string, string);
+    callback migrate-one(string);
+    callback migrate-all();
+    callback migrate-confirm-accept();
+    callback migrate-confirm-cancel();
     callback confirm-accept();
     callback confirm-cancel();
     callback run-settings(string);
@@ -376,10 +389,48 @@ export component MainWindow inherits Window {
                                 text: "These clones are in your workspace but not managed by grove yet: run `grove add` for each one to bring it into a group.";
                             }
 
-                            for p in root.not-migrated: Muted {
-                                text: p;
-                                font-size: 12px;
-                                overflow: elide;
+                            for p in root.not-migrated: VerticalLayout {
+                                spacing: 2px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Muted {
+                                        text: p.path;
+                                        font-size: 12px;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    if p.state == "running": Muted {
+                                        text: "Migrating…";
+                                    }
+                                    if p.state == "ok": Muted {
+                                        text: "Migrated";
+                                    }
+                                    if p.state == "" || p.state == "failed": Button {
+                                        text: p.state == "failed" ? "Retry" : "Migrate";
+                                        enabled: !root.migrating;
+                                        clicked => {
+                                            root.migrate-one(p.path);
+                                        }
+                                    }
+                                }
+
+                                if p.msg != "": Muted {
+                                    text: p.msg;
+                                    font-size: 12px;
+                                    overflow: elide;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: root.migrating ? "Migrating…" : "Migrate all";
+                                    enabled: !root.migrating;
+                                    clicked => {
+                                        root.migrate-all();
+                                    }
+                                }
                             }
                         }
                         if !root.offline && root.loading: Muted {
@@ -1107,6 +1158,43 @@ export component MainWindow inherits Window {
             text: root.toast-text;
             color: white;
             wrap: word-wrap;
+        }
+    }
+
+    // ---- migration confirmation ----
+    if root.migrate-confirm-text != "": Rectangle {
+        background: #00000088;
+        TouchArea { }
+
+        Card {
+            width: min(500px, parent.width - 40px);
+            height: self.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Palette.background;
+            Text {
+                text: root.migrate-confirm-text;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                Button {
+                    text: "Cancel";
+                    clicked => {
+                        root.migrate-confirm-cancel();
+                    }
+                }
+
+                Button {
+                    text: "Migrate";
+                    primary: true;
+                    clicked => {
+                        root.migrate-confirm-accept();
+                    }
+                }
+            }
         }
     }
 

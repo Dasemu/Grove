@@ -113,3 +113,19 @@ kind = "gitea"
 url = "https://git.example.com"
 protocol = "ssh"   # optional, default "https"
 ```
+
+## Migrating clones from the GUI
+
+The "Not migrated clones" card has a Migrate button per row and a Migrate all button. Each asks
+for confirmation first (the dialog names the backup directory, `<state dir>/backups`), then runs
+`grove add <path>` one clone at a time off the UI thread, showing "Migrating…", then the migrated
+path or the refusal message (linked worktrees, submodules, detached HEAD...). The bridge only runs
+`add` for an existing, non-symlink directory directly under `<root>/<group>/` and passes no flags
+(so no custom backup directory). Afterwards the status is refreshed; the daemon computes its
+not-migrated list at start (a daemon-side fix is separate), so finished rows stay on screen with
+their result until the daemon list changes.
+
+## Diagnostics log
+
+`<state dir>/grove-gui.log` (rotated at 256 KiB) records start-up, daemon subscribe/disconnect,
+tray errors and restarts, panics with a backtrace (from any thread) and why the event loop ended.

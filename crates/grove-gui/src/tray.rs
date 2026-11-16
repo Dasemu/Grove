@@ -31,13 +31,16 @@ pub fn spawn(on_action: Arc<dyn Fn(Action) + Send + Sync>) -> Result<TrayHandle,
     .spawn()
 }
 
-pub fn set_state(handle: &TrayHandle, agg: &Aggregate) {
+/// Returns false when the tray service has ended (D-Bus connection lost).
+pub fn set_state(handle: &TrayHandle, agg: &Aggregate) -> bool {
     let agg = agg.clone();
-    handle.update(move |t| {
-        if t.agg != agg {
-            t.agg = agg;
-        }
-    });
+    handle
+        .update(move |t| {
+            if t.agg != agg {
+                t.agg = agg;
+            }
+        })
+        .is_some()
 }
 
 impl ksni::Tray for GroveTray {

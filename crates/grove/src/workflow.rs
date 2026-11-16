@@ -296,9 +296,7 @@ fn remote_key(url: &str) -> Option<String> {
         _ => path,
     };
     let path = path.trim_matches('/').trim_end_matches(".git");
-    let mut parts = path.rsplitn(2, '/');
-    let name = parts.next()?;
-    let owner = parts.next()?;
+    let (owner, name) = path.rsplit_once('/')?;
     Some(format!("{host}/{owner}/{name}").to_lowercase())
 }
 

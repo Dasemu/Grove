@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// `grove` subcommands the GUI may run. Everything else is refused.
@@ -11,6 +11,7 @@ const ALLOWED: &[&str] = &[
     "login",
     "new",
     "import",
+    "add",
     "config-repo-init",
     "bootstrap",
     "resolve",
@@ -42,6 +43,11 @@ impl Bridge {
             return json!({"ok": false, "output": format!("command {sub:?} is not allowed from the GUI")});
         }
         if let Err(e) = validate(args) {
+            return json!({"ok": false, "output": format!("rejected: {e}")});
+        }
+        if sub == "add"
+            && let Err(e) = self.check_migrate_args(args)
+        {
             return json!({"ok": false, "output": format!("rejected: {e}")});
         }
         let mut cmd = Command::new(&self.grove_bin);
@@ -77,6 +83,28 @@ impl Bridge {
                 json!({"ok": false, "output": format!("cannot run {}: {e}", self.grove_bin.display())})
             }
         }
+    }
+
+    fn loaded_config(&self) -> Option<grove_core::config::Config> {
+        let p = self
+            .config
+            .clone()
+            .or_else(grove_core::config::Config::default_path)?;
+        grove_core::config::Config::load(&p).ok()
+    }
+
+    /// `add <path>` only for an existing directory directly under `<root>/<group>/`.
+    fn check_migrate_args(&self, args: &[String]) -> Result<(), String> {
+        let [_, path] = args else {
+            return Err("add takes exactly one path".into());
+        };
+        let cfg = self.loaded_config().ok_or("no readable configuration")?;
+        check_migrate_path(&cfg, Path::new(path)).map(|_| ())
+    }
+
+    /// Where `grove add` writes its safety backup.
+    pub fn backup_dir() -> Option<PathBuf> {
+        grove_core::config::Config::state_dir().map(|d| d.join("backups"))
     }
 
     /// `config.toml` as JSON (it holds no secrets), or `None` before onboarding.
@@ -135,6 +163,31 @@ pub fn validate(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// A clone the GUI may migrate: an existing directory (not a symlink) whose parent is one of the
+/// configured group directories. Returns its canonical path.
+pub fn check_migrate_path(
+    cfg: &grove_core::config::Config,
+    path: &Path,
+) -> Result<PathBuf, String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !meta.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    let canon = path.canonicalize().map_err(|e| e.to_string())?;
+    let parent = canon.parent().ok_or("path has no parent directory")?;
+    let root = cfg.root_path();
+    let root = root.canonicalize().unwrap_or(root);
+    if cfg.groups.iter().any(|g| root.join(&g.name) == parent) {
+        Ok(canon)
+    } else {
+        Err(format!(
+            "{} is not directly inside a group directory under {}",
+            path.display(),
+            root.display()
+        ))
+    }
+}
+
 fn grove_core_default_config() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -158,6 +211,72 @@ mod tests {
         assert!(v(&["resolve", "/p", "--save-as", "b", "--take-remote"]).is_ok());
         assert!(v(&["new", "g", "n", "--public"]).is_ok());
         assert!(v(&["secrets", "pull"]).is_ok());
+    }
+
+    #[test]
+    fn migrate_path_must_be_a_clone_directly_under_a_group() {
+        let base = std::env::temp_dir().join(format!("grove-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("work/proj/sub")).unwrap();
+        std::fs::create_dir_all(base.join("other/proj")).unwrap();
+        std::fs::write(base.join("work/file"), "x").unwrap();
+        std::os::unix::fs::symlink(base.join("other/proj"), base.join("work/link")).unwrap();
+        let cfg = grove_core::config::Config::parse(&format!(
+            "[machine]\nname=\"m\"\n[root]\npath=\"{}\"\n[providers.p]\nkind=\"gitea\"\n[[groups]]\nname=\"work\"\nprimary=\"p\"\n",
+            base.display()
+        ))
+        .unwrap();
+        assert!(check_migrate_path(&cfg, &base.join("work/proj")).is_ok());
+        for bad in [
+            "work/proj/sub",
+            "other/proj",
+            "work/file",
+            "work/link",
+            "work/none",
+            "work",
+            "work/../other/proj",
+        ] {
+            assert!(check_migrate_path(&cfg, &base.join(bad)).is_err(), "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn add_runs_only_for_valid_clone_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("grove-add-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("work/proj")).unwrap();
+        std::fs::create_dir_all(base.join("elsewhere")).unwrap();
+        let cfg = base.join("config.toml");
+        std::fs::write(&cfg, format!(
+            "[machine]\nname=\"m\"\n[root]\npath=\"{}\"\n[providers.p]\nkind=\"gitea\"\n[[groups]]\nname=\"work\"\nprimary=\"p\"\n",
+            base.display()
+        )).unwrap();
+        // A stand-in `grove` that reports what it was asked to do.
+        let fake = base.join("grove");
+        std::fs::write(&fake, "#!/bin/sh\necho \"migrated: $3/wt\"\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let b = Bridge {
+            grove_bin: fake,
+            config: Some(cfg),
+            socket: "/nonexistent".into(),
+        };
+        let ok = b.cli(
+            &["add".into(), base.join("work/proj").display().to_string()],
+            "",
+        );
+        assert_eq!(ok["ok"], true, "{ok}");
+        assert!(ok["output"].as_str().unwrap().starts_with("migrated:"));
+        let bad = b.cli(
+            &["add".into(), base.join("elsewhere").display().to_string()],
+            "",
+        );
+        assert_eq!(bad["ok"], false);
+        assert!(bad["output"].as_str().unwrap().contains("rejected"));
+        let flag = b.cli(&["add".into(), "--backup-dir".into(), "/x".into()], "");
+        assert_eq!(flag["ok"], false);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn bridge() -> Bridge {

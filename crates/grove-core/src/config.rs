@@ -515,9 +515,14 @@ mirror_to = ["gitea"]
     #[test]
     fn provider_protocol_defaults_to_https_and_is_validated() {
         let t = |p: &str| {
-            format!("[machine]\nname=\"a\"\n[root]\npath=\"/x\"\n[providers.p]\nkind=\"gitea\"\n{p}")
+            format!(
+                "[machine]\nname=\"a\"\n[root]\npath=\"/x\"\n[providers.p]\nkind=\"gitea\"\n{p}"
+            )
         };
-        assert_eq!(Config::parse(&t("")).unwrap().providers["p"].protocol, Protocol::Https);
+        assert_eq!(
+            Config::parse(&t("")).unwrap().providers["p"].protocol,
+            Protocol::Https
+        );
         let c = Config::parse(&t("protocol=\"ssh\"\n")).unwrap();
         assert_eq!(c.providers["p"].protocol, Protocol::Ssh);
         assert!(toml::to_string(&c).unwrap().contains("protocol = \"ssh\""));
