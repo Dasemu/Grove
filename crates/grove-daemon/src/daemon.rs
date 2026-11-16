@@ -666,6 +666,13 @@ fn pass(
             }
         }
     }
+    if !errors.is_empty() && !is_ready(repo) {
+        // The directory vanished (or stopped being a bare layout) mid-pass: the failure is a
+        // consequence of the removal, not a sync error. Rediscovery drops the repo and logs
+        // `repo_removed`.
+        status.phase = "idle";
+        return 0;
+    }
     if offline {
         // A snapshot-only pass during backoff changes neither the failure count nor the phase.
         status.phase = if status.failures > 0 { "error" } else { "idle" };
@@ -726,6 +733,7 @@ fn purge_snapshots(ctx: &Ctx, repo: &Path, name: &str, cfg: &Config, st: &Settin
                 done.join(", ")
             ),
         ),
+        Err(_) if !is_ready(repo) => {} // removed mid-pass: rediscovery reports it
         Err(e) => ctx.activity.log(
             "error",
             Some(name),
