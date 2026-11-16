@@ -31,10 +31,19 @@ pub fn get(provider_id: &str) -> Result<String> {
         return Ok(t.trim().to_string());
     }
     let e = keyring::Entry::new(SERVICE, provider_id).map_err(|e| Error::Other(e.to_string()))?;
-    match e.get_password() {
-        Ok(t) => Ok(t),
-        Err(keyring::Error::NoEntry) => Err(Error::NoToken(provider_id.into())),
-        Err(e) => Err(Error::Other(format!("secret service: {e}"))),
+    // A locked keyring may wait on an unlock dialog: never block the caller for longer than the
+    // forge CLIs get (the thread is left behind if the Secret Service never answers).
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(e.get_password());
+    });
+    match rx.recv_timeout(CLI_TIMEOUT) {
+        Ok(Ok(t)) => Ok(t),
+        Ok(Err(keyring::Error::NoEntry)) => Err(Error::NoToken(provider_id.into())),
+        Ok(Err(e)) => Err(Error::Other(format!("secret service: {e}"))),
+        Err(_) => Err(Error::Other(
+            "secret service did not answer in time (locked keyring?)".into(),
+        )),
     }
 }
 
