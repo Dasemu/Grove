@@ -62,6 +62,9 @@ pub struct Group {
     pub layout: Layout,
     #[serde(default = "yes")]
     pub auto_materialize: bool,
+    /// Overrides `sync.snapshots` for this group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots: Option<SnapshotPolicy>,
     /// Account or organisation that owns the group's repos, per provider id. A provider not
     /// listed here uses the authenticated user.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -70,6 +73,20 @@ pub struct Group {
     /// private repos only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public: Option<Route>,
+}
+
+/// Whether the daemon pushes WIP snapshots (`refs/sync/<machine>/<branch>`) of a repo.
+/// Snapshots contain uncommitted work, so they must not land in public repos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SnapshotPolicy {
+    /// Push only when the forge confirms the repo is private (unknown counts as public).
+    #[default]
+    PrivateOnly,
+    /// Push for every repo, public ones included.
+    All,
+    /// Never push snapshots.
+    None,
 }
 
 /// A primary forge plus the forges it is mirrored to.
@@ -109,6 +126,9 @@ pub struct Sync {
     /// Changed files larger than this many MiB are not snapshotted (0 = no limit).
     #[serde(default = "default_max_file_mb")]
     pub max_file_mb: u64,
+    /// Default snapshot push policy; a group can override it.
+    #[serde(default)]
+    pub snapshots: SnapshotPolicy,
 }
 
 impl Default for Sync {
@@ -118,6 +138,7 @@ impl Default for Sync {
             fetch_interval_s: default_fetch(),
             ignore_extra: Vec::new(),
             max_file_mb: default_max_file_mb(),
+            snapshots: SnapshotPolicy::default(),
         }
     }
 }
@@ -201,6 +222,15 @@ impl Config {
         Some(base.join("grove"))
     }
 
+    /// The snapshot policy of the group named `group`, falling back to `sync.snapshots`.
+    pub fn snapshot_policy(&self, group: &str) -> SnapshotPolicy {
+        self.groups
+            .iter()
+            .find(|g| g.name == group)
+            .and_then(|g| g.snapshots)
+            .unwrap_or(self.sync.snapshots)
+    }
+
     /// `root.path` with a leading `~` expanded.
     pub fn root_path(&self) -> PathBuf {
         expand_home(&self.root.path)
@@ -220,6 +250,13 @@ impl Config {
             ));
         }
         for g in &self.groups {
+            // Group names are directory names under the root.
+            if g.name.is_empty() || g.name.starts_with('.') || g.name.contains(['/', '\\']) {
+                return bad(format!(
+                    "group name {:?} must be a plain directory name",
+                    g.name
+                ));
+            }
             let mut routes = vec![("", g.route(true))];
             if let Some(p) = &g.public {
                 routes.push(("public.", p.clone()));
@@ -344,6 +381,41 @@ name = "grove-config"
             Config::parse(&selfm),
             Err(ConfigError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn snapshot_policy_defaults_to_private_only_and_groups_override() {
+        let c = Config::parse(FULL).unwrap();
+        assert_eq!(c.sync.snapshots, SnapshotPolicy::PrivateOnly);
+        assert_eq!(c.snapshot_policy("work"), SnapshotPolicy::PrivateOnly);
+        assert_eq!(c.snapshot_policy("unknown"), SnapshotPolicy::PrivateOnly);
+        let t = FULL
+            .replace(
+                "fetch_interval_s = 30",
+                "fetch_interval_s = 30\nsnapshots = \"none\"",
+            )
+            .replace(
+                "mirror_to = [\"github\"]",
+                "mirror_to = [\"github\"]\nsnapshots = \"all\"",
+            );
+        let c = Config::parse(&t).unwrap();
+        assert_eq!(c.snapshot_policy("work"), SnapshotPolicy::All);
+        assert_eq!(c.snapshot_policy("other"), SnapshotPolicy::None);
+        let again = toml::to_string_pretty(&c).unwrap();
+        assert_eq!(Config::parse(&again).unwrap(), c);
+    }
+
+    #[test]
+    fn rejects_unknown_snapshot_policy_and_bad_group_names() {
+        let bad = FULL.replace("fetch_interval_s = 30", "snapshots = \"public\"");
+        assert!(matches!(Config::parse(&bad), Err(ConfigError::Parse(_))));
+        for n in ["a/b", ".hidden", ""] {
+            let t = FULL.replace("name = \"work\"", &format!("name = \"{n}\""));
+            assert!(
+                matches!(Config::parse(&t), Err(ConfigError::Invalid(_))),
+                "{n:?}"
+            );
+        }
     }
 
     const ROUTED: &str = r#"

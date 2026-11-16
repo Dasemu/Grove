@@ -15,6 +15,7 @@ fn opts(machine: &str, stamp: &str) -> Options {
         remote: "origin".into(),
         offline: false,
         materialize: true,
+        push_snapshots: true,
     }
 }
 
@@ -167,4 +168,45 @@ fn staged_changes_block_adoption_so_the_index_is_never_reset() {
     let r = sync_repo(&db, &opts("B", "t3")).unwrap();
     assert_eq!(r.worktrees[0].state, State::BehindDirty);
     assert_eq!(gb.run(&["show", ":a.txt"]).unwrap(), "1\nstaged");
+}
+
+#[test]
+fn withheld_snapshots_are_neither_taken_nor_pushed_but_fast_forward_still_works() {
+    let base = tmpdir("nosnap");
+    let remote = base.join("r.git");
+    Git::new(&base)
+        .run(&[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ])
+        .unwrap();
+    let seed = init(&base.join("seed"));
+    seed.run(&["remote", "add", "origin", remote.to_str().unwrap()])
+        .unwrap();
+    commit(&seed, "a.txt", "1\n");
+    seed.run(&["push", "-q", "-u", "origin", "main"]).unwrap();
+    let (_g, d) = clone(&base, &remote, "A");
+    fs::write(d.join("a.txt"), "1\nsecret\n").unwrap();
+    let o = Options {
+        push_snapshots: false,
+        ..opts("A", "t1")
+    };
+    let r = sync_repo(&d, &o).unwrap();
+    assert_eq!(r.worktrees[0].snapshot, None);
+    let g = Git::new(&remote);
+    assert!(g.run(&["for-each-ref", "refs/sync/"]).unwrap().is_empty());
+    // Fast-forwarding keeps working.
+    commit(&seed, "b.txt", "2\n");
+    seed.run(&["push", "-q"]).unwrap();
+    fs::write(d.join("a.txt"), "1\n").unwrap();
+    let r = sync_repo(&d, &o).unwrap();
+    assert!(matches!(
+        r.worktrees[0].received,
+        Some(Received::FastForwarded { .. })
+    ));
+    assert!(d.join("b.txt").exists());
 }
