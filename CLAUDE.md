@@ -4,7 +4,7 @@
 Linux tool that keeps chosen git repos continuously in sync across machines, including
 uncommitted work, via snapshot refs (`refs/sync/<machine>/<branch>`) on a primary remote.
 Planned as a Rust workspace (core, providers, daemon, CLI, Tauri GUI). Currently in
-**Phase 0 done, Phase 1 in progress**: `gitsync-core` has the git runner, snapshots and state classification; config loading, worktree inspection and a minimal CLI (`status`, `snapshot`) exist; migration (`add`), receive logic, `doctor` and two-machine tests are pending. Do not start a
+**Phase 0 done, Phase 1 implemented (pending real two-PC validation and review)**: `gitsync-core` + `gitsync` CLI (`status`, `snapshot`, `add`, `sync`, `doctor`); daemon, GUI and providers do not exist yet. Do not start a
 new phase before its predecessor's results are written to `docs/`.
 
 ## Commands
@@ -13,7 +13,7 @@ new phase before its predecessor's results are written to `docs/`.
 - Rust: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
 
 ## Architecture
-See `docs/` (`phase0-spike.md`, `DECISIONS.md`). Git is the storage layer; shell out to
+See `docs/` (`phase0-spike.md`, `phase1.md`, `DECISIONS.md`). Git is the storage layer; shell out to
 system `git`; snapshots use a temp `GIT_INDEX_FILE` + `commit-tree`, never touching the
 user's branch or index.
 
