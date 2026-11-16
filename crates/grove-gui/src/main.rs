@@ -1331,6 +1331,7 @@ fn run() -> Result<()> {
 
     slint::set_xdg_app_id("grove").ok();
     let ui = MainWindow::new().context("create window")?;
+    ui.set_version(env!("CARGO_PKG_VERSION").into());
     let ctx = Ctx {
         core: core.clone(),
         weak: ui.as_weak(),
