@@ -39,17 +39,12 @@ fn temp_index_path() -> PathBuf {
     std::env::temp_dir().join(format!("grove-index-{}-{nanos}", std::process::id()))
 }
 
-/// Take a snapshot of `worktree` for `machine`. `message_stamp` is embedded in the
-/// commit message (callers pass a timestamp; keeping it a parameter keeps this testable).
-pub fn take(worktree: &Path, machine: &str, message_stamp: &str) -> Result<Outcome, GitError> {
-    let git = Git::new(worktree);
+/// Tree of everything in the worktree (tracked changes and untracked files, not ignored ones),
+/// built in a temporary copy of the index so the real index is never modified. The returned
+/// guard keeps the temporary index alive; `Git` has it set as `GIT_INDEX_FILE` and the author
+/// identity forced.
+fn stage(git: &Git) -> Result<(TempIndex, Git, String), GitError> {
     let gitdir = PathBuf::from(git.run(&["rev-parse", "--absolute-git-dir"])?);
-    let branch = git
-        .probe(&["symbolic-ref", "--short", "-q", "HEAD"])?
-        .ok_or_else(|| GitError::Other("detached HEAD: cannot snapshot".into()))?;
-    let refname = ref_name(machine, &branch);
-
-    // Work on a copy of the real index so the user's index is never modified.
     let tmp = TempIndex(temp_index_path());
     let real_index = gitdir.join("index");
     if real_index.exists() {
@@ -62,9 +57,25 @@ pub fn take(worktree: &Path, machine: &str, message_stamp: &str) -> Result<Outco
         .with_env("GIT_AUTHOR_EMAIL", "grove@localhost")
         .with_env("GIT_COMMITTER_NAME", "grove")
         .with_env("GIT_COMMITTER_EMAIL", "grove@localhost");
-
     snap.run(&["add", "-A"])?;
     let tree = snap.run(&["write-tree"])?;
+    Ok((tmp, snap, tree))
+}
+
+/// The tree a snapshot of `worktree` would have, without creating any object besides the tree.
+pub fn worktree_tree(worktree: &Path) -> Result<String, GitError> {
+    Ok(stage(&Git::new(worktree))?.2)
+}
+
+/// Take a snapshot of `worktree` for `machine`. `message_stamp` is embedded in the
+/// commit message (callers pass a timestamp; keeping it a parameter keeps this testable).
+pub fn take(worktree: &Path, machine: &str, message_stamp: &str) -> Result<Outcome, GitError> {
+    let git = Git::new(worktree);
+    let branch = git
+        .probe(&["symbolic-ref", "--short", "-q", "HEAD"])?
+        .ok_or_else(|| GitError::Other("detached HEAD: cannot snapshot".into()))?;
+    let refname = ref_name(machine, &branch);
+    let (_tmp, snap, tree) = stage(&git)?;
 
     let prev = snap.probe(&["rev-parse", "-q", "--verify", &refname])?;
     if let Some(p) = &prev {

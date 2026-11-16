@@ -2,6 +2,7 @@ mod common;
 use common::*;
 use grove_core::git::Git;
 use grove_core::receive::Applied;
+use grove_core::receive::Received;
 use grove_core::state::State;
 use grove_core::sync::{Options, sync_repo};
 use std::fs;
@@ -70,20 +71,36 @@ fn two_machines_converge_without_manual_git() {
     assert_eq!(fs::read_to_string(db.join("a.txt")).unwrap(), "1\nwork\n");
     assert!(db.join("scratch.txt").exists());
 
-    // A commits and pushes by hand; B (now dirty from the applied WIP) must not be touched.
+    // A commits and pushes by hand. B's applied copy is byte-identical to that commit, so B
+    // adopts it (mixed reset, no file touched) and ends clean.
     ga.run(&["add", "-A"]).unwrap();
     ga.run(&["commit", "-qm", "work"]).unwrap();
     ga.run(&["push", "-q"]).unwrap();
     let rb2 = sync_repo(&db, &opts("B", "t3")).unwrap();
-    assert_eq!(rb2.worktrees[0].state, State::BehindDirty);
+    assert_eq!(rb2.worktrees[0].state, State::Synced);
+    assert!(matches!(
+        rb2.worktrees[0].received,
+        Some(Received::FastForwarded { .. })
+    ));
     assert_eq!(fs::read_to_string(db.join("a.txt")).unwrap(), "1\nwork\n");
+    assert!(
+        Git::new(&db)
+            .run(&["status", "--porcelain"])
+            .unwrap()
+            .is_empty()
+    );
 
-    // Discarding B's applied copy makes it clean; the next sync fast-forwards it.
-    Git::new(&db).run(&["checkout", "-q", "--", "."]).unwrap();
-    fs::remove_file(db.join("scratch.txt")).unwrap();
+    // If B has its own extra edit when the next upstream commit arrives, it must not be touched.
+    fs::write(da.join("a.txt"), "1\nwork\nmore\n").unwrap();
+    ga.run(&["commit", "-qam", "more"]).unwrap();
+    ga.run(&["push", "-q"]).unwrap();
+    fs::write(db.join("a.txt"), "1\nwork\nlocal\n").unwrap();
     let rb3 = sync_repo(&db, &opts("B", "t4")).unwrap();
-    assert_eq!(rb3.worktrees[0].state, State::Synced);
-    assert!(db.join("scratch.txt").exists());
+    assert_eq!(rb3.worktrees[0].state, State::BehindDirty);
+    assert_eq!(
+        fs::read_to_string(db.join("a.txt")).unwrap(),
+        "1\nwork\nlocal\n"
+    );
 }
 
 #[test]
@@ -113,4 +130,41 @@ fn unreachable_remote_is_reported_but_local_snapshot_still_taken() {
     assert_eq!(r.worktrees[0].snapshot, Some("created"));
     assert!(!r.worktrees[0].errors.is_empty(), "push failure surfaced");
     assert_eq!(r.worktrees[0].state, State::Dirty);
+}
+
+#[test]
+fn staged_changes_block_adoption_so_the_index_is_never_reset() {
+    let base = tmpdir("staged");
+    let remote = base.join("r.git");
+    Git::new(&base)
+        .run(&[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ])
+        .unwrap();
+    let seed = init(&base.join("seed"));
+    seed.run(&["remote", "add", "origin", remote.to_str().unwrap()])
+        .unwrap();
+    commit(&seed, "a.txt", "1\n");
+    seed.run(&["push", "-q", "-u", "origin", "main"]).unwrap();
+    let (ga, da) = clone(&base, &remote, "A");
+    let (_gb, db) = clone(&base, &remote, "B");
+    fs::write(da.join("a.txt"), "1\nwork\n").unwrap();
+    sync_repo(&da, &opts("A", "t1")).unwrap();
+    sync_repo(&db, &opts("B", "t2")).unwrap();
+    // B stages an intermediate version, then its worktree matches what A will commit.
+    let gb = Git::new(&db);
+    fs::write(db.join("a.txt"), "1\nstaged\n").unwrap();
+    gb.run(&["add", "a.txt"]).unwrap();
+    fs::write(db.join("a.txt"), "1\nwork\n").unwrap();
+    ga.run(&["add", "-A"]).unwrap();
+    ga.run(&["commit", "-qm", "work"]).unwrap();
+    ga.run(&["push", "-q"]).unwrap();
+    let r = sync_repo(&db, &opts("B", "t3")).unwrap();
+    assert_eq!(r.worktrees[0].state, State::BehindDirty);
+    assert_eq!(gb.run(&["show", ":a.txt"]).unwrap(), "1\nstaged");
 }
