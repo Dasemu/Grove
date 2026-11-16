@@ -32,7 +32,10 @@ slint::include_modules!();
 /// Fallback poll interval; daemon events wake the worker earlier.
 const POLL_VISIBLE: Duration = Duration::from_secs(5);
 const POLL_HIDDEN: Duration = Duration::from_secs(30);
-const MIN_GAP: Duration = Duration::from_millis(500);
+/// Minimum time between two daemon refreshes: events arrive in bursts, and hidden there is
+/// nobody to look at the result (the tray only changes when the aggregate does).
+const MIN_GAP_VISIBLE: Duration = Duration::from_secs(1);
+const MIN_GAP_HIDDEN: Duration = Duration::from_secs(10);
 const RECONNECT: Duration = Duration::from_secs(5);
 
 /// Everything the UI shows, taken from one refresh.
@@ -882,7 +885,7 @@ fn worker(
 ) {
     let mut last_states: HashMap<String, String> = HashMap::new();
     let mut last_agg: Option<Aggregate> = None;
-    let mut last_run = Instant::now() - MIN_GAP;
+    let mut last_run = Instant::now() - MIN_GAP_HIDDEN;
     loop {
         let interval = if core.visible.load(Ordering::SeqCst) {
             POLL_VISIBLE
@@ -893,17 +896,29 @@ fn worker(
             Ok(_) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
-        // Coalesce bursts of events.
-        let gap = last_run.elapsed();
-        if gap < MIN_GAP {
-            std::thread::sleep(MIN_GAP - gap);
+        // Coalesce bursts of events; opening the window shortens the wait.
+        loop {
+            let gap = if core.visible.load(Ordering::SeqCst) {
+                MIN_GAP_VISIBLE
+            } else {
+                MIN_GAP_HIDDEN
+            };
+            let el = last_run.elapsed();
+            if el >= gap {
+                break;
+            }
+            match rx.recv_timeout(gap - el) {
+                Ok(()) => {}
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
         }
         while rx.try_recv().is_ok() {}
         last_run = Instant::now();
 
         let visible = core.visible.load(Ordering::SeqCst);
-        let st = core.bridge.ipc(&json!({"v": 1, "cmd": "status"}));
-        let status = (st["ok"] == true).then(|| st["data"].clone());
+        let mut st = core.bridge.ipc(&json!({"v": 1, "cmd": "status"}));
+        let status = (st["ok"] == true).then(|| st["data"].take());
         let agg = model::aggregate(status.as_ref());
         core.paused
             .store(agg.state == TrayState::Paused, Ordering::SeqCst);
@@ -974,17 +989,6 @@ fn worker(
                     ST.with(|st| st.borrow_mut().snap = Some(snap));
                     render(&ui);
                 }
-            });
-        } else {
-            // Keep the last status for the moment the window opens; drop the heavy parts.
-            let snap = Snapshot {
-                status,
-                log: Vec::new(),
-                config: core.bridge.config_json(),
-                alerts: Vec::new(),
-            };
-            let _ = slint::invoke_from_event_loop(move || {
-                ST.with(|st| st.borrow_mut().snap = Some(snap))
             });
         }
     }

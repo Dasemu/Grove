@@ -5,7 +5,7 @@ use crate::model::{Aggregate, TrayState};
 use ksni::blocking::{Handle, TrayMethods};
 use ksni::menu::StandardItem;
 use ksni::{Icon, MenuItem, Status, ToolTip};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -188,8 +188,12 @@ pub fn render(s: TrayState, size: u32) -> Icon {
     }
 }
 
+/// Rendered once per state: the tray asks for the pixmaps on every property read.
 fn icons(s: TrayState) -> Vec<Icon> {
-    vec![render(s, 22), render(s, 32), render(s, 64)]
+    static CACHE: [OnceLock<Vec<Icon>>; 5] = [const { OnceLock::new() }; 5];
+    CACHE[s as usize]
+        .get_or_init(|| vec![render(s, 22), render(s, 32), render(s, 64)])
+        .clone()
 }
 
 #[cfg(test)]

@@ -19,7 +19,10 @@ Threads: the Slint event loop; a worker that fetches `status` (and `log`/config 
 is visible); a subscriber that holds a `subscribe` connection to the daemon and wakes the worker on
 every event (reconnects every 5 s while the daemon is down); the tray service; the single-instance
 listener; short-lived threads for CLI calls so the UI never blocks. Fallback poll: 5 s with the
-window open, 30 s hidden. No Slint timers run while idle.
+window open, 30 s hidden. Daemon events are coalesced (at most one status refresh per 1 s visible,
+10 s hidden). Hidden, the worker only asks for `status`: it drives the tray (touched only when the
+aggregate changes; pixmaps are rendered once per state) and notifications, and nothing is sent to
+the UI thread. Log, config and models are fetched when the window opens. No Slint timers run while idle.
 
 Tray states: ok, syncing, attention (diverged, error, `ahead`, `behinddirty`; also sets the item to `NeedsAttention`), paused, daemon offline.
 Menu: Open, Sync now, Pause/Resume, Quit; left click opens the window. Closing the window hides it;
@@ -69,7 +72,8 @@ X11 loaded at runtime) and the software renderer.
 | Window open | 31 MB | 105 MB |
 | After closing the window (hidden again) | 25 MB | not measured |
 
-Idle CPU hidden: 0 ticks in 20 s. 9 threads.
+Hidden CPU against a busy daemon (8 repos, 5 s fetch interval, ~4 events/s): about 4 ticks in 60 s
+(0.07%), RSS flat. 9 threads.
 
 ## Limits
 
