@@ -315,6 +315,19 @@ fn main() -> Result<()> {
                 r.backup_tar.display(),
                 r.backup_ref
             );
+            for b in &r.linked_backups {
+                println!("backup:   {} (linked worktree)", b.display());
+            }
+            if !r.linked.is_empty() {
+                println!("linked worktrees kept:");
+                for l in &r.linked {
+                    println!(
+                        "  {} ({})",
+                        l.path.display(),
+                        l.branch.as_deref().unwrap_or("detached")
+                    );
+                }
+            }
             println!("note: shells whose cwd was inside the old checkout must `cd` again");
             Ok(())
         }

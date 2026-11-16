@@ -8,8 +8,18 @@ fn is_bare_layout(p: &Path) -> bool {
     p.join(".bare").is_dir()
 }
 
+/// A linked worktree (`.git` file pointing into `<repo>/.git/worktrees/<id>`) belongs to the repo
+/// it was added from; treating it as a repo of its own would sync the same worktrees twice.
+fn is_linked_worktree(p: &Path) -> bool {
+    std::fs::read_to_string(p.join(".git")).is_ok_and(|s| {
+        s.trim()
+            .strip_prefix("gitdir:")
+            .is_some_and(|g| g.trim().contains("/worktrees/"))
+    })
+}
+
 fn is_plain_clone(p: &Path) -> bool {
-    !is_bare_layout(p) && p.join(".git").exists()
+    !is_bare_layout(p) && p.join(".git").exists() && !is_linked_worktree(p)
 }
 
 fn subdirs(p: &Path) -> Vec<PathBuf> {
@@ -77,9 +87,17 @@ mod tests {
             "rootbare/.bare",
             ".dot/b/.bare",
             "grp2/nested/deeper/.bare",
+            "grp/migrated/main",
         ] {
             std::fs::create_dir_all(base.join(d)).unwrap();
         }
+        // A linked worktree sitting next to its repo is neither managed nor "not migrated".
+        std::fs::create_dir_all(base.join("grp/migrated-feature")).unwrap();
+        std::fs::write(
+            base.join("grp/migrated-feature/.git"),
+            "gitdir: /x/grp/migrated/.bare/worktrees/migrated-feature\n",
+        )
+        .unwrap();
         let found = discover(
             &base,
             &["grp".to_string(), "grp2".to_string(), "absent".into()],

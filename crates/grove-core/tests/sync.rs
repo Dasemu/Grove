@@ -210,3 +210,87 @@ fn withheld_snapshots_are_neither_taken_nor_pushed_but_fast_forward_still_works(
     ));
     assert!(d.join("b.txt").exists());
 }
+
+#[test]
+fn migrated_repo_with_linked_worktrees_syncs_only_what_it_can() {
+    use grove_core::migrate::migrate;
+    let base = tmpdir("synclinked");
+    let remote = base.join("r.git");
+    Git::new(&base)
+        .run(&[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ])
+        .unwrap();
+    let seed = init(&base.join("seed"));
+    seed.run(&["remote", "add", "origin", remote.to_str().unwrap()])
+        .unwrap();
+    commit(&seed, "a.txt", "1\n");
+    seed.run(&["push", "-q", "-u", "origin", "main"]).unwrap();
+    seed.run(&["push", "-q", "origin", "main:feat/out"])
+        .unwrap();
+    let (ga, da) = clone(&base, &remote, "A");
+    let nested = da.join(".claude/worktrees/wt1");
+    ga.run(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        nested.to_str().unwrap(),
+    ])
+    .unwrap();
+    let outside = base.join("A-feature");
+    ga.run(&[
+        "worktree",
+        "add",
+        "-q",
+        "--track",
+        "-b",
+        "feat/out",
+        outside.to_str().unwrap(),
+        "origin/feat/out",
+    ])
+    .unwrap();
+    migrate(&da, "A", &base.join("bk"), "1").unwrap();
+    let nested = da.join("main/.claude/worktrees/wt1");
+    fs::write(nested.join("a.txt"), "detached edit\n").unwrap();
+    fs::write(outside.join("a.txt"), "outside edit\n").unwrap();
+
+    let rep = sync_repo(&da, &opts("A", "t1")).unwrap();
+    let find = |p: &Path| {
+        rep.worktrees
+            .iter()
+            .find(|w| w.path == p.canonicalize().unwrap())
+            .unwrap_or_else(|| panic!("{} not reported: {:?}", p.display(), rep.worktrees))
+    };
+    // Detached: reported, never snapshotted.
+    let d = find(&nested);
+    assert_eq!((d.branch.clone(), d.snapshot), (None, None));
+    assert!(d.errors.is_empty(), "{:?}", d.errors);
+    assert_eq!(d.state, State::Dirty);
+    // Branch worktree elsewhere: synced under its own branch ref.
+    let o = find(&outside);
+    assert_eq!(o.snapshot, Some("created"));
+    assert!(o.errors.is_empty(), "{:?}", o.errors);
+    let bare = Git::new(da.join(".bare"));
+    assert!(bare.run(&["rev-parse", "refs/sync/A/feat/out"]).is_ok());
+    assert!(
+        bare.probe(&["rev-parse", "-q", "--verify", "refs/sync/A/HEAD"])
+            .unwrap()
+            .is_none()
+    );
+
+    // Gone upstream + clean: a worktree outside the layout is never archived or removed.
+    Git::new(&outside)
+        .run(&["checkout", "-q", "--", "."])
+        .unwrap();
+    seed.run(&["push", "-q", "origin", "--delete", "feat/out"])
+        .unwrap();
+    let rep = sync_repo(&da, &opts("A", "t2")).unwrap();
+    assert!(rep.archived.is_empty(), "{:?}", rep.archived);
+    assert!(outside.join("a.txt").exists());
+}
