@@ -16,8 +16,11 @@ Scripts: `spikes/forgejo-up.sh` (throwaway Forgejo 11 via Podman), `spikes/snaps
 
 Conclusion: **no fallback needed** for Forgejo. Section 7.1 design holds.
 
+## Real instance (git.zenvairo.es, Gitea 1.25.4, 2026-11-16)
+Throwaway private repo, since deleted. Force push of `refs/sync/desktop/main` accepted; `tea branches list` shows only `main`; a second clone fetched the ref and the tree held tracked and untracked files without the ignored one. Push-mirror behaviour was NOT tested on the real instance (no mirror target set up); verify it before relying on it. HTTPS auth works through `tea login helper` (SSH port 22 is unreachable from this machine).
+
 ## Caveats / pending
-- Verified on Forgejo 11 only. The real instance at git.zenvairo.es (Gitea or Forgejo, version unknown) still has to be checked; needs a throwaway repo there (external effect, awaiting approval).
+- Push-mirror exclusion verified on Forgejo 11 only.
 - UI visibility not verified visually.
 - Push mirrors to a local target need `migrations.ALLOW_LOCALNETWORKS`; irrelevant for real targets.
 - GitHub as a direct target of `refs/sync/*` is not tested (design never pushes them there).
