@@ -3,5 +3,8 @@
 pub mod config;
 pub mod git;
 pub mod inspect;
+pub mod layout;
+pub mod migrate;
+pub mod receive;
 pub mod snapshot;
 pub mod state;
