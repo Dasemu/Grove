@@ -74,6 +74,28 @@ groups, repos directly under the root. Ignored plain clones inside a configured 
 "not migrated (run grove add)" by `grove daemon status` and `grove doctor`. Discovery reads one
 directory per configured group, so it stays cheap.
 
+### Rediscovery at runtime
+
+Discovery is not startup-only. The daemon watches (non-recursively) the root, each configured group
+directory and every child directory that is not managed yet; managed repos keep their recursive
+watch. A child directory created, deleted or renamed, or `.bare` / `.git` appearing or disappearing
+inside one (`grove add` migrating a clone, `grove import` cloning into `<group>/<name>/.bare`,
+a clone moved to the trash) triggers a debounced (500 ms) rediscovery and diff:
+
+- New bare-layout repos are managed at once: watches set up, a pass scheduled, activity event
+  `repo_added`.
+- Repos that are gone (or no longer bare layout) are dropped with their watches and state, one
+  `repo_removed` event, no error; their files are never touched. A repo whose directory vanishes
+  while a pass runs is dropped the same way.
+- The "not migrated" list is refreshed.
+
+As a safety net every full pass (every `fetch_interval_s`) re-runs discovery too, so missed
+inotify events delay detection by at most that interval. `grove daemon status` reflects the new set
+right after rediscovery, also while paused (discovery runs while paused, syncing does not).
+
+Config reload is still out of scope: restart the daemon after editing `config.toml` (new or removed
+groups are only picked up then).
+
 **Breaking change:** group names must now be plain directory names (non-empty, no `/`, no leading
 `.`); a config with other names no longer loads.
 
