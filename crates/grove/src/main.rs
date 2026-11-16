@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod secrets;
+#[cfg(test)]
+#[path = "../../../test-support/tmp.rs"]
+mod test_tmp;
 mod workflow;
 
 #[derive(Parser)]

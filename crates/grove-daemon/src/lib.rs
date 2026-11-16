@@ -6,6 +6,9 @@ pub mod activity;
 pub mod daemon;
 pub mod discover;
 pub mod ipc;
+#[cfg(test)]
+#[path = "../../../test-support/tmp.rs"]
+mod test_tmp;
 pub mod visibility;
 
 pub use activity::{Activity, Event};

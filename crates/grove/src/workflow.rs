@@ -763,7 +763,8 @@ mod tests {
 
     #[test]
     fn local_repos_match_by_name_or_origin_ignoring_case() {
-        let d = std::env::temp_dir().join(format!("grove-local-{}", std::process::id()));
+        let _tmp = crate::test_tmp::TempDir::new("grove-local");
+        let d = _tmp.path().to_path_buf();
         let _ = fs::remove_dir_all(&d);
         // `synapse` (lowercase dir) whose origin is Dasemu/Synapse; `other` with a renamed origin.
         for (dir, origin) in [

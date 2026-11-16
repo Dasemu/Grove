@@ -1,12 +1,11 @@
+#[path = "../../../test-support/tmp.rs"]
+mod tmp;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 
-fn tmp(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("grove-cli-{tag}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&p);
-    fs::create_dir_all(&p).unwrap();
-    p
+fn tmp(tag: &str) -> tmp::TempDir {
+    tmp::TempDir::new(tag)
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {

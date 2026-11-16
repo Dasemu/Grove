@@ -41,7 +41,8 @@ mod tests {
 
     #[test]
     fn toggle_writes_and_removes_the_desktop_file() {
-        let d = std::env::temp_dir().join(format!("gg-auto-{}", std::process::id()));
+        let _tmp = crate::test_tmp::TempDir::new("gg-auto");
+        let d = _tmp.path().to_path_buf();
         assert!(!is_enabled(&d));
         set(&d, true).unwrap();
         assert!(is_enabled(&d));

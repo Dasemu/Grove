@@ -9,6 +9,9 @@ mod bridge;
 mod instance;
 mod log;
 mod model;
+#[cfg(test)]
+#[path = "../../../test-support/tmp.rs"]
+mod test_tmp;
 mod tray;
 
 use anyhow::{Context, Result};

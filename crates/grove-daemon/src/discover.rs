@@ -91,7 +91,8 @@ mod tests {
 
     #[test]
     fn only_bare_layout_repos_in_configured_groups_are_managed() {
-        let base = std::env::temp_dir().join(format!("grove-disc-{}", std::process::id()));
+        let _tmp = crate::test_tmp::TempDir::new("grove-disc");
+        let base = _tmp.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&base);
         for d in [
             "grp/migrated/.bare",

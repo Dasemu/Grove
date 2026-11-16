@@ -125,17 +125,16 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::mpsc;
 
-    fn tmp_sock(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("gg-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d); // leftovers of an earlier run with the same pid
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
-        d.join("gui.sock")
+    fn tmp_sock(tag: &str) -> (crate::test_tmp::TempDir, PathBuf) {
+        let t = crate::test_tmp::TempDir::new(&format!("gg-{tag}"));
+        std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let p = t.path().join("gui.sock");
+        (t, p)
     }
 
     #[test]
     fn second_launch_asks_first_to_show() {
-        let p = tmp_sock("show");
+        let (_t, p) = tmp_sock("show");
         let Role::Primary(l) = acquire(&p, true).unwrap() else {
             panic!("first must be primary");
         };
@@ -151,7 +150,7 @@ mod tests {
 
     #[test]
     fn unresponsive_instance_is_not_evicted() {
-        let p = tmp_sock("busy");
+        let (_t, p) = tmp_sock("busy");
         let l = UnixListener::bind(&p).unwrap();
         // Accepts but never answers (a primary stuck in startup).
         let t = std::thread::spawn(move || {
@@ -167,7 +166,8 @@ mod tests {
 
     #[test]
     fn private_dir_is_enforced() {
-        let base = std::env::temp_dir().join(format!("gg-priv-{}", std::process::id()));
+        let _tmp = crate::test_tmp::TempDir::new("gg-priv");
+        let base = _tmp.path().to_path_buf();
         let d = base.join("x");
         ensure_private_dir(&d).unwrap();
         assert_eq!(std::fs::metadata(&d).unwrap().mode() & 0o777, 0o700);
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn stale_socket_is_replaced() {
-        let p = tmp_sock("stale");
+        let (_t, p) = tmp_sock("stale");
         drop(UnixListener::bind(&p).unwrap()); // leaves the socket file behind
         assert!(p.exists());
         assert!(matches!(acquire(&p, true).unwrap(), Role::Primary(_)));
