@@ -354,6 +354,52 @@ fn fast_forward_declines_instead_of_overwriting_local_ignored_file() {
 }
 
 #[test]
+fn files_new_in_an_ignored_directory_do_not_block_a_fast_forward() {
+    let w = world();
+    commit(&w.g1, "tool/settings.json", "{}\n");
+    w.g1.run(&["push", "-q"]).unwrap();
+    // The whole directory is ignored and exists locally, but not the incoming file.
+    fs::write(w.d2.join(".git/info/exclude"), "tool/\n").unwrap();
+    fs::create_dir_all(w.d2.join("tool/cache")).unwrap();
+    fs::write(w.d2.join("tool/cache/x"), "local\n").unwrap();
+    fetch(&w.d2, REMOTE).unwrap();
+    assert!(
+        matches!(
+            receive(&w.d2, "m2", "t").unwrap(),
+            Received::FastForwarded { .. }
+        ),
+        "nothing local would be overwritten"
+    );
+    assert_eq!(
+        fs::read_to_string(w.d2.join("tool/settings.json")).unwrap(),
+        "{}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(w.d2.join("tool/cache/x")).unwrap(),
+        "local\n"
+    );
+}
+
+#[test]
+fn an_existing_file_in_an_ignored_directory_still_blocks_a_fast_forward() {
+    let w = world();
+    commit(&w.g1, "tool/settings.json", "theirs\n");
+    w.g1.run(&["push", "-q"]).unwrap();
+    fs::write(w.d2.join(".git/info/exclude"), "tool/\n").unwrap();
+    fs::create_dir_all(w.d2.join("tool")).unwrap();
+    fs::write(w.d2.join("tool/settings.json"), "mine\n").unwrap();
+    fetch(&w.d2, REMOTE).unwrap();
+    assert!(matches!(
+        receive(&w.d2, "m2", "t").unwrap(),
+        Received::Declined(_)
+    ));
+    assert_eq!(
+        fs::read_to_string(w.d2.join("tool/settings.json")).unwrap(),
+        "mine\n"
+    );
+}
+
+#[test]
 fn snapshot_apply_declines_instead_of_overwriting_local_ignored_file() {
     let w = world();
     fs::write(w.d1.join("conf.local"), "theirs\n").unwrap();
