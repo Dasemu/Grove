@@ -129,8 +129,9 @@ purged_dir = "Purged"           # default; "" disables the move
 
 - Trigger: a fetch fails with a "not found"-style error (also Gitea's SSH "Cannot find repository"). That is only a hint: the forge serving
   `origin` must then answer 404 while the same token works (`test_connection`), and still do so
-  `purge::CONFIRM_AFTER_SECS` (10 min) after the first confirmation (a gap of more than twice
-  that starts over). A working fetch, or the forge seeing the repo again, clears it. Network or
+  `purge::CONFIRM_AFTER_SECS` (10 min) after the first confirmation (a gap of more than
+  `STALE_AFTER_SECS`, 6 h, between two confirmations starts over: a pass over many repos can take
+  longer than 20 min, so a shorter gap never let a deletion be confirmed). A working fetch, or the forge seeing the repo again, clears it. Network or
   token errors change nothing.
 - Only repos owned by the token's account, or by an organisation named in some group's `owners`
   for that provider, are ever moved: someone else's repo turning private or revoking access looks
