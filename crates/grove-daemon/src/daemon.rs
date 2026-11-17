@@ -9,7 +9,7 @@ use crate::merged::{MergedCache, has_candidates};
 use crate::purge;
 use crate::visibility::{RealForge, Visibility, snapshot_gate};
 use grove_core::config::Config;
-use grove_core::prune::Pruned;
+use grove_core::prune::{Pruned, merged_how};
 use grove_core::receive::Received;
 use grove_core::sync::{Options, sync_repo};
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -632,6 +632,8 @@ fn pass(
         push_snapshots,
         merged: merged_heads,
         disposable: cfg.sync.prune_disposable.clone(),
+        prune: cfg.sync.prune_merged,
+        protected: cfg.sync.protected_branches(),
     };
     let result = sync_repo(repo, &opts);
     if !offline && purge_if_gone(repo, cfg, st, &result, gone_since, ctx) {
@@ -713,12 +715,13 @@ fn pass(
                         "pruned_merged",
                         Some(&name),
                         format!(
-                            "{branch}: merged in PR #{pr}; removed {} (tip kept in {backup_ref})",
+                            "{branch}: {}; removed {} (tip kept in {backup_ref})",
+                            merged_how(*pr),
                             path.display()
                         ),
                     ),
                     Pruned::Kept { branch, pr, why } => {
-                        kept.push(format!("{branch}: merged in PR #{pr} but kept: {why}"))
+                        kept.push(format!("{branch}: {} but kept: {why}", merged_how(*pr)))
                     }
                 }
             }

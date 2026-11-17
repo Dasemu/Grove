@@ -158,6 +158,30 @@ pub trait Provider: Send + Sync {
     fn merged_pulls(&self, owner: &str, name: &str) -> Result<Vec<MergedPull>>;
 }
 
+/// [`Provider::merged_pulls`] that also finds a repo transferred or renamed on the forge: `origin`
+/// may still name the old place, which git and the repo endpoint follow by redirect but the
+/// pulls endpoint does not. On failure the repo is looked up and, if its current owner/name
+/// differ, its pulls are listed under those.
+pub fn merged_pulls_following_moves(
+    p: &dyn Provider,
+    owner: &str,
+    name: &str,
+) -> Result<Vec<MergedPull>> {
+    let err = match p.merged_pulls(owner, name) {
+        Ok(pulls) => return Ok(pulls),
+        Err(e) => e,
+    };
+    match p.get_repo(owner, name) {
+        Ok(r)
+            if !r.owner.is_empty()
+                && !(r.owner.eq_ignore_ascii_case(owner) && r.name.eq_ignore_ascii_case(name)) =>
+        {
+            p.merged_pulls(&r.owner, &r.name)
+        }
+        _ => Err(err),
+    }
+}
+
 /// Builds the provider described by `cfg`, using `token`.
 pub fn build(cfg: &ProviderCfg, token: String) -> Box<dyn Provider> {
     match cfg.kind {
