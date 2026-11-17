@@ -612,19 +612,24 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
             // Safety net for events the watcher missed (one `read_dir` per group).
             let (found, _) = rescan(&root, &groups, &mut watch, &running, &ctx);
             forget_removed(&found, &mut due_at, &mut first_at, &mut backoff_until);
+            // A repo still waiting keeps its earlier due time, so it is not overtaken.
             for r in found {
-                due_at.insert(r, now);
+                due_at
+                    .entry(r)
+                    .and_modify(|t| *t = (*t).min(now))
+                    .or_insert(now);
             }
             next_full = now + fetch_every;
         }
         // A repo whose pass is running stays due and is dispatched when that pass is done.
-        let mut due: Vec<PathBuf> = due_at
+        // Longest waiting first: with more due repos than workers, the order decides who waits.
+        let mut due: Vec<(Instant, PathBuf)> = due_at
             .iter()
             .filter(|(r, t)| **t <= now && !running.contains(*r))
-            .map(|(r, _)| r.clone())
+            .map(|(r, t)| (*t, r.clone()))
             .collect();
         due.sort();
-        for r in due {
+        for (_, r) in due {
             // Only as many passes as idle workers: the rest stay due, so pause stops them and
             // `offline` is decided when a pass really starts.
             if running.len() >= pool {
