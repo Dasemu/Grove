@@ -37,8 +37,8 @@ impl PullSource for RealForge {
         name: &str,
     ) -> Result<Vec<MergedHead>, String> {
         let (token, _) = grove_providers::token::resolve(id, pc).map_err(|e| e.to_string())?;
-        let pulls = grove_providers::build(pc, token)
-            .merged_pulls(owner, name)
+        let forge = grove_providers::build(pc, token);
+        let pulls = grove_providers::merged_pulls_following_moves(forge.as_ref(), owner, name)
             .map_err(|e| e.to_string())?;
         Ok(pulls
             .into_iter()

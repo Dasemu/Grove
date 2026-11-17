@@ -4,7 +4,7 @@ use grove_core::config::{Config, ProviderKind};
 use grove_core::git::Git;
 use grove_core::inspect::{state, worktrees};
 use grove_core::migrate::migrate;
-use grove_core::prune::Pruned;
+use grove_core::prune::{Pruned, merged_how};
 use grove_core::receive::{Applied, Archived, Received};
 use grove_core::resolve::{Choice, resolve};
 use grove_core::snapshot::{Outcome, take};
@@ -377,6 +377,8 @@ fn main() -> Result<()> {
                     push_snapshots: true,
                     merged,
                     disposable: cfg.sync.prune_disposable.clone(),
+                    prune: cfg.sync.prune_merged,
+                    protected: cfg.sync.protected_branches(),
                 },
             )?;
             print_report(&rep)
@@ -531,11 +533,12 @@ fn print_report(rep: &SyncReport) -> Result<()> {
                 path,
                 backup_ref,
             } => println!(
-                "pruned {branch}: merged in PR #{pr}, removed {} (backup {backup_ref})",
+                "pruned {branch}: {}, removed {} (backup {backup_ref})",
+                merged_how(*pr),
                 path.display()
             ),
             Pruned::Kept { branch, pr, why } => {
-                println!("kept {branch}: merged in PR #{pr} but {why}")
+                println!("kept {branch}: {} but {why}", merged_how(*pr))
             }
         }
     }

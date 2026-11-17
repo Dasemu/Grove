@@ -526,3 +526,39 @@ fn merged_pulls_keep_only_merged_same_repo_heads() {
         Error::Api { status: 404, .. }
     ));
 }
+
+#[test]
+fn merged_pulls_follow_a_transferred_repo() {
+    let pulls = r#"[{"number":4,"merged":true,"head":{"ref":"f","sha":"fff","repo":{"full_name":"Org/r"}},"base":{"repo":{"full_name":"Org/r"}}}]"#;
+    let (url, rx) = mock(vec![
+        (404, r#"{"message":"not found"}"#),
+        (
+            200,
+            r#"{"name":"r","owner":{"login":"Org"},"private":true}"#,
+        ),
+        (200, pulls),
+    ]);
+    let g = Gitea::new(ProviderKind::Gitea, &url, "t".into());
+    let got = grove_providers::merged_pulls_following_moves(&g, "me", "r").unwrap();
+    assert_eq!(got.iter().map(|p| p.number).collect::<Vec<_>>(), vec![4]);
+    let asked: Vec<String> = rx
+        .try_iter()
+        .map(|l| l.lines().next().unwrap().to_string())
+        .collect();
+    assert!(asked[1].starts_with("GET /api/v1/repos/me/r "), "{asked:?}");
+    assert!(
+        asked[2].starts_with("GET /api/v1/repos/Org/r/pulls?"),
+        "{asked:?}"
+    );
+
+    // Not moved: the original error stands.
+    let (url, _rx) = mock(vec![
+        (404, r#"{"message":"not found"}"#),
+        (404, r#"{"message":"not found"}"#),
+    ]);
+    let g = Gitea::new(ProviderKind::Gitea, &url, "t".into());
+    assert!(matches!(
+        grove_providers::merged_pulls_following_moves(&g, "me", "gone").unwrap_err(),
+        Error::Api { status: 404, .. }
+    ));
+}
