@@ -5,9 +5,11 @@
 use crate::activity::{Activity, now_secs};
 use crate::discover::{discover, group_of, is_ready, subdirs};
 use crate::ipc;
+use crate::merged::{MergedCache, has_candidates};
 use crate::purge;
 use crate::visibility::{RealForge, Visibility, snapshot_gate};
 use grove_core::config::Config;
+use grove_core::prune::Pruned;
 use grove_core::receive::Received;
 use grove_core::sync::{Options, sync_repo};
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -427,8 +429,8 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
     let mut next_full = Instant::now();
     // When a debounced rediscovery is due (set by the first event of a burst, never pushed back).
     let mut rescan_at: Option<Instant> = None;
-    // Repos whose forge first confirmed their deletion at this time (see `purge`).
-    let mut gone_since: HashMap<PathBuf, (u64, u64)> = HashMap::new();
+    // Deletions being confirmed and merged pull requests, per repo.
+    let mut forge = ForgeMemory::default();
 
     loop {
         let now = Instant::now();
@@ -518,15 +520,7 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
             // While backing off after a failure, still snapshot local work (no network needed);
             // the network is retried at the first pass after the backoff expires.
             let offline = backoff_until.get(&r).is_some_and(|u| *u > now);
-            let failures = pass(
-                &r,
-                &cfg,
-                &st,
-                &mut visibility,
-                offline,
-                &mut gone_since,
-                &ctx,
-            );
+            let failures = pass(&r, &cfg, &st, &mut visibility, offline, &mut forge, &ctx);
             if !is_ready(&r) {
                 // It vanished mid-pass: whatever the pass reported is moot.
                 let (found, _) = rescan(&root, &groups, &mut watch, &ctx);
@@ -563,6 +557,15 @@ fn forget_removed(
     backoff_until.retain(|r, _| found.contains(r));
 }
 
+/// What the daemon remembers between passes about each repo's forge (in memory only).
+#[derive(Default)]
+struct ForgeMemory {
+    /// Repos whose forge first confirmed their deletion at this time (see `purge`).
+    gone_since: HashMap<PathBuf, (u64, u64)>,
+    /// Merged pull requests per repo (see `merged`).
+    merged: MergedCache,
+}
+
 /// One sync pass for `repo`; returns the number of consecutive failures (0 = success).
 fn pass(
     repo: &Path,
@@ -570,9 +573,10 @@ fn pass(
     st: &Settings,
     visibility: &mut Visibility,
     offline: bool,
-    gone_since: &mut HashMap<PathBuf, (u64, u64)>,
+    forge: &mut ForgeMemory,
     ctx: &Ctx,
 ) -> u32 {
+    let ForgeMemory { gone_since, merged } = forge;
     let name = repo.display().to_string();
     if !is_ready(repo) {
         // Being migrated/cloned (or gone): leave it alone, the rediscovery sorts it out.
@@ -603,6 +607,22 @@ fn pass(
         }
         allowed
     };
+    // Offline passes prune nothing; the last answer still keeps pruned branches away.
+    let merged_heads = if !cfg.sync.prune_merged || !has_candidates(repo) {
+        Vec::new()
+    } else if offline {
+        merged.cached(repo)
+    } else {
+        let h = merged.heads(cfg, repo, &st.remote, &RealForge, Instant::now());
+        if let Some(e) = h.new_error {
+            ctx.activity.log(
+                "prune_lookup_failed",
+                Some(&name),
+                format!("cannot list merged pull requests: {e}"),
+            );
+        }
+        h.heads
+    };
     let opts = Options {
         machine: cfg.machine.name.clone(),
         stamp: stamp(),
@@ -610,6 +630,8 @@ fn pass(
         offline,
         materialize,
         push_snapshots,
+        merged: merged_heads,
+        disposable: cfg.sync.prune_disposable.clone(),
     };
     let result = sync_repo(repo, &opts);
     if !offline && purge_if_gone(repo, cfg, st, &result, gone_since, ctx) {
@@ -678,6 +700,30 @@ fn pass(
             }
             for a in &rep.archived {
                 ctx.activity.log("archived", Some(&name), format!("{a:?}"));
+            }
+            let mut kept = Vec::new();
+            for p in &rep.pruned {
+                match p {
+                    Pruned::Removed {
+                        branch,
+                        pr,
+                        path,
+                        backup_ref,
+                    } => ctx.activity.log(
+                        "pruned_merged",
+                        Some(&name),
+                        format!(
+                            "{branch}: merged in PR #{pr}; removed {} (tip kept in {backup_ref})",
+                            path.display()
+                        ),
+                    ),
+                    Pruned::Kept { branch, pr, why } => {
+                        kept.push(format!("{branch}: merged in PR #{pr} but kept: {why}"))
+                    }
+                }
+            }
+            for k in merged.new_notes(repo, kept) {
+                ctx.activity.log("prune_kept", Some(&name), k);
             }
         }
     }

@@ -481,3 +481,48 @@ fn git_url_follows_the_protocol_and_needs_an_ssh_url_for_ssh() {
     );
     assert!(r[1].git_url(Protocol::Ssh).is_err());
 }
+
+#[test]
+fn merged_pulls_keep_only_merged_same_repo_heads() {
+    // Merged, closed without merging, merged from a fork, merged from a deleted fork.
+    let gitea = r#"[
+        {"number":3,"merged":true,"head":{"ref":"feat/a","sha":"aaa","repo":{"full_name":"O/r"}},"base":{"repo":{"full_name":"o/r"}}},
+        {"number":2,"merged":false,"head":{"ref":"b","sha":"bbb","repo":{"full_name":"o/r"}},"base":{"repo":{"full_name":"o/r"}}},
+        {"number":1,"merged":true,"head":{"ref":"c","sha":"ccc","repo":{"full_name":"x/r"}},"base":{"repo":{"full_name":"o/r"}}},
+        {"number":0,"merged":true,"head":{"ref":"d","sha":"ddd","repo":null},"base":{"repo":{"full_name":"o/r"}}}
+    ]"#;
+    let (url, rx) = mock(vec![(200, gitea)]);
+    let pulls = Gitea::new(ProviderKind::Forgejo, &url, "t".into())
+        .merged_pulls("o", "r")
+        .unwrap();
+    assert!(
+        rx.recv()
+            .unwrap()
+            .starts_with("GET /api/v1/repos/o/r/pulls?state=closed&sort=recentupdate&limit=50 ")
+    );
+    assert_eq!(pulls.len(), 1);
+    assert_eq!(
+        (
+            pulls[0].number,
+            pulls[0].head_ref.as_str(),
+            pulls[0].head_sha.as_str()
+        ),
+        (3, "feat/a", "aaa")
+    );
+
+    let github = r#"[
+        {"number":9,"merged_at":"2026-01-01T00:00:00Z","head":{"ref":"x","sha":"999","repo":{"full_name":"o/r"}},"base":{"repo":{"full_name":"o/r"}}},
+        {"number":8,"merged_at":null,"head":{"ref":"y","sha":"888","repo":{"full_name":"o/r"}},"base":{"repo":{"full_name":"o/r"}}}
+    ]"#;
+    let (url, rx) = mock(vec![(200, github), (404, r#"{"message":"Not Found"}"#)]);
+    let gh = GitHub::new(&url, "t".into());
+    let pulls = gh.merged_pulls("o", "r").unwrap();
+    assert!(rx.recv().unwrap().starts_with(
+        "GET /repos/o/r/pulls?state=closed&sort=updated&direction=desc&per_page=100 "
+    ));
+    assert_eq!(pulls.iter().map(|p| p.number).collect::<Vec<_>>(), vec![9]);
+    assert!(matches!(
+        gh.merged_pulls("o", "gone").unwrap_err(),
+        Error::Api { status: 404, .. }
+    ));
+}

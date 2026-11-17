@@ -345,6 +345,15 @@ pub fn apply_snapshot(
 
 /// Create worktrees under `root` for remote branches that have none. Returns new paths.
 pub fn materialize(root: &Path, remote: &str) -> Result<Vec<PathBuf>, GitError> {
+    materialize_except(root, remote, &[])
+}
+
+/// Like [`materialize`], leaving out the branches in `skip` (e.g. merged ones that were pruned).
+pub fn materialize_except(
+    root: &Path,
+    remote: &str,
+    skip: &[String],
+) -> Result<Vec<PathBuf>, GitError> {
     let bare = root.join(".bare");
     let g = Git::new(&bare);
     let prefix = format!("refs/remotes/{remote}/");
@@ -362,7 +371,10 @@ pub fn materialize(root: &Path, remote: &str) -> Result<Vec<PathBuf>, GitError> 
         let Some(branch) = r.strip_prefix(&prefix) else {
             continue;
         };
-        if branch == "HEAD" || existing_branches.iter().any(|b| b == branch) {
+        if branch == "HEAD"
+            || existing_branches.iter().any(|b| b == branch)
+            || skip.iter().any(|b| b == branch)
+        {
             continue;
         }
         let refs: Vec<&str> = taken.iter().map(String::as_str).collect();

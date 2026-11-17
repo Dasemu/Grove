@@ -16,6 +16,8 @@ fn opts(machine: &str, stamp: &str) -> Options {
         offline: false,
         materialize: true,
         push_snapshots: true,
+        merged: vec![],
+        disposable: vec![],
     }
 }
 

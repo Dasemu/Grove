@@ -386,6 +386,8 @@ fn archive_and_receive_in_one_pass_do_not_collide_on_backup_refs() {
         offline: false,
         materialize: true,
         push_snapshots: true,
+        merged: vec![],
+        disposable: vec![],
     };
     w.g1.run(&["checkout", "-q", "-b", "feat/z"]).unwrap();
     commit(&w.g1, "z.txt", "z\n");
