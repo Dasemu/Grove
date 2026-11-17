@@ -909,7 +909,7 @@ fn purge_if_gone(
     let first = {
         let mut map = gone_since.lock().unwrap();
         let entry = map.entry(repo.to_path_buf()).or_insert((now, now));
-        if now.saturating_sub(entry.1) > 2 * window {
+        if now.saturating_sub(entry.1) > purge::STALE_AFTER_SECS {
             // Stale: start over.
             *entry = (now, now);
         }
