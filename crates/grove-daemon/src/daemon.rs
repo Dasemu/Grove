@@ -1,6 +1,7 @@
 //! Event loop: file events are debounced per repo, a periodic pass covers fetches and anything
-//! the watcher missed, failures back off exponentially. One worker thread runs the sync passes,
-//! so passes never overlap.
+//! the watcher missed, failures back off exponentially. The loop thread schedules; a pool of
+//! `sync.workers` threads runs the passes, several repos at once but never two passes of the
+//! same repo.
 
 use crate::activity::{Activity, now_secs};
 use crate::discover::{discover, group_of, is_ready, subdirs};
@@ -99,7 +100,70 @@ pub enum Msg {
     Rescan,
     /// Sync one repo (or all) as soon as possible.
     SyncNow(Option<PathBuf>),
+    /// A worker finished a pass: consecutive failures (0 = success), and whether it was offline.
+    Done {
+        repo: PathBuf,
+        failures: u32,
+        offline: bool,
+    },
     Shutdown,
+}
+
+/// One pass for a worker to run.
+struct Job {
+    repo: PathBuf,
+    offline: bool,
+}
+
+/// Starts `n` threads that run passes from `jobs` and report each one as [`Msg::Done`].
+fn spawn_workers(
+    n: usize,
+    jobs: Receiver<Job>,
+    cfg: &Arc<Config>,
+    st: &Arc<Settings>,
+    visibility: &Arc<Visibility>,
+    forge: &Arc<ForgeMemory>,
+    ctx: &Ctx,
+) -> Vec<JoinHandle<()>> {
+    let jobs = Arc::new(Mutex::new(jobs));
+    (0..n)
+        .map(|_| {
+            let (jobs, cfg, st, visibility, forge, ctx) = (
+                jobs.clone(),
+                cfg.clone(),
+                st.clone(),
+                visibility.clone(),
+                forge.clone(),
+                ctx.clone(),
+            );
+            std::thread::spawn(move || {
+                loop {
+                    // The lock is held only while waiting for the next job.
+                    let job = jobs.lock().unwrap().recv();
+                    let Ok(Job { repo, offline }) = job else {
+                        break;
+                    };
+                    // A panicking pass must still report back, or its repo is never synced again.
+                    let failures = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        pass(&repo, &cfg, &st, &visibility, offline, &forge, &ctx)
+                    }))
+                    .unwrap_or_else(|_| {
+                        ctx.activity.log(
+                            "error",
+                            Some(&repo.display().to_string()),
+                            "sync pass panicked; retried with backoff",
+                        );
+                        1
+                    });
+                    let _ = ctx.tx.send(Msg::Done {
+                        repo,
+                        failures,
+                        offline,
+                    });
+                }
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -337,6 +401,7 @@ fn rescan(
     root: &Path,
     groups: &[String],
     watch: &mut Watch,
+    running: &HashSet<PathBuf>,
     ctx: &Ctx,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     // Shallow watches first, then discover: a `.bare` created in a child between the two steps
@@ -353,8 +418,16 @@ fn rescan(
         }
     }
     watch.sync(&wanted, false, ctx);
-    let d = discover(root, groups);
-    let found = d.managed;
+    let mut d = discover(root, groups);
+    // A repo whose pass is running may hold `.grove-busy` (purge) for a moment: it is judged
+    // when the pass reports back, not now.
+    d.stalled.retain(|r| !running.contains(r));
+    let mut found = d.managed;
+    for r in running {
+        if !found.contains(r) && r.is_dir() {
+            found.push(r.clone());
+        }
+    }
     for r in &d.stalled {
         if watch.warned_stalled.insert(r.clone()) {
             ctx.activity.log(
@@ -409,7 +482,26 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
     let fetch_every = Duration::from_secs(cfg.sync.fetch_interval_s.max(1));
     let root = cfg.root_path();
     let groups: Vec<String> = cfg.groups.iter().map(|g| g.name.clone()).collect();
-    let mut visibility = Visibility::load(st.visibility_cache.clone());
+    let cfg = Arc::new(cfg);
+    let st = Arc::new(st);
+    let visibility = Arc::new(Visibility::load(st.visibility_cache.clone()));
+    // Deletions being confirmed and merged pull requests, per repo.
+    let forge = Arc::new(ForgeMemory::default());
+    let (jobs, job_rx) = channel::<Job>();
+    let workers = spawn_workers(
+        cfg.sync.workers.max(1),
+        job_rx,
+        &cfg,
+        &st,
+        &visibility,
+        &forge,
+        &ctx,
+    );
+    // Repos a worker is running a pass for: never scheduled twice.
+    let mut running: HashSet<PathBuf> = HashSet::new();
+    // Repos whose `sync` was requested while their pass ran: that pass's failure sets no backoff.
+    let mut sync_asked: HashSet<PathBuf> = HashSet::new();
+    let pool = cfg.sync.workers.max(1);
     let mut watch = make_watch(
         ctx.tx.clone(),
         cfg.sync.ignore_extra.clone(),
@@ -417,7 +509,7 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
         groups.clone(),
         &ctx,
     );
-    rescan(&root, &groups, &mut watch, &ctx);
+    rescan(&root, &groups, &mut watch, &running, &ctx);
 
     // due_at: when a repo should next be synced; backoff_until: earliest retry after failures.
     let mut due_at: HashMap<PathBuf, Instant> = HashMap::new();
@@ -429,14 +521,16 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
     let mut next_full = Instant::now();
     // When a debounced rediscovery is due (set by the first event of a burst, never pushed back).
     let mut rescan_at: Option<Instant> = None;
-    // Deletions being confirmed and merged pull requests, per repo.
-    let mut forge = ForgeMemory::default();
 
-    loop {
+    'main: loop {
         let now = Instant::now();
+        // With every worker busy nothing can start before a `Done` arrives: due repos must not
+        // shorten the wait (that would spin).
+        let idle = running.len() < pool;
         let wake = due_at
-            .values()
-            .copied()
+            .iter()
+            .filter(|(r, _)| idle && !running.contains(*r))
+            .map(|(_, t)| *t)
             .chain([next_full])
             .chain(rescan_at)
             .min()
@@ -467,11 +561,36 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
             }
             Ok(Msg::SyncNow(Some(r))) => {
                 backoff_until.remove(&r);
+                if running.contains(&r) {
+                    sync_asked.insert(r.clone());
+                }
                 due_at.insert(r, Instant::now());
             }
             Ok(Msg::SyncNow(None)) => {
                 backoff_until.clear();
+                sync_asked.extend(running.iter().cloned());
                 next_full = Instant::now();
+            }
+            Ok(Msg::Done {
+                repo,
+                failures,
+                offline,
+            }) => {
+                running.remove(&repo);
+                let asked = sync_asked.remove(&repo);
+                if !is_ready(&repo) {
+                    // It vanished mid-pass (or was purged): whatever the pass reported is moot.
+                    let (found, _) = rescan(&root, &groups, &mut watch, &running, &ctx);
+                    forget_removed(&found, &mut due_at, &mut first_at, &mut backoff_until);
+                } else if !offline {
+                    if failures == 0 || asked {
+                        backoff_until.remove(&repo);
+                    } else {
+                        let wait = Duration::from_secs(5u64.saturating_mul(1 << failures.min(6)))
+                            .min(MAX_BACKOFF);
+                        backoff_until.insert(repo, Instant::now() + wait);
+                    }
+                }
             }
             Ok(Msg::Shutdown) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -479,7 +598,7 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
         // Discovery also runs while paused so the status stays current; only syncing stops.
         if rescan_at.is_some_and(|t| t <= Instant::now()) {
             rescan_at = None;
-            let (found, added) = rescan(&root, &groups, &mut watch, &ctx);
+            let (found, added) = rescan(&root, &groups, &mut watch, &running, &ctx);
             forget_removed(&found, &mut due_at, &mut first_at, &mut backoff_until);
             for r in added {
                 due_at.insert(r, Instant::now());
@@ -491,20 +610,26 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
         let now = Instant::now();
         if now >= next_full {
             // Safety net for events the watcher missed (one `read_dir` per group).
-            let (found, _) = rescan(&root, &groups, &mut watch, &ctx);
+            let (found, _) = rescan(&root, &groups, &mut watch, &running, &ctx);
             forget_removed(&found, &mut due_at, &mut first_at, &mut backoff_until);
             for r in found {
                 due_at.insert(r, now);
             }
             next_full = now + fetch_every;
         }
+        // A repo whose pass is running stays due and is dispatched when that pass is done.
         let mut due: Vec<PathBuf> = due_at
             .iter()
-            .filter(|(_, t)| **t <= now)
+            .filter(|(r, t)| **t <= now && !running.contains(*r))
             .map(|(r, _)| r.clone())
             .collect();
         due.sort();
         for r in due {
+            // Only as many passes as idle workers: the rest stay due, so pause stops them and
+            // `offline` is decided when a pass really starts.
+            if running.len() >= pool {
+                break;
+            }
             if !ctx.shared.lock().unwrap().repos.contains_key(&r) {
                 due_at.remove(&r);
                 continue;
@@ -513,34 +638,23 @@ fn run(cfg: Config, st: Settings, rx: Receiver<Msg>, ctx: Ctx) {
             first_at.remove(&r);
             if !is_ready(&r) {
                 // Removed or migrated away since the last discovery: drop it, no error.
-                let (found, _) = rescan(&root, &groups, &mut watch, &ctx);
+                let (found, _) = rescan(&root, &groups, &mut watch, &running, &ctx);
                 forget_removed(&found, &mut due_at, &mut first_at, &mut backoff_until);
                 continue;
             }
             // While backing off after a failure, still snapshot local work (no network needed);
             // the network is retried at the first pass after the backoff expires.
             let offline = backoff_until.get(&r).is_some_and(|u| *u > now);
-            let failures = pass(&r, &cfg, &st, &mut visibility, offline, &mut forge, &ctx);
-            if !is_ready(&r) {
-                // It vanished mid-pass: whatever the pass reported is moot.
-                let (found, _) = rescan(&root, &groups, &mut watch, &ctx);
-                forget_removed(&found, &mut due_at, &mut first_at, &mut backoff_until);
-                continue;
-            }
-            if offline {
-                continue;
-            }
-            if failures == 0 {
-                backoff_until.remove(&r);
-            } else {
-                let wait =
-                    Duration::from_secs(5u64.saturating_mul(1 << failures.min(6))).min(MAX_BACKOFF);
-                backoff_until.insert(r, Instant::now() + wait);
-            }
-            if ctx.shared.lock().unwrap().paused {
-                break;
+            running.insert(r.clone());
+            if jobs.send(Job { repo: r, offline }).is_err() {
+                break 'main;
             }
         }
+    }
+    // Workers finish the pass they are running; nothing is cut short.
+    drop(jobs);
+    for w in workers {
+        let _ = w.join();
     }
     ctx.activity.log("stop", None, "daemon stopped");
 }
@@ -557,11 +671,12 @@ fn forget_removed(
     backoff_until.retain(|r, _| found.contains(r));
 }
 
-/// What the daemon remembers between passes about each repo's forge (in memory only).
+/// What the daemon remembers between passes about each repo's forge (in memory only), shared
+/// by the workers.
 #[derive(Default)]
 struct ForgeMemory {
     /// Repos whose forge first confirmed their deletion at this time (see `purge`).
-    gone_since: HashMap<PathBuf, (u64, u64)>,
+    gone_since: Mutex<HashMap<PathBuf, (u64, u64)>>,
     /// Merged pull requests per repo (see `merged`).
     merged: MergedCache,
 }
@@ -571,9 +686,9 @@ fn pass(
     repo: &Path,
     cfg: &Config,
     st: &Settings,
-    visibility: &mut Visibility,
+    visibility: &Visibility,
     offline: bool,
-    forge: &mut ForgeMemory,
+    forge: &ForgeMemory,
     ctx: &Ctx,
 ) -> u32 {
     let ForgeMemory { gone_since, merged } = forge;
@@ -766,7 +881,7 @@ fn purge_if_gone(
     cfg: &Config,
     st: &Settings,
     result: &Result<grove_core::sync::SyncReport, grove_core::git::GitError>,
-    gone_since: &mut HashMap<PathBuf, (u64, u64)>,
+    gone_since: &Mutex<HashMap<PathBuf, (u64, u64)>>,
     ctx: &Ctx,
 ) -> bool {
     let name = repo.display().to_string();
@@ -776,14 +891,14 @@ fn purge_if_gone(
     };
     if !hint || cfg.sync.purged_dir.is_empty() {
         if matches!(result, Ok(rep) if rep.fetch_error.is_none()) {
-            gone_since.remove(repo);
+            gone_since.lock().unwrap().remove(repo);
         }
         return false;
     }
     match purge::confirmed_gone(cfg, repo, &st.remote, &RealForge) {
         Ok(true) => {}
         Ok(false) => {
-            gone_since.remove(repo);
+            gone_since.lock().unwrap().remove(repo);
             return false;
         }
         // Cannot tell (network, token): keep whatever was confirmed before.
@@ -791,13 +906,16 @@ fn purge_if_gone(
     }
     let now = now_secs();
     let window = purge::CONFIRM_AFTER_SECS;
-    let entry = gone_since.entry(repo.to_path_buf()).or_insert((now, now));
-    if now.saturating_sub(entry.1) > 2 * window {
-        // Stale: start over.
-        *entry = (now, now);
-    }
-    entry.1 = now;
-    let first = entry.0;
+    let first = {
+        let mut map = gone_since.lock().unwrap();
+        let entry = map.entry(repo.to_path_buf()).or_insert((now, now));
+        if now.saturating_sub(entry.1) > 2 * window {
+            // Stale: start over.
+            *entry = (now, now);
+        }
+        entry.1 = now;
+        entry.0
+    };
     if first == now {
         ctx.activity.log(
             "purge_pending",
@@ -816,8 +934,8 @@ fn purge_if_gone(
     else {
         return false;
     };
-    let gone = |ctx: &Ctx, gone_since: &mut HashMap<PathBuf, (u64, u64)>| {
-        gone_since.remove(repo);
+    let gone = |ctx: &Ctx, gone_since: &Mutex<HashMap<PathBuf, (u64, u64)>>| {
+        gone_since.lock().unwrap().remove(repo);
         ctx.shared.lock().unwrap().repos.remove(repo);
     };
     match purge::move_repo(repo, &dest) {

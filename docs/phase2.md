@@ -17,8 +17,16 @@ is `grove_core::sync::sync_repo`, the same code the CLI runs. The daemon only de
   cannot starve snapshots.
 - **Periodic pass**: every `fetch_interval_s` all repos get a full pass (fetch, receive, apply
   snapshots, materialize/archive). Also what catches missed events.
-- **One worker thread**: passes never overlap. Events that arrive during a pass queue another pass;
-  it finds nothing to do and ends the chain.
+- **Worker pool**: the loop thread only schedules; `sync.workers` threads (default 4, 1 to 32) run
+  the passes, so a slow or hanging fetch of one repo no longer holds up the others. A repo never
+  has two passes at once: one that becomes due while its pass runs is dispatched when it ends.
+  Events that arrive during a pass queue another pass; it finds nothing to do and ends the chain.
+  Passes are handed out only to idle workers, so the rest stay due: pause stops them, and whether
+  a pass runs offline (backoff) is decided when it starts. A `sync` request for a repo whose pass
+  is running is not undone by that pass failing. A panicking pass is logged and counts as a
+  failure. Rediscovery does not drop or flag (stalled) a repo while its pass runs.
+  The visibility and merged-PR caches are shared and never locked across a forge request.
+  Shutdown and pause let running passes finish. `workers = 1` is the old sequential behaviour.
 - **Failures** (network, auth, git errors) back off exponentially per repo: 10 s, 20 s, ... capped at
   5 min, and are logged as `error`. `sync` over IPC clears the backoff. While backing off, changes
   are still snapshotted locally (an offline pass); only the network is retried after the backoff.

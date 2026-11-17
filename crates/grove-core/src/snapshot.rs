@@ -47,7 +47,10 @@ fn temp_index_path() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("grove-index-{}-{nanos}", std::process::id()))
+    // A counter too: daemon workers snapshot several repos at once.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("grove-index-{}-{nanos}-{n}", std::process::id()))
 }
 
 /// Tree of everything in the worktree (tracked changes and untracked files, not ignored ones),

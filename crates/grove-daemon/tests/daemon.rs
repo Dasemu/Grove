@@ -768,3 +768,27 @@ fn clone_appears_only_when_complete() {
     assert!(seen, "cloned repo never managed");
     d.shutdown();
 }
+
+#[test]
+fn a_hanging_fetch_does_not_hold_up_other_repos() {
+    let w = world("workers", &["pca"]);
+    // `a-slow` sorts first, so its pass is dispatched first; its fetch hangs for 15 s.
+    let slow = w.base.join("pca/g/a-slow");
+    bare_layout(&slow, &w.remote);
+    let bare = slow.join(".bare");
+    git(
+        &bare,
+        &["remote", "set-url", "origin", "ssh://hang.invalid/x.git"],
+    );
+    git(&bare, &["config", "core.sshCommand", "sleep 15; false"]);
+    let mut cfg = config(&w, "pca", 200, 60);
+    cfg.sync.workers = 2;
+    let started = Instant::now();
+    let d = Daemon::start(cfg, settings(&w, "pca")).unwrap();
+    fs::write(w.base.join("pca/g/repo/main/new.txt"), "x\n").unwrap();
+    wait_until("snapshot of the other repo pushed", 10, || {
+        !git(&w.remote, &["for-each-ref", "refs/sync/pca/"]).is_empty()
+    });
+    assert!(started.elapsed() < Duration::from_secs(12));
+    d.shutdown();
+}
