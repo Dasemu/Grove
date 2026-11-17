@@ -127,7 +127,7 @@ A managed repo whose remote was deleted is moved out of the synced tree, never d
 purged_dir = "Purged"           # default; "" disables the move
 ```
 
-- Trigger: a fetch fails with a "not found"-style error. That is only a hint: the forge serving
+- Trigger: a fetch fails with a "not found"-style error (also Gitea's SSH "Cannot find repository"). That is only a hint: the forge serving
   `origin` must then answer 404 while the same token works (`test_connection`), and still do so
   `purge::CONFIRM_AFTER_SECS` (10 min) after the first confirmation (a gap of more than twice
   that starts over). A working fetch, or the forge seeing the repo again, clears it. Network or
