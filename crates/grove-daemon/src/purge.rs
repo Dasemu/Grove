@@ -22,6 +22,7 @@ pub fn looks_gone(fetch_error: &str) -> bool {
         "not found",
         "does not appear to be a git repository",
         "does not exist",
+        "cannot find repository", // Gitea/Forgejo over SSH
         "error: 404",
     ]
     .iter()
@@ -182,6 +183,10 @@ mod tests {
         ));
         assert!(looks_gone(
             "fatal: 'x.git' does not appear to be a git repository"
+        ));
+        assert!(looks_gone(
+            "git fetch -q --prune origin failed (Some(128)): error:\nerror: Cannot find \
+             repository: dasemu/x\nerror:\nfatal: Could not read from remote repository."
         ));
         assert!(!looks_gone(
             "ssh: connect to host h port 22: Connection timed out"
