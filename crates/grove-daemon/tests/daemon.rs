@@ -792,3 +792,45 @@ fn a_hanging_fetch_does_not_hold_up_other_repos() {
     assert!(started.elapsed() < Duration::from_secs(12));
     d.shutdown();
 }
+
+#[test]
+fn every_repo_gets_a_pass_when_a_cycle_takes_longer_than_the_interval() {
+    let w = world("fair", &["pca"]);
+    // Four repos sorting before `g/repo` whose fetch takes 1.5 s each: with one worker a cycle
+    // takes ~6 s against a 1 s interval.
+    for n in ["a", "b", "c", "d"] {
+        let r = w.base.join(format!("pca/g/{n}"));
+        bare_layout(&r, &w.remote);
+        git(
+            &r.join(".bare"),
+            &[
+                "config",
+                "remote.origin.uploadpack",
+                "sleep 1.5; git-upload-pack",
+            ],
+        );
+    }
+    let mut cfg = config(&w, "pca", 200, 1);
+    cfg.sync.workers = 1;
+    let d = Daemon::start(cfg, settings(&w, "pca")).unwrap();
+    let sock = w.base.join("pca.sock");
+    let last = |s: &serde_json::Value, name: &str| {
+        s["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["path"].as_str().unwrap().ends_with(&format!("/g/{name}")))
+            .and_then(|r| r["last_sync"].as_u64())
+    };
+    // `repo` keeps getting passes: it is not starved by the slow ones (before, sorted dispatch
+    // gave every new cycle to `a`..`d` again and `repo` never ran).
+    let mut seen = Vec::new();
+    wait_until("two passes of the last repo", 45, || {
+        let t = last(&status(&sock), "repo");
+        if t.is_some() && seen.last() != Some(&t) {
+            seen.push(t);
+        }
+        seen.len() >= 2
+    });
+    d.shutdown();
+}

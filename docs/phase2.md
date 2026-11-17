@@ -21,6 +21,9 @@ is `grove_core::sync::sync_repo`, the same code the CLI runs. The daemon only de
   the passes, so a slow or hanging fetch of one repo no longer holds up the others. A repo never
   has two passes at once: one that becomes due while its pass runs is dispatched when it ends.
   Events that arrive during a pass queue another pass; it finds nothing to do and ends the chain.
+  Due repos are dispatched longest-waiting first, and a full pass never moves an earlier due
+  time later, so when a cycle takes longer than `fetch_interval_s` every repo still gets its
+  turn (dispatching by path starved the repos late in the alphabet).
   Passes are handed out only to idle workers, so the rest stay due: pause stops them, and whether
   a pass runs offline (backoff) is decided when it starts. A `sync` request for a repo whose pass
   is running is not undone by that pass failing. A panicking pass is logged and counts as a
