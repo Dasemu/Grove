@@ -171,6 +171,10 @@ pub struct Sync {
     /// (`prune::default_protected`) and the default branch. See [`Sync::protected_branches`].
     #[serde(default)]
     pub prune_protected: Vec<String>,
+    /// How many repos the daemon syncs at the same time (1 to 32). A repo never has two
+    /// passes at once.
+    #[serde(default = "default_workers")]
+    pub workers: usize,
 }
 
 impl Sync {
@@ -194,6 +198,7 @@ impl Default for Sync {
             prune_merged: true,
             prune_disposable: default_disposable(),
             prune_protected: Vec::new(),
+            workers: default_workers(),
         }
     }
 }
@@ -206,6 +211,9 @@ pub struct ConfigRepo {
 
 fn yes() -> bool {
     true
+}
+fn default_workers() -> usize {
+    4
 }
 fn default_debounce() -> u64 {
     2000
@@ -346,6 +354,12 @@ impl Config {
                     "sync.purged_dir {pd:?} is also a group: purged repos would keep syncing"
                 ));
             }
+        }
+        if !(1..=32).contains(&self.sync.workers) {
+            return bad(format!(
+                "sync.workers = {} must be between 1 and 32",
+                self.sync.workers
+            ));
         }
         if let Some(d) = self
             .sync

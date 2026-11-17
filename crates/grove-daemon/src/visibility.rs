@@ -15,6 +15,7 @@ use grove_core::sync::git_dir_for;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// How long a "private" answer is trusted (a repo can be made public at any time).
 pub const PRIVATE_TTL: u64 = 3600;
@@ -223,10 +224,16 @@ impl Entry {
     }
 }
 
-/// Visibility cache. Owned by the daemon's single worker thread.
+/// Visibility cache, shared by the daemon's sync workers. The lock is never held across a
+/// forge request, so lookups for different repos run in parallel.
 #[derive(Debug, Default)]
 pub struct Visibility {
     path: Option<PathBuf>,
+    state: Mutex<Cache>,
+}
+
+#[derive(Debug, Default)]
+struct Cache {
     entries: BTreeMap<String, Entry>,
     failed: HashMap<String, (u64, String)>,
     logins: HashMap<String, String>,
@@ -242,12 +249,14 @@ impl Visibility {
             .unwrap_or_default();
         Visibility {
             path,
-            entries,
-            ..Visibility::default()
+            state: Mutex::new(Cache {
+                entries,
+                ..Cache::default()
+            }),
         }
     }
 
-    fn save(&self) {
+    fn save(&self, entries: &BTreeMap<String, Entry>) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let Some(path) = &self.path else { return };
@@ -256,7 +265,7 @@ impl Visibility {
         }
         let tmp = path.with_extension("json.tmp");
         let _ = std::fs::remove_file(&tmp);
-        let Ok(text) = serde_json::to_string_pretty(&self.entries) else {
+        let Ok(text) = serde_json::to_string_pretty(entries) else {
             return;
         };
         let written = std::fs::OpenOptions::new()
@@ -272,7 +281,7 @@ impl Visibility {
 
     /// What the forge says about `owner/name` on provider `pid`, from the cache or the forge.
     fn seen(
-        &mut self,
+        &self,
         pid: &str,
         pc: &ProviderCfg,
         owner: &str,
@@ -282,34 +291,39 @@ impl Visibility {
     ) -> Result<Seen, String> {
         let url = pc.url.as_deref().unwrap_or_default().trim_end_matches('/');
         let key = format!("{pid}|{url}|{owner}/{name}").to_ascii_lowercase();
-        if let Some(e) = self.entries.get(&key)
-            && e.fresh(now)
         {
-            return Ok(e.seen);
+            let c = self.state.lock().unwrap();
+            if let Some(e) = c.entries.get(&key)
+                && e.fresh(now)
+            {
+                return Ok(e.seen);
+            }
+            if let Some((at, why)) = c.failed.get(&key)
+                && at.saturating_sub(0) <= now
+                && now - at < RETRY
+            {
+                return Err(why.clone());
+            }
         }
-        if let Some((at, why)) = self.failed.get(&key)
-            && at.saturating_sub(0) <= now
-            && now - at < RETRY
-        {
-            return Err(why.clone());
-        }
-        match forge.seen(pid, pc, owner, name) {
+        let answer = forge.seen(pid, pc, owner, name);
+        let mut c = self.state.lock().unwrap();
+        match answer {
             Ok(seen) => {
-                self.failed.remove(&key);
-                self.entries.insert(key, Entry { seen, checked: now });
-                self.save();
+                c.failed.remove(&key);
+                c.entries.insert(key, Entry { seen, checked: now });
+                self.save(&c.entries);
                 Ok(seen)
             }
             Err(why) => {
                 let why = format!("lookup on {pid:?} failed: {why}");
-                self.failed.insert(key, (now, why.clone()));
+                c.failed.insert(key, (now, why.clone()));
                 Err(why)
             }
         }
     }
 
     /// Visibility of the repo behind one push URL.
-    pub fn check_url(&mut self, cfg: &Config, url: &str, now: u64, forge: &dyn Forge) -> Verdict {
+    pub fn check_url(&self, cfg: &Config, url: &str, now: u64, forge: &dyn Forge) -> Verdict {
         let Some(id) = parse_remote(url) else {
             return Verdict::Unknown("push URL not understood".into());
         };
@@ -327,7 +341,7 @@ impl Visibility {
 
     /// Mirror target `name` on provider `pid`: `Ok` when it is private or does not exist.
     fn check_mirror(
-        &mut self,
+        &self,
         cfg: &Config,
         group: &str,
         pid: &str,
@@ -346,16 +360,20 @@ impl Visibility {
             .and_then(|g| g.owner(pid))
         {
             Some(o) => o.to_string(),
-            None => match self.logins.get(pid) {
-                Some(l) => l.clone(),
-                None => {
-                    let l = forge
-                        .login(pid, pc)
-                        .map_err(|e| format!("mirror on {pid:?}: cannot get login: {e}"))?;
-                    self.logins.insert(pid.to_string(), l.clone());
-                    l
+            None => {
+                let known = self.state.lock().unwrap().logins.get(pid).cloned();
+                match known {
+                    Some(l) => l,
+                    None => {
+                        let l = forge
+                            .login(pid, pc)
+                            .map_err(|e| format!("mirror on {pid:?}: cannot get login: {e}"))?;
+                        let mut c = self.state.lock().unwrap();
+                        c.logins.insert(pid.to_string(), l.clone());
+                        l
+                    }
                 }
-            },
+            }
         };
         match self.seen(pid, pc, &owner, name, now, forge) {
             Ok(Seen::NotPrivate) => Err(format!("mirror {pid}:{owner}/{name} is public")),
@@ -395,7 +413,7 @@ pub fn snapshot_gate(
     cfg: &Config,
     repo: &Path,
     remote: &str,
-    vis: &mut Visibility,
+    vis: &Visibility,
     now: u64,
     forge: &dyn Forge,
 ) -> Result<(), String> {
@@ -559,7 +577,7 @@ owners = { github = "gh-org" }
         .unwrap();
         let e = provider_for(&dup, &parse_remote("https://h.io/o/r").unwrap()).unwrap_err();
         assert!(e.contains("several"));
-        let mut v = Visibility::default();
+        let v = Visibility::default();
         let fake = Fake::default().with("o/r", Ok(Seen::Private));
         assert!(matches!(
             v.check_url(&dup, "https://h.io/o/r", 0, &fake),
@@ -571,7 +589,7 @@ owners = { github = "gh-org" }
     #[test]
     fn unknown_visibility_is_public_and_withholds_snapshots() {
         let c = cfg();
-        let mut v = Visibility::default();
+        let v = Visibility::default();
         let boom = Fake::default();
         for url in [
             "https://gitlab.com/o/r.git",
@@ -608,7 +626,7 @@ owners = { github = "gh-org" }
     #[test]
     fn private_answers_expire_after_an_hour_and_failures_are_throttled() {
         let c = cfg();
-        let mut v = Visibility::default();
+        let v = Visibility::default();
         let f = Fake::default().with("o/r", Ok(Seen::Private));
         let url = "https://github.com/o/r";
         assert_eq!(v.check_url(&c, url, 100, &f), Verdict::Private);
@@ -654,7 +672,7 @@ owners = { github = "gh-org" }
     #[test]
     fn cache_keys_include_provider_and_are_case_normalised() {
         let c = cfg();
-        let mut v = Visibility::default();
+        let v = Visibility::default();
         let f = Fake::default().with("o/r", Ok(Seen::Private));
         v.check_url(&c, "https://github.com/O/R.git", 0, &f);
         v.check_url(&c, "git@github.com:o/r", 0, &f);
@@ -676,7 +694,7 @@ owners = { github = "gh-org" }
         let file = dir.join("visibility.json");
         let c = cfg();
         let f = Fake::default().with("o/r", Ok(Seen::NotPrivate));
-        let mut v = Visibility::load(Some(file.clone()));
+        let v = Visibility::load(Some(file.clone()));
         assert_eq!(
             v.check_url(&c, "https://github.com/o/r", 50, &f),
             Verdict::Public
@@ -684,7 +702,7 @@ owners = { github = "gh-org" }
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let never = Fake::default();
-        let mut again = Visibility::load(Some(file));
+        let again = Visibility::load(Some(file));
         assert_eq!(
             again.check_url(&c, "https://github.com/o/r", 60, &never),
             Verdict::Public
@@ -721,22 +739,16 @@ owners = { github = "gh-org" }
         let f = Fake::default()
             .with("o/r", Ok(Seen::Private))
             .with("o/open", Ok(Seen::NotPrivate));
-        let mut v = Visibility::default();
-        let gate = |repo: &Path, v: &mut Visibility| snapshot_gate(&c, repo, "origin", v, 0, &f);
+        let v = Visibility::default();
+        let gate = |repo: &Path, v: &Visibility| snapshot_gate(&c, repo, "origin", v, 0, &f);
         let ok = "https://git.example.com:3000/o/r.git";
-        assert!(gate(&mk(&base, "priv", &[ok], &[]), &mut v).is_ok());
-        assert!(gate(&mk(&base, "off", &[ok], &[]), &mut v).is_err());
-        assert!(
-            gate(
-                &mk(&base, "all", &["https://unknown.example/o/r"], &[]),
-                &mut v
-            )
-            .is_ok()
-        );
+        assert!(gate(&mk(&base, "priv", &[ok], &[]), &v).is_ok());
+        assert!(gate(&mk(&base, "off", &[ok], &[]), &v).is_err());
+        assert!(gate(&mk(&base, "all", &["https://unknown.example/o/r"], &[]), &v).is_ok());
         // Fetch URL private, but the push goes to a public repo (pushurl).
         let e = gate(
             &mk(&base, "priv2", &[ok], &["https://github.com/o/open"]),
-            &mut v,
+            &v,
         );
         assert!(e.is_err());
         // Private-only without any remote: unknown, withheld.
@@ -744,7 +756,7 @@ owners = { github = "gh-org" }
         std::fs::create_dir_all(&bare).unwrap();
         Git::new(&bare).run(&["init", "-q", "--bare"]).unwrap();
         assert!(
-            gate(&base.join("priv/none"), &mut v)
+            gate(&base.join("priv/none"), &v)
                 .unwrap_err()
                 .contains("unknown")
         );
@@ -760,24 +772,24 @@ owners = { github = "gh-org" }
         let f = Fake::default()
             .with("o/r", Ok(Seen::Private))
             .with("o/open", Ok(Seen::NotPrivate));
-        let mut v = Visibility::default();
+        let v = Visibility::default();
         let ok = "https://git.example.com:3000/o/r.git";
         let open = "https://github.com/o/open";
         // Group "priv": private fetch URL + public pushurl => withheld; both private => allowed.
         let both = mk(&base, "priv", &[ok], &[ok, "https://github.com/o/r"]);
-        assert!(snapshot_gate(&c, &both, "origin", &mut v, 0, &f).is_ok());
+        assert!(snapshot_gate(&c, &both, "origin", &v, 0, &f).is_ok());
         std::fs::remove_dir_all(base.join("priv")).unwrap();
         let leaky = mk(&base, "priv", &[ok, open], &[]);
-        let e = snapshot_gate(&c, &leaky, "origin", &mut v, 0, &f).unwrap_err();
+        let e = snapshot_gate(&c, &leaky, "origin", &v, 0, &f).unwrap_err();
         assert!(e.contains("public"), "{e}");
         // pushInsteadOf rewrites the push URL to a public repo.
         let g = Git::new(leaky.join(".bare"));
         g.run(&["remote", "set-url", "--delete", "origin", open])
             .unwrap();
-        assert!(snapshot_gate(&c, &leaky, "origin", &mut v, 0, &f).is_ok());
+        assert!(snapshot_gate(&c, &leaky, "origin", &v, 0, &f).is_ok());
         g.run(&["config", &format!("url.{open}.pushInsteadOf"), ok])
             .unwrap();
-        assert!(snapshot_gate(&c, &leaky, "origin", &mut v, 0, &f).is_err());
+        assert!(snapshot_gate(&c, &leaky, "origin", &v, 0, &f).is_err());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -789,8 +801,8 @@ owners = { github = "gh-org" }
         let _ = std::fs::remove_dir_all(&base);
         let repo = mk(&base, "mir", &["https://git.example.com:3000/o/r.git"], &[]);
         let gate = |f: &Fake| {
-            let mut v = Visibility::default();
-            snapshot_gate(&c, &repo, "origin", &mut v, 0, f)
+            let v = Visibility::default();
+            snapshot_gate(&c, &repo, "origin", &v, 0, f)
         };
         let base_f = || Fake::default().with("o/r", Ok(Seen::Private));
         // No mirror (404): fine. Mirror owner comes from `owners`.
