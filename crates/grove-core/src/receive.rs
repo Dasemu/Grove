@@ -45,6 +45,7 @@ pub(crate) fn ignored_conflicts(g: &Git, target: &str) -> Result<Vec<String>, Gi
         "-z",
     ])?;
     let ignored: Vec<&str> = ignored.split('\0').filter(|p| !p.is_empty()).collect();
+    let top = std::path::PathBuf::from(g.run(&["rev-parse", "--show-toplevel"])?);
     Ok(added
         .into_iter()
         .filter(|a| {
@@ -52,8 +53,24 @@ pub(crate) fn ignored_conflicts(g: &Git, target: &str) -> Result<Vec<String>, Gi
                 .iter()
                 .any(|i| a == i || (i.ends_with('/') && a.starts_with(i)))
         })
+        // An ignored directory (`.claude/`) only covers the path: there is something to
+        // overwrite only if the file, or a file where one of its parent directories goes, exists.
+        .filter(|a| occupied(&top, a))
         .map(String::from)
         .collect())
+}
+
+/// True when writing `rel` under `top` would replace something on disk: the path itself
+/// exists, or one of its parents exists as something other than a directory.
+fn occupied(top: &Path, rel: &str) -> bool {
+    let path = top.join(rel);
+    if path.symlink_metadata().is_ok() {
+        return true;
+    }
+    path.ancestors()
+        .skip(1)
+        .take_while(|p| p.starts_with(top) && *p != top)
+        .any(|p| p.symlink_metadata().is_ok_and(|m| !m.is_dir()))
 }
 
 fn current_branch(g: &Git) -> Result<String, GitError> {
