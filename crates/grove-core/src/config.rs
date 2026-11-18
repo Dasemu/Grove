@@ -167,6 +167,23 @@ pub struct Sync {
     /// regenerable build output and dependency caches. Any other ignored file keeps it.
     #[serde(default = "default_disposable")]
     pub prune_disposable: Vec<String>,
+    /// Extra branches never pruned, on top of the built-in long-lived ones
+    /// (`prune::default_protected`) and the default branch. See [`Sync::protected_branches`].
+    #[serde(default)]
+    pub prune_protected: Vec<String>,
+    /// How many repos the daemon syncs at the same time (1 to 32). A repo never has two
+    /// passes at once.
+    #[serde(default = "default_workers")]
+    pub workers: usize,
+}
+
+impl Sync {
+    /// Branches never pruned: the built-in long-lived ones plus `prune_protected`.
+    pub fn protected_branches(&self) -> Vec<String> {
+        let mut all = crate::prune::default_protected();
+        all.extend(self.prune_protected.iter().cloned());
+        all
+    }
 }
 
 impl Default for Sync {
@@ -180,6 +197,8 @@ impl Default for Sync {
             purged_dir: default_purged_dir(),
             prune_merged: true,
             prune_disposable: default_disposable(),
+            prune_protected: Vec::new(),
+            workers: default_workers(),
         }
     }
 }
@@ -192,6 +211,9 @@ pub struct ConfigRepo {
 
 fn yes() -> bool {
     true
+}
+fn default_workers() -> usize {
+    4
 }
 fn default_debounce() -> u64 {
     2000
@@ -333,6 +355,12 @@ impl Config {
                 ));
             }
         }
+        if !(1..=32).contains(&self.sync.workers) {
+            return bad(format!(
+                "sync.workers = {} must be between 1 and 32",
+                self.sync.workers
+            ));
+        }
         if let Some(d) = self
             .sync
             .prune_disposable
@@ -457,10 +485,19 @@ name = "grove-config"
         let c = Config::parse(base).unwrap();
         assert!(c.sync.prune_merged);
         assert!(c.sync.prune_disposable.iter().any(|d| d == "target"));
+        assert!(
+            c.sync
+                .protected_branches()
+                .iter()
+                .any(|b| b == "development")
+        );
         let own = format!("{base}[sync]\nprune_merged=false\nprune_disposable=[\"out\"]\n");
         let c = Config::parse(&own).unwrap();
         assert!(!c.sync.prune_merged);
         assert_eq!(c.sync.prune_disposable, vec!["out".to_string()]);
+        let t = format!("{base}[sync]\nprune_protected=[\"release\"]\n");
+        let p = Config::parse(&t).unwrap().sync.protected_branches();
+        assert!(p.iter().any(|b| b == "release") && p.iter().any(|b| b == "main"));
         for bad in ["\"\"", "\"a/b\"", "\"..\""] {
             let t = format!("{base}[sync]\nprune_disposable=[{bad}]\n");
             assert!(Config::parse(&t).is_err(), "{bad}");

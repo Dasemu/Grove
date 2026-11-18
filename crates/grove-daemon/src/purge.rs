@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 
 /// How long a remote deletion must keep being confirmed before the repo is moved.
 pub const CONFIRM_AFTER_SECS: u64 = 600;
+/// A confirmation older than this (no check in between, e.g. the forge was unreachable) no
+/// longer counts and the wait starts over. Much longer than the time between two passes of
+/// one repo, which can exceed 20 minutes with many repos.
+pub const STALE_AFTER_SECS: u64 = 6 * 3600;
 
 /// Fetch failures that may mean the remote repo is gone (only a hint; see [`confirmed_gone`]).
 pub fn looks_gone(fetch_error: &str) -> bool {
@@ -22,6 +26,7 @@ pub fn looks_gone(fetch_error: &str) -> bool {
         "not found",
         "does not appear to be a git repository",
         "does not exist",
+        "cannot find repository", // Gitea/Forgejo over SSH
         "error: 404",
     ]
     .iter()
@@ -182,6 +187,10 @@ mod tests {
         ));
         assert!(looks_gone(
             "fatal: 'x.git' does not appear to be a git repository"
+        ));
+        assert!(looks_gone(
+            "git fetch -q --prune origin failed (Some(128)): error:\nerror: Cannot find \
+             repository: dasemu/x\nerror:\nfatal: Could not read from remote repository."
         ));
         assert!(!looks_gone(
             "ssh: connect to host h port 22: Connection timed out"

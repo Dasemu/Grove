@@ -12,6 +12,7 @@ use grove_core::inspect::worktrees;
 use grove_core::prune::MergedHead;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How long a forge answer is reused.
@@ -37,8 +38,8 @@ impl PullSource for RealForge {
         name: &str,
     ) -> Result<Vec<MergedHead>, String> {
         let (token, _) = grove_providers::token::resolve(id, pc).map_err(|e| e.to_string())?;
-        let pulls = grove_providers::build(pc, token)
-            .merged_pulls(owner, name)
+        let forge = grove_providers::build(pc, token);
+        let pulls = grove_providers::merged_pulls_following_moves(forge.as_ref(), owner, name)
             .map_err(|e| e.to_string())?;
         Ok(pulls
             .into_iter()
@@ -91,10 +92,11 @@ struct Entry {
     noted: BTreeSet<String>,
 }
 
-/// Per-repo forge answers and notes, held by the daemon loop (in memory only).
+/// Per-repo forge answers and notes (in memory only), shared by the daemon's sync workers. The
+/// lock is never held across a forge request.
 #[derive(Default)]
 pub struct MergedCache {
-    entries: HashMap<PathBuf, Entry>,
+    entries: Mutex<HashMap<PathBuf, Entry>>,
 }
 
 /// Result of [`MergedCache::heads`].
@@ -107,25 +109,31 @@ pub struct Heads {
 impl MergedCache {
     /// The merged heads of `repo`, asking `src` when the cached answer is older than [`TTL`].
     pub fn heads(
-        &mut self,
+        &self,
         cfg: &Config,
         repo: &Path,
         remote: &str,
         src: &dyn PullSource,
         now: Instant,
     ) -> Heads {
-        let e = self.entries.entry(repo.to_path_buf()).or_default();
-        if e.checked
-            .is_some_and(|t| now.saturating_duration_since(t) < TTL)
         {
-            return Heads {
-                heads: e.heads.clone(),
-                new_error: None,
-            };
+            let mut entries = self.entries.lock().unwrap();
+            let e = entries.entry(repo.to_path_buf()).or_default();
+            if e.checked
+                .is_some_and(|t| now.saturating_duration_since(t) < TTL)
+            {
+                return Heads {
+                    heads: e.heads.clone(),
+                    new_error: None,
+                };
+            }
+            e.checked = Some(now);
         }
-        e.checked = Some(now);
+        let answer = lookup(cfg, repo, remote, src);
+        let mut entries = self.entries.lock().unwrap();
+        let e = entries.entry(repo.to_path_buf()).or_default();
         let mut new_error = None;
-        match lookup(cfg, repo, remote, src) {
+        match answer {
             Ok(h) => {
                 e.heads = h;
                 e.error = None;
@@ -145,8 +153,9 @@ impl MergedCache {
 
     /// Of the "kept" notes of this pass, those not logged yet for `repo`. Notes that no longer
     /// apply are forgotten, so they are logged again if they come back.
-    pub fn new_notes(&mut self, repo: &Path, notes: Vec<String>) -> Vec<String> {
-        let e = self.entries.entry(repo.to_path_buf()).or_default();
+    pub fn new_notes(&self, repo: &Path, notes: Vec<String>) -> Vec<String> {
+        let mut entries = self.entries.lock().unwrap();
+        let e = entries.entry(repo.to_path_buf()).or_default();
         let now: BTreeSet<String> = notes.into_iter().collect();
         let fresh = now.difference(&e.noted).cloned().collect();
         e.noted = now;
@@ -156,6 +165,8 @@ impl MergedCache {
     /// The last answer for `repo`, without asking the forge (offline passes).
     pub fn cached(&self, repo: &Path) -> Vec<MergedHead> {
         self.entries
+            .lock()
+            .unwrap()
             .get(repo)
             .map(|e| e.heads.clone())
             .unwrap_or_default()
@@ -217,7 +228,7 @@ mod tests {
             asked: RefCell::new(vec![]),
             answer: RefCell::new(Ok(vec![head(1)])),
         };
-        let mut c = MergedCache::default();
+        let c = MergedCache::default();
         let t0 = Instant::now();
         assert_eq!(c.heads(&cfg, &repo, "origin", &f, t0).heads, vec![head(1)]);
         assert_eq!(f.asked.borrow().as_slice(), ["gitea:Org/r"]);
@@ -235,7 +246,7 @@ mod tests {
 
     #[test]
     fn notes_are_reported_once_while_they_hold() {
-        let mut c = MergedCache::default();
+        let c = MergedCache::default();
         let r = Path::new("/r");
         assert_eq!(c.new_notes(r, vec!["a".into()]), vec!["a".to_string()]);
         assert!(c.new_notes(r, vec!["a".into()]).is_empty());

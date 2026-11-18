@@ -4,7 +4,7 @@
 
 use crate::git::{Git, GitError};
 use crate::inspect::{facts, state, worktrees};
-use crate::prune::{MergedHead, Pruned, prune_merged, settled_branches};
+use crate::prune::{MergedHead, Pruned, Rules, prune_merged, settled_branches};
 use crate::receive::{
     Applied, Archived, Received, apply_snapshot, archive_gone, fetch, foreign_snapshots,
     materialize_except, push_snapshot, receive,
@@ -32,6 +32,10 @@ pub struct Options {
     pub merged: Vec<MergedHead>,
     /// Names of ignored files/directories that do not count as local work when pruning.
     pub disposable: Vec<String>,
+    /// Prune worktrees of merged branches (bare layout only, see `prune`).
+    pub prune: bool,
+    /// Branch names never pruned.
+    pub protected: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,14 +86,20 @@ pub fn sync_repo(path: &Path, o: &Options) -> Result<SyncReport, GitError> {
             Err(e) => rep.fetch_error = Some(format!("archive: {e}")),
         }
     }
-    if bare_layout && rep.fetch_error.is_none() && !o.offline {
-        match prune_merged(path, &o.merged, &o.disposable, &o.machine, &o.stamp) {
+    if bare_layout && o.prune && rep.fetch_error.is_none() && !o.offline {
+        let rules = Rules {
+            remote: &o.remote,
+            merged: &o.merged,
+            disposable: &o.disposable,
+            protected: &o.protected,
+        };
+        match prune_merged(path, &rules, &o.machine, &o.stamp) {
             Ok(p) => rep.pruned = p,
             Err(e) => rep.fetch_error = Some(format!("prune merged: {e}")),
         }
     }
     if bare_layout && o.materialize && rep.fetch_error.is_none() {
-        let skip = settled_branches(&gitdir, &o.remote, &o.merged, &o.machine);
+        let skip = settled_branches(&gitdir, &o.remote, &o.merged, &o.protected, &o.machine);
         match skip.and_then(|skip| materialize_except(path, &o.remote, &skip)) {
             Ok(m) => rep.materialized = m,
             Err(e) => rep.fetch_error = Some(format!("materialize: {e}")),

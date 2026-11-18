@@ -18,6 +18,8 @@ fn opts(machine: &str, stamp: &str) -> Options {
         push_snapshots: true,
         merged: vec![],
         disposable: vec![],
+        prune: false,
+        protected: vec![],
     }
 }
 

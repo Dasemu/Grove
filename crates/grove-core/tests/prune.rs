@@ -2,7 +2,7 @@ mod common;
 use common::*;
 use grove_core::git::Git;
 use grove_core::migrate::migrate;
-use grove_core::prune::{MergedHead, Pruned, prune_merged};
+use grove_core::prune::{MergedHead, Pruned, Rules, default_protected, prune_merged};
 use grove_core::sync::{Options, sync_repo};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -58,6 +58,8 @@ fn opts(stamp: &str, merged: Vec<MergedHead>) -> Options {
         push_snapshots: false,
         merged,
         disposable: vec!["target".into()],
+        prune: true,
+        protected: default_protected(),
     }
 }
 
@@ -119,7 +121,7 @@ fn a_squash_merged_worktree_is_removed_and_not_brought_back() {
     else {
         panic!("{:?}", rep.pruned);
     };
-    assert_eq!((branch.as_str(), *pr), ("feat/x", 7));
+    assert_eq!((branch.as_str(), *pr), ("feat/x", Some(7)));
     assert!(!wt.exists() && !has_branch(&w.root, "feat/x"));
     let bare = Git::new(w.root.join(".bare"));
     assert_eq!(bare.run(&["rev-parse", backup_ref]).unwrap(), tip);
@@ -215,10 +217,82 @@ fn an_older_tip_is_pruned_but_the_default_branch_and_outside_worktrees_never_are
         head(5, "main", &main_tip),
         head(6, "o", &tip_o),
     ];
-    let pruned = prune_merged(&w.root, &merged, &[], "me", "t").unwrap();
+    let rules = Rules {
+        remote: "origin",
+        merged: &merged,
+        disposable: &[],
+        protected: &[],
+    };
+    let pruned = prune_merged(&w.root, &rules, "me", "t").unwrap();
     assert!(
-        matches!(pruned.as_slice(), [Pruned::Removed { branch, pr: 4, .. }] if branch == "f"),
+        matches!(pruned.as_slice(), [Pruned::Removed { branch, pr: Some(4), .. }] if branch == "f"),
         "{pruned:?}"
     );
     assert!(w.root.join("main").exists() && ext.exists());
+}
+
+#[test]
+fn a_branch_merged_without_a_pr_is_removed_but_protected_and_fresh_ones_are_not() {
+    let w = world();
+    let tip = push_branch(&w, "feat/ff");
+    push_branch(&w, "development");
+    push_branch(&w, "wip");
+    sync_repo(&w.root, &opts("s1", vec![])).unwrap();
+    // A branch at the default branch's tip has nothing of its own yet.
+    w.dev.run(&["push", "-q", "origin", "main:fresh"]).unwrap();
+
+    // Merged into main without a pull request (no forge answer at all), with `development`
+    // (long-lived, protected); `wip` is not merged.
+    for b in ["feat/ff", "development"] {
+        w.dev
+            .run(&["merge", "-q", "--no-ff", "-m", "m", b])
+            .unwrap();
+    }
+    w.dev.run(&["push", "-q", "origin", "main"]).unwrap();
+    w.dev.run(&["push", "-q", "origin", "main:fresh2"]).unwrap();
+    let rep = sync_repo(&w.root, &opts("s2", vec![])).unwrap();
+    assert!(rep.fetch_error.is_none(), "{:?}", rep.fetch_error);
+    let [
+        Pruned::Removed {
+            branch,
+            pr: None,
+            backup_ref,
+            ..
+        },
+    ] = rep.pruned.as_slice()
+    else {
+        panic!("{:?}", rep.pruned);
+    };
+    assert_eq!(branch, "feat/ff");
+    let bare = Git::new(w.root.join(".bare"));
+    assert_eq!(bare.run(&["rev-parse", backup_ref]).unwrap(), tip);
+    assert!(!w.root.join("feat-ff").exists() && !has_branch(&w.root, "feat/ff"));
+    for d in ["development", "wip", "fresh2"] {
+        assert!(w.root.join(d).exists(), "{d}");
+    }
+
+    // `feat/ff` stays on the remote and is not materialized again. `fresh` (materialized in
+    // s2) has no commits of its own: main's first-parent history passed through its tip, so it
+    // is not taken for a merge although main moved past it.
+    let rep = sync_repo(&w.root, &opts("s3", vec![])).unwrap();
+    assert!(rep.pruned.is_empty(), "{:?}", rep.pruned);
+    assert!(!w.root.join("feat-ff").exists());
+    assert!(w.root.join("fresh").exists() && w.root.join("fresh2").exists());
+}
+
+#[test]
+fn a_protected_branch_is_kept_even_as_the_head_of_a_merged_pr() {
+    let w = world();
+    let tip = push_branch(&w, "development");
+    squash_merge(&w, "development");
+    // Not materialized yet: a merged PR head must not keep a protected branch away.
+    let rep = sync_repo(&w.root, &opts("s1", vec![head(9, "development", &tip)])).unwrap();
+    assert!(
+        w.root.join("development").exists(),
+        "{:?}",
+        rep.materialized
+    );
+    let rep = sync_repo(&w.root, &opts("s2", vec![head(9, "development", &tip)])).unwrap();
+    assert!(rep.pruned.is_empty(), "{:?}", rep.pruned);
+    assert!(w.root.join("development").exists());
 }
