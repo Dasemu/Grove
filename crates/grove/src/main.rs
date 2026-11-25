@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use grove_core::config::{Config, ProviderKind};
+use grove_core::config::Config;
 use grove_core::git::Git;
 use grove_core::inspect::{state, worktrees};
 use grove_core::migrate::migrate;
@@ -13,6 +13,7 @@ use grove_core::sync::{Options, SyncReport, git_dir_for, sync_repo};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod namespace;
 mod secrets;
 #[cfg(test)]
 #[path = "../../../test-support/tmp.rs"]
@@ -111,6 +112,34 @@ enum Cmd {
         name: String,
         #[arg(long)]
         public: bool,
+        /// Open the new worktree afterwards (with LAUNCHER, or the default one)
+        #[arg(long, value_name = "LAUNCHER", num_args = 0..=1, default_missing_value = "")]
+        open: Option<String>,
+    },
+    /// Open a worktree in an editor or tool (Zed, VS Code, Claude Code, ...)
+    Open {
+        /// A path, or `[group/]repo[@branch]` under the root (default: the current directory)
+        #[arg(default_value = ".")]
+        target: String,
+        /// Launcher name (see --list; default: `open.default`, else the first installed)
+        #[arg(long = "with", short = 'w', value_name = "LAUNCHER")]
+        with: Option<String>,
+        /// List the launchers and whether they are installed
+        #[arg(long)]
+        list: bool,
+        /// Print the command instead of running it
+        #[arg(long)]
+        print: bool,
+    },
+    /// Manage namespaces: the groups of repos under `<root>/<name>` and where they live
+    Group {
+        #[command(subcommand)]
+        action: GroupCmd,
+    },
+    /// Manage forge accounts (Gitea, Forgejo, GitHub)
+    Provider {
+        #[command(subcommand)]
+        action: ProviderCmd,
     },
     /// List (or, with names, clone) remote repos that are not on this machine
     Import { group: String, names: Vec<String> },
@@ -128,6 +157,66 @@ enum Cmd {
         #[command(subcommand)]
         action: DaemonCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum GroupCmd {
+    /// List the namespaces
+    List,
+    /// Add a namespace (or change one with --replace) and create its directory
+    Add {
+        name: String,
+        /// Provider the repos are created on
+        #[arg(long)]
+        primary: String,
+        /// Provider(s) the repos are mirrored to (repeatable)
+        #[arg(long = "mirror-to", value_name = "PROVIDER")]
+        mirror_to: Vec<String>,
+        /// Owning account or organisation: `PROVIDER=OWNER`, or `OWNER` for the primary
+        /// (repeatable; default: your own account)
+        #[arg(long = "owner", value_name = "[PROVIDER=]OWNER")]
+        owners: Vec<String>,
+        /// Public repos go to this provider instead (then --primary is for private ones)
+        #[arg(long, value_name = "PROVIDER")]
+        public_primary: Option<String>,
+        /// Mirrors of public repos (repeatable; needs --public-primary)
+        #[arg(long = "public-mirror-to", value_name = "PROVIDER")]
+        public_mirror_to: Vec<String>,
+        /// WIP snapshot policy for this namespace: private-only, all, none
+        #[arg(long)]
+        snapshots: Option<String>,
+        /// Do not create worktrees for new remote branches automatically
+        #[arg(long)]
+        no_materialize: bool,
+        /// Replace an existing namespace of that name
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Remove a namespace from the config (its directory and repos stay on disk, unsynced)
+    Remove { name: String },
+}
+
+#[derive(Subcommand)]
+enum ProviderCmd {
+    /// List the providers
+    List,
+    /// Add a provider (or change one with --replace); then `grove login ID`
+    Add {
+        id: String,
+        /// gitea, forgejo or github
+        #[arg(long)]
+        kind: String,
+        /// Base URL (required for gitea/forgejo)
+        #[arg(long)]
+        url: Option<String>,
+        /// How git talks to it: https (API token) or ssh (your keys)
+        #[arg(long, default_value = "https")]
+        protocol: String,
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Remove a provider no namespace uses
+    Remove { id: String },
 }
 
 #[derive(Subcommand)]
@@ -258,6 +347,160 @@ fn daemon(action: &DaemonCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Opens `dir` with the launcher `with` (or the default one); `print` only shows the command.
+fn open_dir(cfg: &Config, dir: &Path, with: Option<&str>, print: bool) -> Result<()> {
+    use grove_core::launch::{System, argv, launchers, pick, spawn};
+    let all = launchers(&cfg.open, &System);
+    let l = pick(&all, &cfg.open, with).map_err(anyhow::Error::msg)?;
+    let cmd = argv(l, dir, &cfg.open, &System).map_err(anyhow::Error::msg)?;
+    if print {
+        println!("{}", cmd.join(" "));
+        return Ok(());
+    }
+    spawn(&cmd, dir).map_err(anyhow::Error::msg)?;
+    println!("opened {} in {}", dir.display(), l.label);
+    Ok(())
+}
+
+fn list_launchers(cfg: &Config) -> Result<()> {
+    let all = grove_core::launch::launchers(&cfg.open, &grove_core::launch::System);
+    let default = grove_core::launch::pick(&all, &cfg.open, None)
+        .ok()
+        .map(|l| l.name.clone());
+    for l in &all {
+        println!(
+            "{} {:<16} {:<16} {}{}",
+            if Some(&l.name) == default.as_ref() {
+                "*"
+            } else {
+                " "
+            },
+            l.name,
+            l.label,
+            if l.available {
+                l.command[0].as_str()
+            } else {
+                "(not installed)"
+            },
+            if l.terminal { "  [terminal]" } else { "" }
+        );
+    }
+    Ok(())
+}
+
+fn config_path(arg: &Option<PathBuf>) -> Result<PathBuf> {
+    arg.clone()
+        .or_else(Config::default_path)
+        .context("cannot determine config path (set --config)")
+}
+
+/// Saves an edited config and says what to do next.
+fn save_edited(cfg: &Config, path: &Path) -> Result<()> {
+    let bak = namespace::save(cfg, path)?;
+    println!(
+        "saved {} (previous version: {})",
+        path.display(),
+        bak.display()
+    );
+    if grove_daemon::ipc::default_socket_path().exists() {
+        println!("restart the daemon to apply it: systemctl --user restart groved");
+    }
+    Ok(())
+}
+
+fn group_cmd(arg: &Option<PathBuf>, action: &GroupCmd) -> Result<()> {
+    let path = config_path(arg)?;
+    let mut cfg = load_config(arg)?;
+    match action {
+        GroupCmd::List => {
+            for l in namespace::describe_groups(&cfg) {
+                println!("{l}");
+            }
+            Ok(())
+        }
+        GroupCmd::Add {
+            name,
+            primary,
+            mirror_to,
+            owners,
+            public_primary,
+            public_mirror_to,
+            snapshots,
+            no_materialize,
+            replace,
+        } => {
+            let snapshots = snapshots
+                .as_deref()
+                .map(namespace::parse_snapshots)
+                .transpose()?;
+            namespace::add_group(
+                &mut cfg,
+                namespace::GroupArgs {
+                    name: name.clone(),
+                    primary: primary.clone(),
+                    mirror_to: mirror_to.clone(),
+                    owners: owners.clone(),
+                    public_primary: public_primary.clone(),
+                    public_mirror_to: public_mirror_to.clone(),
+                    snapshots,
+                    no_materialize: *no_materialize,
+                },
+                *replace,
+            )?;
+            save_edited(&cfg, &path)?;
+            let dir = cfg.root_path().join(name);
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            println!("namespace {name}: {}", dir.display());
+            Ok(())
+        }
+        GroupCmd::Remove { name } => {
+            namespace::remove_group(&mut cfg, name)?;
+            save_edited(&cfg, &path)?;
+            println!(
+                "removed namespace {name}; {} stays on disk and is no longer synced",
+                cfg.root_path().join(name).display()
+            );
+            Ok(())
+        }
+    }
+}
+
+fn provider_cmd(arg: &Option<PathBuf>, action: &ProviderCmd) -> Result<()> {
+    let path = config_path(arg)?;
+    let mut cfg = load_config(arg)?;
+    match action {
+        ProviderCmd::List => {
+            for l in namespace::describe_providers(&cfg) {
+                println!("{l}");
+            }
+            Ok(())
+        }
+        ProviderCmd::Add {
+            id,
+            kind,
+            url,
+            protocol,
+            replace,
+        } => {
+            let p = grove_core::config::Provider {
+                kind: namespace::parse_kind(kind)?,
+                protocol: namespace::parse_protocol(protocol)?,
+                url: url.clone().filter(|u| !u.is_empty()),
+            };
+            namespace::add_provider(&mut cfg, id, p, *replace)?;
+            save_edited(&cfg, &path)?;
+            println!("next: `grove login {id}` (tokens from `tea`/`gh` are used if present)");
+            Ok(())
+        }
+        ProviderCmd::Remove { id } => {
+            namespace::remove_provider(&mut cfg, id)?;
+            save_edited(&cfg, &path)?;
+            println!("removed provider {id} (its stored token stays in the keyring)");
+            Ok(())
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -395,22 +638,13 @@ fn main() -> Result<()> {
             config_repo,
             force,
         } => {
-            let protocol = match protocol.as_str() {
-                "https" => grove_core::config::Protocol::Https,
-                "ssh" => grove_core::config::Protocol::Ssh,
-                p => bail!("unknown protocol {p:?} (https, ssh)"),
-            };
+            let protocol = namespace::parse_protocol(protocol)?;
             let path = cli
                 .config
                 .clone()
                 .or_else(Config::default_path)
                 .context("cannot determine config path (set --config)")?;
-            let kind = match kind.as_str() {
-                "gitea" => ProviderKind::Gitea,
-                "forgejo" => ProviderKind::Forgejo,
-                "github" => ProviderKind::Github,
-                k => bail!("unknown provider kind {k:?} (gitea, forgejo, github)"),
-            };
+            let kind = namespace::parse_kind(kind)?;
             let machine = machine
                 .clone()
                 .or_else(|| {
@@ -451,11 +685,35 @@ fn main() -> Result<()> {
             group,
             name,
             public,
+            open,
         } => {
-            let wt = workflow::new_repo(&load_config(&cli.config)?, group, name, !public)?;
+            let cfg = load_config(&cli.config)?;
+            let wt = workflow::new_repo(&cfg, group, name, !public)?;
             println!("ready: {}", wt.display());
+            if let Some(with) = open {
+                let with = (!with.is_empty()).then_some(with.as_str());
+                if let Err(e) = open_dir(&cfg, &wt, with, false) {
+                    println!("warning: not opened: {e:#}");
+                }
+            }
             Ok(())
         }
+        Cmd::Open {
+            target,
+            with,
+            list,
+            print,
+        } => {
+            let cfg = load_config(&cli.config)?;
+            if *list {
+                return list_launchers(&cfg);
+            }
+            let dir =
+                grove_core::launch::resolve_target(&cfg, target).map_err(anyhow::Error::msg)?;
+            open_dir(&cfg, &dir, with.as_deref(), *print)
+        }
+        Cmd::Group { action } => group_cmd(&cli.config, action),
+        Cmd::Provider { action } => provider_cmd(&cli.config, action),
         Cmd::Import { group, names } => workflow::import(&load_config(&cli.config)?, group, names),
         Cmd::ConfigRepoInit => {
             let n = workflow::config_repo_init(&load_config(&cli.config)?)?;

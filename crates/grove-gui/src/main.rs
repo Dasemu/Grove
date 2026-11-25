@@ -47,6 +47,8 @@ struct Snapshot {
     status: Option<Value>,
     log: Vec<Value>,
     config: Option<Value>,
+    /// Installed launchers (name, label), the default one first.
+    launchers: Vec<(String, String)>,
     alerts: Vec<(String, String)>,
 }
 
@@ -141,6 +143,7 @@ struct UiState {
     toast_gen: u32,
     last_groups: Vec<String>,
     last_providers: Vec<String>,
+    last_launchers: Vec<(String, String)>,
 }
 
 thread_local! {
@@ -161,6 +164,7 @@ thread_local! {
         import_current: String::new(),
         toast_gen: 0,
         last_groups: Vec::new(),
+        last_launchers: Vec::new(),
         last_providers: Vec::new(),
     });
 }
@@ -428,6 +432,9 @@ fn render(ui: &MainWindow) {
             }
             if providers != st.last_providers {
                 ui.set_providers(str_model(&providers));
+                let mut mirrors = vec!["No mirror".to_string()];
+                mirrors.extend(providers.iter().cloned());
+                ui.set_mirror_choices(str_model(&mirrors));
                 st.last_providers = providers;
             }
             let secs: Vec<Section> = model::settings_sections(cfg)
@@ -445,6 +452,21 @@ fn render(ui: &MainWindow) {
                 })
                 .collect();
             ui.set_sections(ModelRc::from(Rc::new(VecModel::from(secs))));
+        }
+        if snap.launchers != st.last_launchers {
+            let rows: Vec<Launch> = snap
+                .launchers
+                .iter()
+                .map(|(n, l)| Launch {
+                    name: n.into(),
+                    label: l.into(),
+                })
+                .collect();
+            ui.set_launchers(ModelRc::from(Rc::new(VecModel::from(rows))));
+            let mut choices = vec!["Don't open".to_string()];
+            choices.extend(snap.launchers.iter().map(|(_, l)| format!("Open in {l}")));
+            ui.set_open_choices(str_model(&choices));
+            st.last_launchers = snap.launchers.clone();
         }
     });
 }
@@ -536,6 +558,15 @@ fn run_cli(
             }
         });
         core.wake();
+    });
+}
+
+/// A config-editing command from Settings: output below the forms, a toast either way.
+fn run_settings_cli(ctx: &Ctx, ui: &MainWindow, args: Vec<String>, done_msg: &'static str) {
+    run_cli(ctx, ui, None, args, String::new(), move |ui, ok, text| {
+        let first = text.lines().next().unwrap_or("").to_string();
+        toast(ui, if ok { done_msg } else { &first }, !ok);
+        ui.set_settings_out(out(ok, text));
     });
 }
 
@@ -743,12 +774,22 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
 
     ui.on_create_repo({
         let c = ctx.clone();
-        move |group, name, public| {
+        move |group, name, public, open| {
             let Some(ui) = c.weak.upgrade() else { return };
             let group = model::group_name(&first_or(group.as_str(), &ui.get_groups())).to_string();
             let mut args = vec!["new".to_string(), group, name.trim().to_string()];
             if public {
                 args.push("--public".into());
+            }
+            let launcher = ST.with(|st| {
+                st.borrow()
+                    .last_launchers
+                    .iter()
+                    .find(|(_, l)| format!("Open in {l}") == open.as_str())
+                    .map(|(n, _)| n.clone())
+            });
+            if let Some(n) = launcher {
+                args.extend(["--open".into(), n]);
             }
             ui.set_new_out(out(true, String::new()));
             run_cli(&c, &ui, None, args, String::new(), |ui, ok, text| {
@@ -756,6 +797,23 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
                 if ok {
                     toast(ui, "Repository created", false);
                 }
+            });
+        }
+    });
+
+    ui.on_open_in({
+        let c = ctx.clone();
+        move |path, launcher| {
+            let Some(ui) = c.weak.upgrade() else { return };
+            let args = vec![
+                "open".to_string(),
+                path.to_string(),
+                "--with".into(),
+                launcher.to_string(),
+            ];
+            run_cli(&c, &ui, None, args, String::new(), |ui, ok, text| {
+                let first = text.lines().last().unwrap_or("").to_string();
+                toast(ui, &first, !ok);
             });
         }
     });
@@ -973,6 +1031,63 @@ fn wire(ui: &MainWindow, ctx: &Ctx) {
             });
         }
     });
+    ui.on_add_provider({
+        let c = ctx.clone();
+        move |id, kind, url, protocol, replace| {
+            let Some(ui) = c.weak.upgrade() else { return };
+            let mut args: Vec<String> = vec![
+                "provider".into(),
+                "add".into(),
+                id.trim().to_string(),
+                "--kind".into(),
+                kind.to_string(),
+                "--protocol".into(),
+                protocol.to_string(),
+            ];
+            if !url.trim().is_empty() {
+                args.extend(["--url".into(), url.trim().to_string()]);
+            }
+            if replace {
+                args.push("--replace".into());
+            }
+            run_settings_cli(&c, &ui, args, "Provider saved");
+        }
+    });
+    ui.on_remove_provider({
+        let c = ctx.clone();
+        move |id| {
+            let Some(ui) = c.weak.upgrade() else { return };
+            let args = vec!["provider".into(), "remove".into(), id.to_string()];
+            run_settings_cli(&c, &ui, args, "Provider removed");
+        }
+    });
+    ui.on_add_group({
+        let c = ctx.clone();
+        move |name, primary, mirror, owner, mirror_owner, snapshots, replace| {
+            let Some(ui) = c.weak.upgrade() else { return };
+            let primary = first_or(primary.as_str(), &ui.get_providers());
+            let args = model::group_add_args(&model::GroupForm {
+                name: name.to_string(),
+                primary,
+                mirror: mirror.to_string(),
+                owner: owner.to_string(),
+                mirror_owner: mirror_owner.to_string(),
+                snapshots: snapshots.to_string(),
+                replace,
+            });
+            run_settings_cli(&c, &ui, args, "Namespace saved");
+        }
+    });
+    ui.on_remove_group({
+        let c = ctx.clone();
+        move |label| {
+            let Some(ui) = c.weak.upgrade() else { return };
+            let name = model::group_name(&first_or(label.as_str(), &ui.get_groups())).to_string();
+            let args = vec!["group".into(), "remove".into(), name];
+            run_settings_cli(&c, &ui, args, "Namespace removed");
+        }
+    });
+
     ui.on_login({
         let c = ctx.clone();
         move |provider, token| {
@@ -1200,6 +1315,7 @@ fn worker(
                 status,
                 log,
                 config: core.bridge.config_json(),
+                launchers: core.bridge.launchers(),
                 alerts,
             };
             let w = weak.clone();

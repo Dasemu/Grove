@@ -182,6 +182,7 @@ pub fn init(path: &Path, a: InitArgs, force: bool) -> Result<Config> {
             public: None,
         }],
         sync: Default::default(),
+        open: Default::default(),
         config_repo: a.config_repo.map(|name| grove_core::config::ConfigRepo {
             provider: a.provider,
             name,

@@ -8,6 +8,7 @@ pub mod busy;
 pub mod config;
 pub mod git;
 pub mod inspect;
+pub mod launch;
 pub mod layout;
 pub mod migrate;
 pub mod prune;
