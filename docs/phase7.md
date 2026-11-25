@@ -54,7 +54,8 @@ grove-gui --view settings                   # start on a view (activity, new, im
 `grove` is looked up next to the `grove-gui` binary, then in `PATH`. Packaging: `.deb` installs
 `grove-gui`, `contrib/grove.desktop`, `assets/grove.png` and a copy of the autostart file under
 `/usr/share/grove/`. Autostart is opt-in: Settings has a "Start Grove at login" toggle that writes or
-removes `~/.config/autostart/grove.desktop`. The deb recommends `libnotify-bin` (`notify-send`). Dev builds need no system Qt: Slint is built with the `winit` backend (Wayland and
+removes `~/.config/autostart/grove.desktop`; its `Exec` is the running binary's absolute path,
+because desktop sessions often lack `~/.local/bin` in `PATH` (a source install from the README). The deb recommends `libnotify-bin` (`notify-send`). Dev builds need no system Qt: Slint is built with the `winit` backend (Wayland and
 X11 loaded at runtime) and the software renderer.
 
 ## Dependencies
