@@ -18,6 +18,9 @@ const ALLOWED: &[&str] = &[
     "secrets",
     "sync",
     "status",
+    "group",
+    "provider",
+    "open",
 ];
 
 pub struct Bridge {
@@ -49,6 +52,17 @@ impl Bridge {
         let mut checked: Vec<String> = args.to_vec();
         if sub == "add" {
             match self.check_migrate_args(args) {
+                Ok(canon) => checked[1] = canon.to_string_lossy().into_owned(),
+                Err(e) => return json!({"ok": false, "output": format!("rejected: {e}")}),
+            }
+        }
+        // `open` only for a directory under the workspace root, in canonical form.
+        if sub == "open" {
+            let checked_path = self
+                .loaded_config()
+                .ok_or_else(|| "no readable configuration".to_string())
+                .and_then(|cfg| check_open_path(&cfg, Path::new(&args[1])));
+            match checked_path {
                 Ok(canon) => checked[1] = canon.to_string_lossy().into_owned(),
                 Err(e) => return json!({"ok": false, "output": format!("rejected: {e}")}),
             }
@@ -106,6 +120,26 @@ impl Bridge {
         check_migrate_path(&cfg, Path::new(path))
     }
 
+    /// Installed launchers (name, label) for "Open in" buttons, the default one first.
+    pub fn launchers(&self) -> Vec<(String, String)> {
+        use grove_core::launch::{System, launchers, pick};
+        let Some(cfg) = self.loaded_config() else {
+            return Vec::new();
+        };
+        let all = launchers(&cfg.open, &System);
+        let default = pick(&all, &cfg.open, None).ok().map(|l| l.name.clone());
+        let mut out: Vec<(String, String)> = all
+            .into_iter()
+            .filter(|l| l.available)
+            .map(|l| (l.name, l.label))
+            .collect();
+        if let Some(i) = out.iter().position(|(n, _)| Some(n) == default.as_ref()) {
+            let d = out.remove(i);
+            out.insert(0, d);
+        }
+        out
+    }
+
     /// Where `grove add` writes its safety backup.
     pub fn backup_dir() -> Option<PathBuf> {
         grove_core::config::Config::state_dir().map(|d| d.join("backups"))
@@ -135,7 +169,20 @@ fn flag_spec(sub: &str) -> (&'static [&'static str], &'static [&'static str]) {
                 "--url",
             ],
         ),
-        "new" => (&["--public"], &[]),
+        "new" => (&["--public"], &["--open"]),
+        "open" => (&[], &["--with"]),
+        "group" => (
+            &["--replace", "--no-materialize"],
+            &[
+                "--primary",
+                "--mirror-to",
+                "--owner",
+                "--public-primary",
+                "--public-mirror-to",
+                "--snapshots",
+            ],
+        ),
+        "provider" => (&["--replace"], &["--kind", "--url", "--protocol"]),
         "resolve" => (&["--take-remote", "--keep-local"], &["--save-as"]),
         _ => (&[], &[]),
     }
@@ -159,10 +206,21 @@ pub fn validate(args: &[String]) -> Result<(), String> {
             }
         } else if sub == "secrets" && i == 0 && !["init", "pull", "rekey"].contains(&a.as_str()) {
             return Err(format!("secrets {a:?} is not allowed from the GUI"));
+        } else if (sub == "group" || sub == "provider")
+            && i == 0
+            && !["add", "remove"].contains(&a.as_str())
+        {
+            return Err(format!("{sub} {a:?} is not allowed from the GUI"));
         }
     }
     if sub == "secrets" && args.len() != 2 {
         return Err("secrets takes exactly one action".into());
+    }
+    if (sub == "group" || sub == "provider") && args.len() < 3 {
+        return Err(format!("{sub} needs an action and a name"));
+    }
+    if sub == "open" && args.get(1).is_none_or(|p| p.starts_with('-')) {
+        return Err("open needs a path first".into());
     }
     Ok(())
 }
@@ -192,6 +250,27 @@ pub fn check_migrate_path(
     }
 }
 
+/// A directory the GUI may open in an editor: an existing directory inside the workspace root.
+pub fn check_open_path(cfg: &grove_core::config::Config, path: &Path) -> Result<PathBuf, String> {
+    let canon = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !canon.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    let root = cfg.root_path();
+    let root = root.canonicalize().unwrap_or(root);
+    if canon.starts_with(&root) && canon != root {
+        Ok(canon)
+    } else {
+        Err(format!(
+            "{} is not inside {}",
+            path.display(),
+            root.display()
+        ))
+    }
+}
+
 fn grove_core_default_config() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -215,6 +294,48 @@ mod tests {
         assert!(v(&["resolve", "/p", "--save-as", "b", "--take-remote"]).is_ok());
         assert!(v(&["new", "g", "n", "--public"]).is_ok());
         assert!(v(&["secrets", "pull"]).is_ok());
+        assert!(v(&["group", "list"]).is_err());
+        assert!(v(&["group", "add"]).is_err());
+        assert!(v(&["group", "add", "g", "--primary", "p", "--force"]).is_err());
+        assert!(
+            v(&[
+                "group",
+                "add",
+                "g",
+                "--primary",
+                "p",
+                "--mirror-to",
+                "q",
+                "--replace"
+            ])
+            .is_ok()
+        );
+        assert!(v(&["provider", "remove", "p"]).is_ok());
+        assert!(v(&["provider", "add", "p", "--url", "--kind"]).is_err());
+        assert!(v(&["open", "/p", "--with", "zed"]).is_ok());
+        assert!(v(&["open", "/p", "--print"]).is_err());
+        assert!(v(&["open", "--with", "zed"]).is_err());
+        assert!(v(&["new", "g", "n", "--open", "zed"]).is_ok());
+    }
+
+    #[test]
+    fn open_path_must_be_inside_the_root() {
+        let tmp = crate::test_tmp::TempDir::new("grove-open");
+        let base = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("ws/work/app/main")).unwrap();
+        std::fs::create_dir_all(base.join("elsewhere")).unwrap();
+        let cfg = grove_core::config::Config::parse(&format!(
+            "[machine]\nname=\"m\"\n[root]\npath=\"{}/ws\"\n",
+            base.display()
+        ))
+        .unwrap();
+        assert_eq!(
+            check_open_path(&cfg, &base.join("ws/work/app/../app/main")).unwrap(),
+            base.join("ws/work/app/main")
+        );
+        for bad in ["ws", "elsewhere", "ws/work/../../elsewhere", "ws/none"] {
+            assert!(check_open_path(&cfg, &base.join(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

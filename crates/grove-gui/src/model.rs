@@ -336,6 +336,53 @@ pub fn group_name(entry: &str) -> &str {
     entry.split(" → ").next().unwrap_or(entry)
 }
 
+/// What the "Add or change a namespace" form holds.
+pub struct GroupForm {
+    pub name: String,
+    pub primary: String,
+    /// Empty: no mirror.
+    pub mirror: String,
+    pub owner: String,
+    pub mirror_owner: String,
+    /// "default" leaves the global policy in force.
+    pub snapshots: String,
+    pub replace: bool,
+}
+
+/// `grove group add ...` for the namespace form.
+pub fn group_add_args(f: &GroupForm) -> Vec<String> {
+    let mut a: Vec<String> = vec![
+        "group".into(),
+        "add".into(),
+        f.name.trim().to_string(),
+        "--primary".into(),
+        f.primary.clone(),
+    ];
+    let mirror = f.mirror.trim();
+    if !mirror.is_empty() {
+        a.extend(["--mirror-to".into(), mirror.to_string()]);
+    }
+    if !f.owner.trim().is_empty() {
+        a.extend([
+            "--owner".into(),
+            format!("{}={}", f.primary, f.owner.trim()),
+        ]);
+    }
+    if !mirror.is_empty() && !f.mirror_owner.trim().is_empty() {
+        a.extend([
+            "--owner".into(),
+            format!("{mirror}={}", f.mirror_owner.trim()),
+        ]);
+    }
+    if !f.snapshots.is_empty() && f.snapshots != "default" {
+        a.extend(["--snapshots".into(), f.snapshots.clone()]);
+    }
+    if f.replace {
+        a.push("--replace".into());
+    }
+    a
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +547,47 @@ mod tests {
         );
         assert_eq!(s[3].1[0].1, "grove-config on gitea");
         assert_eq!(group_name("work → gitea"), "work");
+    }
+
+    #[test]
+    fn group_form_becomes_group_add_args() {
+        let mut f = GroupForm {
+            name: " oss ".into(),
+            primary: "gh".into(),
+            mirror: String::new(),
+            owner: String::new(),
+            mirror_owner: "ignored without a mirror".into(),
+            snapshots: "default".into(),
+            replace: false,
+        };
+        assert_eq!(
+            group_add_args(&f),
+            ["group", "add", "oss", "--primary", "gh"]
+        );
+        f.mirror = "gitea".into();
+        f.owner = "Zenvairo".into();
+        f.mirror_owner = "Org".into();
+        f.snapshots = "none".into();
+        f.replace = true;
+        assert_eq!(
+            group_add_args(&f),
+            [
+                "group",
+                "add",
+                "oss",
+                "--primary",
+                "gh",
+                "--mirror-to",
+                "gitea",
+                "--owner",
+                "gh=Zenvairo",
+                "--owner",
+                "gitea=Org",
+                "--snapshots",
+                "none",
+                "--replace"
+            ]
+        );
+        assert!(crate::bridge::validate(&group_add_args(&f)).is_ok());
     }
 }

@@ -17,6 +17,45 @@ pub struct Config {
     pub sync: Sync,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_repo: Option<ConfigRepo>,
+    /// How `grove open` launches editors and tools on a worktree (machine-local).
+    #[serde(default, skip_serializing_if = "Open::is_empty")]
+    pub open: Open,
+}
+
+/// `[open]`: editors and tools a worktree can be opened with (see `crate::launch`).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+pub struct Open {
+    /// Launcher used when none is named (default: the first available one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Terminal command prefix for terminal launchers, e.g. `["kitty", "--directory", "{path}"]`.
+    /// The launcher's command is appended. Default: `$TERMINAL`, then the first known terminal
+    /// found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<Vec<String>>,
+    /// Own launchers; one named like a built-in replaces it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launchers: Vec<Launcher>,
+}
+
+impl Open {
+    pub fn is_empty(&self) -> bool {
+        *self == Open::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct Launcher {
+    pub name: String,
+    /// Shown in the GUI (default: the name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Program and arguments; `{path}` is replaced by the worktree path. The process also
+    /// starts in the worktree.
+    pub command: Vec<String>,
+    /// Run the command inside a terminal (for command-line tools such as `claude`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -424,11 +463,42 @@ impl Config {
         {
             return bad(format!("config_repo: unknown provider {:?}", c.provider));
         }
+        let mut seen = std::collections::BTreeSet::new();
+        for l in &self.open.launchers {
+            if !is_plain_name(&l.name) {
+                return bad(format!(
+                    "open.launchers: name {:?} must use only letters, digits, '-' or '_'",
+                    l.name
+                ));
+            }
+            if !seen.insert(l.name.as_str()) {
+                return bad(format!("open.launchers: {:?} is defined twice", l.name));
+            }
+            if l.command.first().is_none_or(|p| p.trim().is_empty()) {
+                return bad(format!("open.launchers: {:?} has no command", l.name));
+            }
+        }
+        if let Some(d) = &self.open.default
+            && !seen.contains(d.as_str())
+            && !crate::launch::BUILTIN.iter().any(|b| b.name == d)
+        {
+            return bad(format!("open.default: unknown launcher {d:?}"));
+        }
+        if self.open.terminal.as_ref().is_some_and(|t| t.is_empty()) {
+            return bad("open.terminal must not be empty".into());
+        }
         Ok(())
     }
 }
 
-fn expand_home(p: &str) -> PathBuf {
+/// Letters, digits, `-` and `_` only (and not empty): safe as a ref part, id or file name.
+pub fn is_plain_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+pub fn expand_home(p: &str) -> PathBuf {
     match (p.strip_prefix("~/"), std::env::var_os("HOME")) {
         (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ if p == "~" => std::env::var_os("HOME").map_or_else(|| PathBuf::from(p), PathBuf::from),
@@ -649,6 +719,39 @@ mirror_to = ["gitea"]
         assert!(matches!(Config::parse("["), Err(ConfigError::Parse(_))));
         let t = "[machine]\nname=\"a\"\n[root]\npath=\"/x\"\n[providers.p]\nkind=\"gitlab\"\n";
         assert!(matches!(Config::parse(t), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn open_section_round_trips_and_is_validated() {
+        let base = "[machine]\nname=\"a\"\n[root]\npath=\"/x\"\n";
+        let c = Config::parse(base).unwrap();
+        assert!(c.open.is_empty());
+        assert!(!toml::to_string(&c).unwrap().contains("[open]"));
+        let t = format!(
+            "{base}[open]\ndefault=\"nvim\"\nterminal=[\"foot\"]\n\
+             [[open.launchers]]\nname=\"nvim\"\ncommand=[\"nvim\",\".\"]\nterminal=true\n"
+        );
+        let c = Config::parse(&t).unwrap();
+        assert_eq!(c.open.launchers[0].command, ["nvim", "."]);
+        assert!(c.open.launchers[0].terminal);
+        assert_eq!(Config::parse(&toml::to_string(&c).unwrap()).unwrap(), c);
+        // A built-in can be the default without being redefined.
+        assert!(Config::parse(&format!("{base}[open]\ndefault=\"zed\"\n")).is_ok());
+        for bad in [
+            "[open]\ndefault=\"nope\"\n",
+            "[open]\nterminal=[]\n",
+            "[[open.launchers]]\nname=\"a b\"\ncommand=[\"x\"]\n",
+            "[[open.launchers]]\nname=\"a\"\ncommand=[]\n",
+            "[[open.launchers]]\nname=\"a\"\ncommand=[\"x\"]\n[[open.launchers]]\nname=\"a\"\ncommand=[\"y\"]\n",
+        ] {
+            assert!(
+                matches!(
+                    Config::parse(&format!("{base}{bad}")),
+                    Err(ConfigError::Invalid(_))
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

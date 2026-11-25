@@ -52,6 +52,11 @@ export struct MigRow {
     msg: string,
 }
 
+export struct Launch {
+    name: string,
+    label: string,
+}
+
 export struct Out {
     text: string,
     ok: bool,
@@ -195,6 +200,12 @@ export component MainWindow inherits Window {
     in property <[LogRow]> log;
     in property <[string]> groups;
     in property <[string]> providers;
+    // "No mirror" followed by the providers.
+    in property <[string]> mirror-choices;
+    // Installed editors/tools, the default one first.
+    in property <[Launch]> launchers;
+    // "Don't open" followed by the launcher labels.
+    in property <[string]> open-choices;
     in property <[Section]> sections;
     in property <[Pick]> picks;
     in property <string> import-note;
@@ -209,6 +220,7 @@ export component MainWindow inherits Window {
     in property <Repo> detail;
     in property <bool> detail-found;
     in-out property <string> selected-path;
+    property <string> prov-url-text;
     in property <Out> new-out;
     in property <Out> import-out;
     in property <Out> settings-out;
@@ -220,7 +232,12 @@ export component MainWindow inherits Window {
     callback sync-all();
     callback toggle-pause();
     callback filter-changed(string);
-    callback create-repo(string, string, bool);
+    callback create-repo(string, string, bool, string);
+    callback open-in(string, string);
+    callback add-provider(string, string, string, string, bool);
+    callback remove-provider(string);
+    callback add-group(string, string, string, string, string, string, bool);
+    callback remove-group(string);
     callback scan-import(string, bool);
     callback import-selected(string);
     callback pick-toggled(int, bool);
@@ -491,6 +508,13 @@ export component MainWindow inherits Window {
 
                             for r in root.repos: Rectangle {
                                 height: rcard.preferred-height;
+                                // Below the card, so the card's own buttons get their clicks.
+                                TouchArea {
+                                    clicked => {
+                                        root.open-repo(r.path);
+                                    }
+                                }
+
                                 rcard := Card {
                                 HorizontalLayout {
                                     spacing: 12px;
@@ -553,14 +577,19 @@ export component MainWindow inherits Window {
                                             font-size: 11px;
                                         }
                                     }
-                                }
 
-                                }
-
-                                TouchArea {
-                                    clicked => {
-                                        root.open-repo(r.path);
+                                    if root.launchers.length > 0: VerticalLayout {
+                                        alignment: center;
+                                        Button {
+                                            text: "Open";
+                                            accessible-label: "Open in " + root.launchers[0].label;
+                                            clicked => {
+                                                root.open-in(r.path, root.launchers[0].name);
+                                            }
+                                        }
                                     }
+                                }
+
                                 }
                             }
                         }
@@ -648,6 +677,22 @@ export component MainWindow inherits Window {
 
                                 Muted {
                                     text: w.plan;
+                                }
+
+                                if w.path != "" && root.launchers.length > 0: HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    Muted {
+                                        text: "Open in";
+                                        vertical-alignment: center;
+                                    }
+
+                                    for l in root.launchers: Button {
+                                        text: l.label;
+                                        clicked => {
+                                            root.open-in(w.path, l.name);
+                                        }
+                                    }
                                 }
 
                                 if w.state == "diverged": diverged := VerticalLayout {
@@ -831,6 +876,14 @@ export component MainWindow inherits Window {
                                     text: "Public repository";
                                 }
 
+                                Muted {
+                                    text: "Afterwards";
+                                }
+
+                                new-open := ComboBox {
+                                    model: root.open-choices;
+                                }
+
                                 HorizontalLayout {
                                     alignment: start;
                                     Button {
@@ -838,7 +891,7 @@ export component MainWindow inherits Window {
                                         primary: true;
                                         enabled: !root.busy && new-name.text != "";
                                         clicked => {
-                                            root.create-repo(new-group.current-value, new-name.text, new-public.checked);
+                                            root.create-repo(new-group.current-value, new-name.text, new-public.checked, new-open.current-value);
                                         }
                                     }
                                 }
@@ -1006,6 +1059,250 @@ export component MainWindow inherits Window {
                                 clicked => {
                                     root.run-settings("bootstrap");
                                 }
+                            }
+                        }
+
+                        Text {
+                            text: "Add or change a provider";
+                            font-size: 16px;
+                            font-weight: 700;
+                        }
+
+                        Card {
+                            HorizontalLayout {
+                                spacing: 8px;
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    horizontal-stretch: 1;
+                                    Muted {
+                                        text: "Id";
+                                    }
+
+                                    prov-id := LineEdit {
+                                        placeholder-text: "gitea, gh, work-forge…";
+                                        accessible-label: "Provider id";
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    min-width: 150px;
+                                    horizontal-stretch: 0;
+                                    Muted {
+                                        text: "Kind";
+                                    }
+
+                                    prov-kind := ComboBox {
+                                        model: ["gitea", "forgejo", "github"];
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    min-width: 130px;
+                                    horizontal-stretch: 0;
+                                    Muted {
+                                        text: "Git over";
+                                    }
+
+                                    prov-proto := ComboBox {
+                                        model: ["https", "ssh"];
+                                    }
+                                }
+                            }
+
+                            if prov-kind.current-value != "github": VerticalLayout {
+                                spacing: 4px;
+                                Muted {
+                                    text: "URL";
+                                }
+
+                                prov-url := LineEdit {
+                                    placeholder-text: "https://git.example.com";
+                                    accessible-label: "Provider URL";
+                                    edited(t) => {
+                                        root.prov-url-text = t;
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                prov-replace := CheckBox {
+                                    text: "Replace an existing provider with this id";
+                                }
+
+                                Button {
+                                    text: "Save provider";
+                                    primary: true;
+                                    enabled: !root.busy && prov-id.text != "" && (prov-kind.current-value == "github" || root.prov-url-text != "");
+                                    clicked => {
+                                        root.add-provider(prov-id.text, prov-kind.current-value, prov-kind.current-value == "github" ? "" : root.prov-url-text, prov-proto.current-value, prov-replace.checked);
+                                    }
+                                }
+                            }
+
+                            Muted {
+                                text: "Then sign in to it below (a token from `tea`/`gh` is used when present).";
+                                font-size: 11px;
+                            }
+                        }
+
+                        Text {
+                            text: "Add or change a namespace";
+                            font-size: 16px;
+                            font-weight: 700;
+                        }
+
+                        Card {
+                            Muted {
+                                text: "A namespace is a directory under the workspace root whose repos live on one forge, optionally mirrored to another.";
+                                font-size: 11px;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    Muted {
+                                        text: "Name";
+                                    }
+
+                                    grp-name := LineEdit {
+                                        placeholder-text: "work, personal, clients…";
+                                        accessible-label: "Namespace name";
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    width: 170px;
+                                    Muted {
+                                        text: "Snapshots";
+                                    }
+
+                                    grp-snap := ComboBox {
+                                        model: ["default", "private-only", "all", "none"];
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    Muted {
+                                        text: "Primary (repos are created here)";
+                                    }
+
+                                    grp-primary := ComboBox {
+                                        model: root.providers;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    Muted {
+                                        text: "Owner there (empty: your account)";
+                                    }
+
+                                    grp-owner := LineEdit {
+                                        placeholder-text: "account or organisation";
+                                        accessible-label: "Owner on the primary provider";
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    Muted {
+                                        text: "Mirror to";
+                                    }
+
+                                    grp-mirror := ComboBox {
+                                        model: root.mirror-choices;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    Muted {
+                                        text: "Owner on the mirror";
+                                    }
+
+                                    grp-mowner := LineEdit {
+                                        enabled: grp-mirror.current-index > 0;
+                                        placeholder-text: "account or organisation";
+                                        accessible-label: "Owner on the mirror provider";
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                grp-replace := CheckBox {
+                                    text: "Replace an existing namespace with this name";
+                                }
+
+                                Button {
+                                    text: "Save namespace";
+                                    primary: true;
+                                    enabled: !root.busy && grp-name.text != "";
+                                    clicked => {
+                                        root.add-group(grp-name.text, grp-primary.current-value, grp-mirror.current-index > 0 ? grp-mirror.current-value : "", grp-owner.text, grp-mirror.current-index > 0 ? grp-mowner.text : "", grp-snap.current-value, grp-replace.checked);
+                                    }
+                                }
+                            }
+
+                            Muted {
+                                text: "Public repos can take a different route (`grove group add --public-primary`); that is CLI only. The daemon picks up changes after `systemctl --user restart groved`.";
+                                font-size: 11px;
+                            }
+                        }
+
+                        Text {
+                            text: "Remove";
+                            font-size: 16px;
+                            font-weight: 700;
+                        }
+
+                        Card {
+                            HorizontalLayout {
+                                spacing: 8px;
+                                rm-group := ComboBox {
+                                    model: root.groups;
+                                }
+
+                                Button {
+                                    text: "Remove namespace";
+                                    enabled: !root.busy && root.groups.length > 0;
+                                    clicked => {
+                                        root.remove-group(rm-group.current-value);
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                rm-prov := ComboBox {
+                                    model: root.providers;
+                                }
+
+                                Button {
+                                    text: "Remove provider";
+                                    enabled: !root.busy && root.providers.length > 0;
+                                    clicked => {
+                                        root.remove-provider(rm-prov.current-value);
+                                    }
+                                }
+                            }
+
+                            Muted {
+                                text: "Removing a namespace only edits config.toml: its directory and repos stay on disk and stop syncing. A provider still used by a namespace cannot be removed. The previous config is kept as config.toml.bak.";
+                                font-size: 11px;
                             }
                         }
 
