@@ -336,6 +336,16 @@ pub fn group_name(entry: &str) -> &str {
     entry.split(" → ").next().unwrap_or(entry)
 }
 
+/// After a `--hidden` start (autostart at login), show requests from other launches are ignored
+/// for this long: they come from the desktop's session restore, and a window mapped while the
+/// compositor is still starting shows up in the task bar but never on screen.
+pub const LOGIN_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether a show request from another launch, `since_start` after this one started, is honoured.
+pub fn accept_instance_show(hidden_start: bool, since_start: std::time::Duration) -> bool {
+    !hidden_start || since_start >= LOGIN_GRACE
+}
+
 /// What the "Add or change a namespace" form holds.
 pub struct GroupForm {
     pub name: String,
@@ -547,6 +557,15 @@ mod tests {
         );
         assert_eq!(s[3].1[0].1, "grove-config on gitea");
         assert_eq!(group_name("work → gitea"), "work");
+    }
+
+    #[test]
+    fn early_show_requests_are_ignored_only_after_a_hidden_start() {
+        use std::time::Duration;
+        assert!(accept_instance_show(false, Duration::ZERO));
+        assert!(!accept_instance_show(true, Duration::from_secs(3)));
+        assert!(accept_instance_show(true, LOGIN_GRACE));
+        assert!(accept_instance_show(true, Duration::from_secs(600)));
     }
 
     #[test]

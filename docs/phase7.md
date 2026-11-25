@@ -155,3 +155,26 @@ tray errors and restarts, panics with a backtrace (from any thread) and why the 
   repeated page, not on a short page. For a user that is not the login, GitHub/Gitea listing uses
   `/user/repos` (collaborator repos included) and says when `/orgs/{owner}` is a 404.
 - The GUI hands `grove add` the canonical path it validated.
+
+## Autostart at login (Plasma Wayland)
+
+Seen on Plasma 6 / Wayland: after an autostart (`grove-gui --hidden`) the window had a task bar
+entry, but clicking it showed nothing; opening it from the tray worked (that path hides and
+re-shows the window). A window mapped while the compositor is still starting ends up in that
+state. Two ways it got shown at login, both handled now:
+
+- No tray yet: Plasma's StatusNotifier watcher/host can come up after autostart, and a failed tray
+  start used to fall back to opening the window. A `--hidden` start now registers the tray item
+  with ksni's `assume_sni_available`: it waits for the watcher and registers when it appears
+  (`tray: StatusNotifier watcher …` lines in the log). Without a D-Bus session at all the window
+  still opens, as before. The tray respawn after a lost D-Bus connection also waits.
+- Session restore: the desktop relaunches `grove-gui` (no `--hidden`) at login, which asks the
+  running instance to show its window. During the first 20 s after a `--hidden` start
+  (`model::LOGIN_GRACE`) such requests are ignored and logged. The tray's "Open Grove" is never
+  ignored.
+
+Every time the window is shown, `grove-gui.log` records why (start without `--hidden`, another
+launch, tray, no tray) and whether it was visible before; the session type is logged at start.
+Checked under Xvfb with a private D-Bus session and no tray host (starts hidden, an early second
+launch is ignored, a later one opens the window). The watcher appearing later was not simulated,
+and the original symptom was not reproduced here (no Plasma).

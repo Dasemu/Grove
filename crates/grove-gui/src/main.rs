@@ -489,7 +489,12 @@ fn toast(ui: &MainWindow, msg: &str, bad: bool) {
     });
 }
 
-fn show_window(ui: &MainWindow, core: &Core) {
+/// Shows (or re-maps) the window. `why` goes to the diagnostics log.
+fn show_window(ui: &MainWindow, core: &Core, why: &str) {
+    log::line(&format!(
+        "showing the window ({why}; visible before: {})",
+        ui.window().is_visible()
+    ));
     // Slint exposes no xdg-activation, so an already visible window is raised by re-mapping it:
     // a fresh toplevel is what the compositor focuses.
     if core.visible.load(Ordering::SeqCst) && ui.window().is_visible() {
@@ -1399,6 +1404,11 @@ fn run() -> Result<()> {
         return Ok(());
     }
     let hidden = args.iter().any(|a| a == "--hidden");
+    let started = Instant::now();
+    log::line(&format!(
+        "session type: {}",
+        std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into())
+    ));
     let inst_path = arg("--instance-socket")
         .map(PathBuf::from)
         .unwrap_or_else(instance::default_socket_path);
@@ -1413,15 +1423,25 @@ fn run() -> Result<()> {
     {
         let (late, pending) = (late.clone(), pending_show.clone());
         std::thread::spawn(move || {
-            instance::serve(listener, move || match late.lock().unwrap().clone() {
-                Some(c) => {
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = c.weak.upgrade() {
-                            show_window(&ui, &c.core);
-                        }
-                    });
+            instance::serve(listener, move || {
+                let age = started.elapsed();
+                if !model::accept_instance_show(hidden, age) {
+                    log::line(&format!(
+                        "ignored a show request from another launch {:.1} s after a --hidden start (session restore?)",
+                        age.as_secs_f32()
+                    ));
+                    return;
                 }
-                None => pending.store(true, Ordering::SeqCst),
+                match late.lock().unwrap().clone() {
+                    Some(c) => {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = c.weak.upgrade() {
+                                show_window(&ui, &c.core, "another launch asked");
+                            }
+                        });
+                    }
+                    None => pending.store(true, Ordering::SeqCst),
+                }
             })
         });
     }
@@ -1472,7 +1492,7 @@ fn run() -> Result<()> {
                 let c = ctx.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = c.weak.upgrade() {
-                        show_window(&ui, &c.core);
+                        show_window(&ui, &c.core, "tray");
                     }
                 });
             }
@@ -1487,7 +1507,8 @@ fn run() -> Result<()> {
             }
         })
     };
-    let tray = match tray::spawn(on_action.clone()) {
+    // Autostart runs before Plasma's tray is ready: wait for it instead of opening the window.
+    let tray = match tray::spawn(on_action.clone(), hidden) {
         Ok(h) => {
             core.tray_ok.store(true, Ordering::SeqCst);
             Some(h)
@@ -1516,7 +1537,13 @@ fn run() -> Result<()> {
         let (c, w) = (core.clone(), ui.as_weak());
         let respawn = on_action.clone();
         std::thread::spawn(move || {
-            worker(c, rx, tray, move || tray::spawn(respawn.clone()).ok(), w)
+            worker(
+                c,
+                rx,
+                tray,
+                move || tray::spawn(respawn.clone(), true).ok(),
+                w,
+            )
         });
     }
     {
@@ -1525,9 +1552,19 @@ fn run() -> Result<()> {
     }
     *late.lock().unwrap() = Some(ctx.clone());
 
-    if !hidden || pending_show.load(Ordering::SeqCst) || !core.tray_ok.load(Ordering::SeqCst) {
-        show_window(&ui, &core);
+    let why = if !hidden {
+        Some("started without --hidden")
+    } else if pending_show.load(Ordering::SeqCst) {
+        Some("another launch asked during start-up")
+    } else if !core.tray_ok.load(Ordering::SeqCst) {
+        Some("no tray")
     } else {
+        None
+    };
+    if let Some(why) = why {
+        show_window(&ui, &core, why);
+    } else {
+        log::line("started hidden in the tray");
         core.wake();
     }
     let r = slint::run_event_loop_until_quit();

@@ -22,12 +22,18 @@ pub struct GroveTray {
 
 pub type TrayHandle = Handle<GroveTray>;
 
-/// Starts the tray service. Fails when there is no D-Bus session.
-pub fn spawn(on_action: Arc<dyn Fn(Action) + Send + Sync>) -> Result<TrayHandle, ksni::Error> {
+/// Starts the tray service. Fails when there is no D-Bus session. With `wait_for_host` a
+/// missing StatusNotifier watcher/host is not an error: the item registers as soon as the
+/// desktop's tray comes up (an autostarted app usually runs before Plasma's tray is ready).
+pub fn spawn(
+    on_action: Arc<dyn Fn(Action) + Send + Sync>,
+    wait_for_host: bool,
+) -> Result<TrayHandle, ksni::Error> {
     GroveTray {
         agg: Aggregate::default(),
         on_action,
     }
+    .assume_sni_available(wait_for_host)
     .spawn()
 }
 
@@ -46,6 +52,17 @@ pub fn set_state(handle: &TrayHandle, agg: &Aggregate) -> bool {
 impl ksni::Tray for GroveTray {
     fn id(&self) -> String {
         "grove".into()
+    }
+
+    fn watcher_online(&self) {
+        crate::log::line("tray: StatusNotifier watcher is online; icon registered");
+    }
+
+    fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
+        crate::log::line(&format!(
+            "tray: StatusNotifier watcher offline ({reason:?}); waiting for it"
+        ));
+        true
     }
 
     fn title(&self) -> String {
