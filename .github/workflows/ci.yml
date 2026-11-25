@@ -11,6 +11,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Shell syntax
         run: for f in spikes/*.sh; do bash -n "$f"; done
+      - name: System libraries for the GUI (Slint needs fontconfig headers)
+        if: hashFiles('Cargo.toml') != ''
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libfontconfig-dev
       - name: Rust (once a Cargo workspace exists)
         if: hashFiles('Cargo.toml') != ''
         run: |
