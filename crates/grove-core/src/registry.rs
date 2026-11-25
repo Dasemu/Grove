@@ -225,6 +225,13 @@ mod tests {
         fs::write(locked.join("f"), "x").unwrap();
         fs::write(d.join(crate::busy::BUSY), "1 1\n").unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        // Root (e.g. a CI container) ignores directory permissions, so nothing can be locked
+        // and the partial-rollback path is unreachable: the test has nothing to check there.
+        if fs::write(locked.join("probe"), "x").is_ok() {
+            eprintln!("skipped: directory permissions are not enforced (running as root?)");
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
         rollback_clone(&d);
         assert!(d.join(".grove-stage").exists());
         assert!(
